@@ -92,17 +92,28 @@ export const App: React.FC = () => {
 
     // Listen for live NDJSON stream events
     let unlisten: (() => void) | undefined;
+    let canceled = false;
+
     listen<unknown>('agy-stream-event', (event) => {
       const line = JSON.stringify(event.payload);
       setEventLogs((prev) => [...prev, line]);
-    }).then((unsub) => {
-      unlisten = unsub;
-    }).catch((err) => {
-      console.error('Failed to register stream listener', err);
-    });
+    })
+      .then((unsub) => {
+        if (canceled) {
+          unsub();
+        } else {
+          unlisten = unsub;
+        }
+      })
+      .catch((err) => {
+        console.error('Failed to register stream listener', err);
+      });
 
     return () => {
-      if (unlisten) unlisten();
+      canceled = true;
+      if (unlisten) {
+        unlisten();
+      }
     };
   }, []);
 

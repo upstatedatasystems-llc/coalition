@@ -434,4 +434,83 @@ mod tests {
         assert!(response.text_response.contains("test prompt"));
         assert!(response.cumulative_usage.total_tokens > 0);
     }
+
+    #[tokio::test]
+    async fn test_fake_agy_event_stream_count_and_accuracy() {
+        let fake_agy_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("fake-commands")
+            .join(if cfg!(windows) {
+                "fake-agy.cmd"
+            } else {
+                "fake-agy"
+            });
+
+        if !fake_agy_path.exists() {
+            eprintln!("Skipping fake agy test: path not found {:?}", fake_agy_path);
+            return;
+        }
+
+        let adapter = AntigravityCliAdapter::with_path(fake_agy_path);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = mpsc::channel::<AgyEvent>(100);
+
+        let response = adapter
+            .run_turn(
+                BuilderTurnRequest {
+                    prompt: "verify-non-duplicate".to_string(),
+                    conversation_id: None,
+                    model: Some("gemini-3.8-flash-high".to_string()),
+                    effort: None,
+                    icarus_mode: false,
+                    working_dir: None,
+                },
+                cancel,
+                Some(tx),
+            )
+            .await
+            .expect("run turn on fake-agy");
+
+        // Verify accurate response fields
+        assert_eq!(
+            response.conversation_id,
+            Some("fake-conv-uuid-12345".to_string())
+        );
+        assert_eq!(response.status, "SUCCESS");
+        assert_eq!(response.cumulative_usage.total_tokens, 550);
+        assert!(!response.was_canceled);
+
+        // Collect all streamed events
+        let mut received_events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            received_events.push(event);
+        }
+
+        // Must receive exactly 4 events: Init, StepUpdate (user), StepUpdate (agent), Result
+        assert_eq!(
+            received_events.len(),
+            4,
+            "Expected exactly 4 stream events, received {}",
+            received_events.len()
+        );
+
+        match &received_events[0] {
+            AgyEvent::Init {
+                conversation_id, ..
+            } => {
+                assert_eq!(conversation_id.as_deref(), Some("fake-conv-uuid-12345"));
+            }
+            other => panic!("Expected Init event first, got {:?}", other),
+        }
+
+        match &received_events[3] {
+            AgyEvent::Result { result } => {
+                assert_eq!(result.status, "SUCCESS");
+                assert_eq!(result.usage.as_ref().unwrap().total_tokens, 550);
+            }
+            other => panic!("Expected Result event last, got {:?}", other),
+        }
+    }
 }
