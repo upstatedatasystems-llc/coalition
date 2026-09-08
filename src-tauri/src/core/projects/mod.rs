@@ -139,30 +139,120 @@ impl ProjectService {
             )
             .optional()?;
 
-        // 2. Inspect or recover durable contract from .coalition
-        let artifact_opt = ArtifactManager::inspect_or_recover_project(&repo_root)?;
+        // 2. Inspect durable/recovery artifacts WITHOUT mutation
+        let inspection = ArtifactManager::inspect_project_artifacts(&repo_root)?;
+        let coalition_dir = repo_root.join(".coalition");
+        let canonical_yaml_path = coalition_dir.join("project.yaml");
 
-        // Reconcile Case D: path is registered in SQLite but durable contract is missing on disk
-        if let (Some(by_path), None) = (&record_by_path, &artifact_opt) {
-            return Err(ProjectError::DurableContractMissing {
-                path: canonical_path_str,
-                project_id: by_path.project_id.clone(),
-            });
+        // Check for ambiguous or corrupted recovery state when canonical is missing
+        if inspection.canonical.is_none() && inspection.ambiguous_or_invalid_recovery_state {
+            return Err(ProjectError::RecoveryRequired(
+                "Ambiguous or corrupted backup state in .coalition requires manual recovery"
+                    .to_string(),
+            ));
         }
 
-        // Obtain or initialize durable project.yaml
-        let (project_yaml, created_new_artifact) = match artifact_opt {
-            Some(yaml) => (yaml, false),
-            None => {
-                // Case A: neither SQLite nor disk knows this project; initialize brand new contract
-                let new_yaml = ArtifactManager::initialize_new_project(&repo_root, default_name)?;
-                (new_yaml, true)
+        // Check for canonical missing with only temp files present
+        if inspection.canonical.is_none()
+            && inspection.valid_backups.is_empty()
+            && inspection.temp_files_present
+        {
+            return Err(ProjectError::RecoveryRequired(
+                "Incomplete write detected in .coalition (only temp files present); manual recovery required".to_string(),
+            ));
+        }
+
+        // 3. Reconcile identity and authorize backup promotion or new contract initialization
+        let (project_yaml, created_new_artifact, was_rehydrated) = if let Some(canonical_yaml) =
+            inspection.canonical
+        {
+            // Canonical exists! Clean any stale temp files.
+            ArtifactManager::clean_stale_temp_files(&coalition_dir);
+            (canonical_yaml, false, false)
+        } else if inspection.valid_backups.len() == 1 {
+            let candidate = &inspection.valid_backups[0];
+            let candidate_id = &candidate.project.project_id;
+
+            if let Some(ref by_path) = record_by_path {
+                // Known path in SQLite
+                if by_path.project_id == *candidate_id {
+                    // Identity matches! Authorize promotion
+                    ArtifactManager::promote_backup_to_canonical(
+                        &candidate.path,
+                        &canonical_yaml_path,
+                    )?;
+                    (candidate.project.clone(), false, false)
+                } else {
+                    // Conflicting ID! Reject without promoting
+                    return Err(ProjectError::IdentityConflict(format!(
+                        "Repository path '{}' is registered with project_id '{}', but backup contract specifies conflicting project_id '{}'",
+                        canonical_path_str, by_path.project_id, candidate_id
+                    )));
+                }
+            } else {
+                // Unknown path in SQLite. Query SQLite by candidate ID.
+                let record_by_id: Option<ProjectRecord> = conn
+                    .query_row(
+                        "SELECT project_id, name, repository_path, created_at, updated_at, last_opened_at
+                         FROM projects
+                         WHERE project_id = ?1",
+                        params![candidate_id],
+                        |r| {
+                            Ok(ProjectRecord {
+                                project_id: r.get(0)?,
+                                name: r.get(1)?,
+                                repository_path: r.get(2)?,
+                                created_at: r.get(3)?,
+                                updated_at: r.get(4)?,
+                                last_opened_at: r.get(5)?,
+                            })
+                        },
+                    )
+                    .optional()?;
+
+                if let Some(ref by_id) = record_by_id {
+                    let old_path = PathBuf::from(&by_id.repository_path);
+                    if old_path.exists() {
+                        // Active checkout collision! Reject without promoting
+                        return Err(ProjectError::IdentityConflict(format!(
+                            "Project ID '{}' from backup is already registered at active path '{}'. Cannot register duplicate checkout at '{}'",
+                            candidate_id, by_id.repository_path, canonical_path_str
+                        )));
+                    }
+                    // Moved repository! Authorize promotion
+                    ArtifactManager::promote_backup_to_canonical(
+                        &candidate.path,
+                        &canonical_yaml_path,
+                    )?;
+                    (candidate.project.clone(), false, false)
+                } else {
+                    // Neither path nor ID is known to SQLite (e.g. SQLite was deleted / fresh DB).
+                    // Authorize promotion as durable rehydration.
+                    ArtifactManager::promote_backup_to_canonical(
+                        &candidate.path,
+                        &canonical_yaml_path,
+                    )?;
+                    (candidate.project.clone(), false, true)
+                }
             }
+        } else {
+            // No canonical, no backups, no temp files
+            if let Some(ref by_path) = record_by_path {
+                // Known path in SQLite, but no durable contract: Case D!
+                return Err(ProjectError::DurableContractMissing {
+                    path: canonical_path_str,
+                    project_id: by_path.project_id.clone(),
+                });
+            }
+
+            // Case A: Neither SQLite nor disk knows this repository.
+            let new_yaml = ArtifactManager::initialize_new_project(&repo_root, default_name)?;
+            (new_yaml, true, false)
         };
 
         let now = chrono::Utc::now().to_rfc3339();
 
-        // 3. Identity conflict and move reconciliation against existing SQLite state
+        // 4. Query SQLite by project ID for operational state persistence
         let record_by_id: Option<ProjectRecord> = conn
             .query_row(
                 "SELECT project_id, name, repository_path, created_at, updated_at, last_opened_at
@@ -185,7 +275,7 @@ impl ProjectService {
         // Perform operational state persistence in an explicit SQLite transaction
         let tx = conn.transaction()?;
 
-        let (project_record, was_rehydrated) = match (record_by_id, record_by_path) {
+        let (project_record, is_rehydration) = match (record_by_id, record_by_path) {
             (Some(mut by_id), Some(by_path)) => {
                 if by_id.project_id != by_path.project_id {
                     return Err(ProjectError::IdentityConflict(format!(
@@ -277,8 +367,7 @@ impl ProjectService {
                     ],
                 )?;
 
-                let is_rehydration = !created_new_artifact;
-                (record, is_rehydration)
+                (record, was_rehydrated || !created_new_artifact)
             }
         };
 
@@ -324,7 +413,7 @@ impl ProjectService {
                     project_record.name, project_record.repository_path
                 ),
             )
-        } else if was_rehydrated {
+        } else if is_rehydration {
             (
                 "PROJECT_REHYDRATED",
                 format!(
@@ -964,5 +1053,339 @@ mod tests {
         let rec = ProjectService::get_project_details(db.connection(), Some(&git), &original_pid)
             .unwrap();
         assert_eq!(rec.project.project_id, original_pid);
+    }
+
+    #[test]
+    fn test_valid_canonical_plus_stale_backup_canonical_wins() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let repo_dir = tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        // Register project
+        let details =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap();
+        let pid = details.project.project_id.clone();
+        let coalition = repo_dir.path().join(".coalition");
+
+        // Plant a stale backup with a different project ID
+        let stale_backup = coalition.join("project.yaml.bak.old");
+        let stale_proj = ProjectYaml {
+            schema_version: 1,
+            project_id: uuid::Uuid::new_v4().to_string(),
+            name: "stale-backup".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+        fs::write(&stale_backup, serde_yaml::to_string(&stale_proj).unwrap()).unwrap();
+
+        // Reopen project: canonical must win!
+        let reopened =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap();
+        assert_eq!(reopened.project.project_id, pid);
+        assert_eq!(reopened.artifact.unwrap().project_id, pid);
+    }
+
+    #[test]
+    fn test_known_path_matching_backup_promoted() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let repo_dir = tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        // Register project
+        let details =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap();
+        let pid = details.project.project_id.clone();
+        let coalition = repo_dir.path().join(".coalition");
+
+        // Remove canonical project.yaml and place single valid backup with SAME project_id
+        let canonical_path = coalition.join("project.yaml");
+        fs::remove_file(&canonical_path).unwrap();
+
+        let backup_path = coalition.join("project.yaml.bak.matching");
+        let mut backup_proj = details.artifact.unwrap();
+        backup_proj.name = "promoted-from-backup".to_string();
+        fs::write(&backup_path, serde_yaml::to_string(&backup_proj).unwrap()).unwrap();
+
+        // Reopen project: matching backup must be promoted to canonical!
+        let reopened =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap();
+        assert_eq!(reopened.project.project_id, pid);
+        assert!(
+            canonical_path.exists(),
+            "Canonical project.yaml must now exist"
+        );
+        let on_disk = ArtifactManager::read_project_yaml(&canonical_path).unwrap();
+        assert_eq!(on_disk.project_id, pid);
+        assert_eq!(on_disk.name, "promoted-from-backup");
+    }
+
+    #[test]
+    fn test_known_path_conflicting_backup_rejected_no_mutation() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let repo_dir = tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        // Register project
+        let _details =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap();
+        let coalition = repo_dir.path().join(".coalition");
+
+        // Remove canonical project.yaml and place single valid backup with CONFLICTING project_id
+        let canonical_path = coalition.join("project.yaml");
+        fs::remove_file(&canonical_path).unwrap();
+
+        let backup_path = coalition.join("project.yaml.bak.conflicting");
+        let conflicting_proj = ProjectYaml {
+            schema_version: 1,
+            project_id: uuid::Uuid::new_v4().to_string(),
+            name: "conflicting".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+        fs::write(
+            &backup_path,
+            serde_yaml::to_string(&conflicting_proj).unwrap(),
+        )
+        .unwrap();
+
+        // Reopen project: must return IdentityConflict
+        let err =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap_err();
+        assert!(matches!(err, ProjectError::IdentityConflict(_)));
+
+        // CRITICAL: Ensure zero promotion mutation occurred
+        assert!(
+            !canonical_path.exists(),
+            "Must NOT promote conflicting backup"
+        );
+        assert!(backup_path.exists(), "Backup must remain untouched");
+    }
+
+    #[test]
+    fn test_unknown_path_backup_registered_at_active_path_rejected() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        // Repo 1 is registered and active
+        let repo1 = tempdir().unwrap();
+        init_test_git_repo(repo1.path());
+        let details1 =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo1.path())
+                .unwrap();
+
+        // Repo 2 at unknown path has no canonical, but has backup with active_pid
+        let repo2 = tempdir().unwrap();
+        init_test_git_repo(repo2.path());
+        let coalition2 = repo2.path().join(".coalition");
+        fs::create_dir_all(&coalition2).unwrap();
+
+        let backup_path = coalition2.join("project.yaml.bak.duplicate");
+        let mut duplicate_proj = details1.artifact.unwrap();
+        duplicate_proj.name = "duplicate-checkout".to_string();
+        fs::write(
+            &backup_path,
+            serde_yaml::to_string(&duplicate_proj).unwrap(),
+        )
+        .unwrap();
+
+        // Registering repo 2 must detect active checkout collision and reject
+        let err = ProjectService::register_or_open_project(db.connection_mut(), &git, repo2.path())
+            .unwrap_err();
+        assert!(matches!(err, ProjectError::IdentityConflict(_)));
+        assert!(
+            !coalition2.join("project.yaml").exists(),
+            "Must not promote duplicate backup"
+        );
+    }
+
+    #[test]
+    fn test_unknown_path_backup_from_moved_path_recovered() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        // Register original project
+        let repo1 = tempdir().unwrap();
+        init_test_git_repo(repo1.path());
+        let details1 =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo1.path())
+                .unwrap();
+        let pid = details1.project.project_id.clone();
+        let backup_content = details1.artifact.unwrap();
+
+        // Drop repo1 (simulating move)
+        drop(repo1);
+
+        // Repo 2 at new path has backup with same ID
+        let repo2 = tempdir().unwrap();
+        init_test_git_repo(repo2.path());
+        let coalition2 = repo2.path().join(".coalition");
+        fs::create_dir_all(&coalition2).unwrap();
+        let backup_path = coalition2.join("project.yaml.bak.moved");
+        fs::write(
+            &backup_path,
+            serde_yaml::to_string(&backup_content).unwrap(),
+        )
+        .unwrap();
+
+        // Registering repo 2 succeeds as moved repository recovery
+        let details2 =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo2.path())
+                .unwrap();
+        assert_eq!(details2.project.project_id, pid);
+        assert!(
+            coalition2.join("project.yaml").exists(),
+            "Backup must be promoted"
+        );
+
+        // SQLite path updated to repo2
+        let canonical2 = git.resolve_repo_root(repo2.path()).unwrap();
+        assert_eq!(
+            details2.project.repository_path,
+            canonical2.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn test_fresh_db_single_valid_backup_rehydrated() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let repo_dir = tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+        let coalition = repo_dir.path().join(".coalition");
+        fs::create_dir_all(&coalition).unwrap();
+
+        let pid = uuid::Uuid::new_v4().to_string();
+        let backup_proj = ProjectYaml {
+            schema_version: 1,
+            project_id: pid.clone(),
+            name: "rehydrated-from-backup".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+        fs::write(
+            coalition.join("project.yaml.bak.1"),
+            serde_yaml::to_string(&backup_proj).unwrap(),
+        )
+        .unwrap();
+
+        // Register in empty DB
+        let details =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap();
+        assert_eq!(details.project.project_id, pid);
+        assert!(
+            coalition.join("project.yaml").exists(),
+            "Backup must be promoted"
+        );
+
+        // Verify PROJECT_REHYDRATED logged
+        let events =
+            ActivityManager::get_project_activity(db.connection(), &pid, Some(10)).unwrap();
+        assert!(
+            events.iter().any(|e| e.event_type == "PROJECT_REHYDRATED"),
+            "Must be logged as PROJECT_REHYDRATED"
+        );
+    }
+
+    #[test]
+    fn test_multiple_backups_recovery_required_no_mutation() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let repo_dir = tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+        let coalition = repo_dir.path().join(".coalition");
+        fs::create_dir_all(&coalition).unwrap();
+
+        let proj1 = ProjectYaml {
+            schema_version: 1,
+            project_id: uuid::Uuid::new_v4().to_string(),
+            name: "backup-1".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+        let proj2 = ProjectYaml {
+            schema_version: 1,
+            project_id: uuid::Uuid::new_v4().to_string(),
+            name: "backup-2".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+
+        fs::write(
+            coalition.join("project.yaml.bak.1"),
+            serde_yaml::to_string(&proj1).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            coalition.join("project.yaml.bak.2"),
+            serde_yaml::to_string(&proj2).unwrap(),
+        )
+        .unwrap();
+
+        let err =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap_err();
+        assert!(matches!(err, ProjectError::RecoveryRequired(_)));
+        assert!(
+            !coalition.join("project.yaml").exists(),
+            "Must NOT create project.yaml"
+        );
+        assert!(coalition.join("project.yaml.bak.1").exists());
+        assert!(coalition.join("project.yaml.bak.2").exists());
+    }
+
+    #[test]
+    fn test_only_temp_file_missing_canonical_recovery_required() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let repo_dir = tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+        let coalition = repo_dir.path().join(".coalition");
+        fs::create_dir_all(&coalition).unwrap();
+
+        // Plant only a temp file
+        let temp_file = coalition.join("project.yaml.tmp.interrupted");
+        fs::write(&temp_file, "interrupted write data").unwrap();
+
+        let err =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap_err();
+        assert!(matches!(err, ProjectError::RecoveryRequired(_)));
+        assert!(
+            !coalition.join("project.yaml").exists(),
+            "Must NOT create project.yaml"
+        );
+        assert!(
+            temp_file.exists(),
+            "Temp file must remain for recovery inspection"
+        );
     }
 }

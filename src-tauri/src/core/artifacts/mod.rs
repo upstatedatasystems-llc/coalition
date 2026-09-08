@@ -43,6 +43,20 @@ pub struct ProjectYaml {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryCandidate {
+    pub path: PathBuf,
+    pub project: ProjectYaml,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectArtifactInspection {
+    pub canonical: Option<ProjectYaml>,
+    pub valid_backups: Vec<RecoveryCandidate>,
+    pub temp_files_present: bool,
+    pub ambiguous_or_invalid_recovery_state: bool,
+}
+
 #[derive(Error, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArtifactError {
     #[error("Path traversal detected: {path} escapes repository root {root}")]
@@ -239,17 +253,13 @@ impl ArtifactManager {
         }
     }
 
-    /// Inspects the project state in .coalition or recovers from a single valid backup.
-    /// Precedence:
-    /// 1. If project.yaml exists and is valid: cleans stale temp files and returns Some(project).
-    /// 2. If project.yaml is missing:
-    ///    - Checks for project.yaml.bak.*
-    ///    - If exactly one valid backup exists: promotes it atomically to project.yaml, cleans stale temp files, returns Some(recovered).
-    ///    - If multiple backups or corrupted backup: returns Err(ArtifactError::RecoveryRequired).
-    ///    - If no backups: returns Ok(None).
-    pub fn inspect_or_recover_project<P: AsRef<Path>>(
+    /// Non-mutating inspection of .coalition artifacts.
+    /// Identifies canonical project.yaml, valid backup candidates, presence of temp files,
+    /// and whether the directory is in an ambiguous or corrupted recovery state.
+    /// Does NOT mutate, promote, or delete any files.
+    pub fn inspect_project_artifacts<P: AsRef<Path>>(
         repo_root: P,
-    ) -> Result<Option<ProjectYaml>, ArtifactError> {
+    ) -> Result<ProjectArtifactInspection, ArtifactError> {
         let canonical_root = repo_root
             .as_ref()
             .canonicalize()
@@ -257,56 +267,73 @@ impl ArtifactManager {
 
         let coalition_dir = canonical_root.join(".coalition");
         if !coalition_dir.exists() {
-            return Ok(None);
+            return Ok(ProjectArtifactInspection {
+                canonical: None,
+                valid_backups: Vec::new(),
+                temp_files_present: false,
+                ambiguous_or_invalid_recovery_state: false,
+            });
         }
 
         Self::validate_safe_path(&canonical_root, &coalition_dir)?;
 
         let project_yaml_path = coalition_dir.join("project.yaml");
-        if project_yaml_path.exists() {
+        let canonical = if project_yaml_path.exists() {
             Self::validate_safe_path(&canonical_root, &project_yaml_path)?;
-            let project = Self::read_project_yaml(&project_yaml_path)?;
-            Self::clean_stale_temp_files(&coalition_dir);
-            return Ok(Some(project));
-        }
+            Some(Self::read_project_yaml(&project_yaml_path)?)
+        } else {
+            None
+        };
 
-        // project.yaml is missing; check for backup files
-        let mut backups = Vec::new();
+        let mut valid_backups = Vec::new();
+        let mut temp_files_present = false;
+        let mut ambiguous_or_invalid_recovery_state = false;
+
         if let Ok(entries) = fs::read_dir(&coalition_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("project.yaml.bak.") {
-                    backups.push(entry.path());
+                let path = entry.path();
+                if name.starts_with("project.yaml.tmp.") {
+                    temp_files_present = true;
+                } else if name.starts_with("project.yaml.bak.") {
+                    if let Ok(()) = Self::validate_safe_path(&canonical_root, &path) {
+                        match Self::read_project_yaml(&path) {
+                            Ok(project) => {
+                                valid_backups.push(RecoveryCandidate { path, project });
+                            }
+                            Err(_) => {
+                                ambiguous_or_invalid_recovery_state = true;
+                            }
+                        }
+                    } else {
+                        ambiguous_or_invalid_recovery_state = true;
+                    }
                 }
             }
         }
 
-        if backups.is_empty() {
-            Self::clean_stale_temp_files(&coalition_dir);
-            return Ok(None);
+        if valid_backups.len() > 1 {
+            ambiguous_or_invalid_recovery_state = true;
         }
 
-        if backups.len() == 1 {
-            let backup_path = &backups[0];
-            Self::validate_safe_path(&canonical_root, backup_path)?;
-            match Self::read_project_yaml(backup_path) {
-                Ok(recovered) => {
-                    Self::replace_file_atomically(backup_path, &project_yaml_path)?;
-                    Self::clean_stale_temp_files(&coalition_dir);
-                    Ok(Some(recovered))
-                }
-                Err(e) => Err(ArtifactError::RecoveryRequired(format!(
-                    "Found single backup file '{:?}', but it is corrupted/invalid: {}",
-                    backup_path.file_name().unwrap_or_default(),
-                    e
-                ))),
-            }
-        } else {
-            Err(ArtifactError::RecoveryRequired(format!(
-                "Multiple project.yaml backup files (count: {}) found in .coalition; manual recovery required to avoid selecting wrong state",
-                backups.len()
-            )))
+        Ok(ProjectArtifactInspection {
+            canonical,
+            valid_backups,
+            temp_files_present,
+            ambiguous_or_invalid_recovery_state,
+        })
+    }
+
+    /// Authoritatively promotes an authorized backup to canonical project.yaml and cleans stale temp files.
+    pub fn promote_backup_to_canonical(
+        backup_path: &Path,
+        canonical_path: &Path,
+    ) -> Result<(), ArtifactError> {
+        Self::replace_file_atomically(backup_path, canonical_path)?;
+        if let Some(parent) = canonical_path.parent() {
+            Self::clean_stale_temp_files(parent);
         }
+        Ok(())
     }
 
     /// Creates .coalition directory, ensures standard subdirectories, and writes a brand new project.yaml.
@@ -349,7 +376,7 @@ impl ArtifactManager {
         Ok(new_project)
     }
 
-    /// Initializes standard durable .coalition layout if not present, and loads/recovers project.yaml.
+    /// Initializes standard durable .coalition layout if not present, and loads project.yaml if already present.
     pub fn initialize_or_load_project<P: AsRef<Path>>(
         repo_root: P,
         default_name: &str,
@@ -362,7 +389,8 @@ impl ArtifactManager {
         let coalition_dir = canonical_root.join(".coalition");
         if coalition_dir.exists() {
             Self::validate_coalition_layout(&canonical_root, &coalition_dir)?;
-            if let Some(existing) = Self::inspect_or_recover_project(&canonical_root)? {
+            let inspection = Self::inspect_project_artifacts(&canonical_root)?;
+            if let Some(existing) = inspection.canonical {
                 return Ok((existing, false));
             }
         }
@@ -466,7 +494,6 @@ fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), A
     };
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-        REPLACEFILE_WRITE_THROUGH,
     };
 
     let temp_wide: Vec<u16> = temp
@@ -481,30 +508,105 @@ fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), A
         .collect();
 
     if destination.exists() {
+        let parent = destination.parent().ok_or_else(|| {
+            ArtifactError::Io("Destination path has no parent directory".to_string())
+        })?;
+        let backup_path = parent.join(format!("project.yaml.bak.{}", Uuid::new_v4()));
+        let backup_wide: Vec<u16> = backup_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
         let res = unsafe {
             ReplaceFileW(
                 dest_wide.as_ptr(),
                 temp_wide.as_ptr(),
-                std::ptr::null(),
-                REPLACEFILE_WRITE_THROUGH,
+                backup_wide.as_ptr(),
+                0, // dwReplaceFlags = 0 (REPLACEFILE_WRITE_THROUGH is unsupported for ReplaceFileW)
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )
         };
 
         if res != 0 {
-            return Ok(());
+            // ReplaceFileW succeeded from the OS perspective.
+            // Validate that the destination contains a valid project descriptor before cleaning backup.
+            match ArtifactManager::read_project_yaml(destination) {
+                Ok(_) => {
+                    // Valid! Safely remove the generated backup.
+                    let _ = fs::remove_file(&backup_path);
+                    return Ok(());
+                }
+                Err(read_err) => {
+                    // Canonical file validation failed after ReplaceFileW.
+                    // If backup exists, attempt to restore it before reporting error.
+                    if backup_path.exists() {
+                        let _ = unsafe {
+                            MoveFileExW(
+                                backup_wide.as_ptr(),
+                                dest_wide.as_ptr(),
+                                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                            )
+                        };
+                    }
+                    return Err(ArtifactError::RecoveryRequired(format!(
+                        "ReplaceFileW succeeded but destination validation failed: {}. Preserved recovery artifacts.",
+                        read_err
+                    )));
+                }
+            }
         }
 
         let err = unsafe { GetLastError() };
         if err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND {
-            return Err(ArtifactError::Io(format!(
-                "ReplaceFileW failed with OS error code {}",
-                err
-            )));
+            // Failure occurred. Inspect actual filesystem state.
+            let dest_exists = destination.exists();
+            let backup_exists = backup_path.exists();
+
+            if !dest_exists && backup_exists {
+                // The destination was moved/renamed to backup before failure occurred!
+                // Restore destination from backup.
+                let restore_res = unsafe {
+                    MoveFileExW(
+                        backup_wide.as_ptr(),
+                        dest_wide.as_ptr(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                    )
+                };
+                if restore_res != 0 && ArtifactManager::read_project_yaml(destination).is_ok() {
+                    let _ = fs::remove_file(temp);
+                    return Err(ArtifactError::Io(format!(
+                        "ReplaceFileW failed (OS error {}). Destination was restored from backup.",
+                        err
+                    )));
+                } else {
+                    return Err(ArtifactError::RecoveryRequired(format!(
+                        "ReplaceFileW failed (OS error {}). Destination lost and backup restore failed. Manual recovery required.",
+                        err
+                    )));
+                }
+            } else if dest_exists && ArtifactManager::read_project_yaml(destination).is_ok() {
+                // Destination is still intact and valid.
+                let _ = fs::remove_file(temp);
+                if backup_exists {
+                    let _ = fs::remove_file(&backup_path);
+                }
+                return Err(ArtifactError::Io(format!(
+                    "ReplaceFileW failed with OS error code {}. Original destination remains intact.",
+                    err
+                )));
+            } else {
+                // Ambiguous or corrupted state
+                return Err(ArtifactError::RecoveryRequired(format!(
+                    "ReplaceFileW failed with OS error code {}. Filesystem in ambiguous recovery state.",
+                    err
+                )));
+            }
         }
     }
 
+    // Destination did not exist initially (or raced): use MoveFileExW
     let res = unsafe {
         MoveFileExW(
             temp_wide.as_ptr(),
@@ -880,16 +982,22 @@ mod tests {
         fs::write(&stale_temp, "temporary stale data").unwrap();
         assert!(stale_temp.exists());
 
-        // Calling inspect_or_recover_project cleans stale temp files
-        let inspected = ArtifactManager::inspect_or_recover_project(dir.path())
-            .unwrap()
-            .expect("should find project");
-        assert_eq!(inspected.project_id, project.project_id);
+        // Calling inspect_project_artifacts detects temp file without mutating
+        let inspection = ArtifactManager::inspect_project_artifacts(dir.path()).unwrap();
+        assert_eq!(
+            inspection.canonical.as_ref().unwrap().project_id,
+            project.project_id
+        );
+        assert!(inspection.temp_files_present);
+        assert!(stale_temp.exists(), "Inspection must be non-mutating");
+
+        // Clean stale temp files
+        ArtifactManager::clean_stale_temp_files(&coalition);
         assert!(!stale_temp.exists(), "stale temp file must be cleaned up");
     }
 
     #[test]
-    fn test_single_valid_backup_recovery() {
+    fn test_single_valid_backup_inspection_and_promotion() {
         let dir = tempdir().unwrap();
         let coalition = dir.path().join(".coalition");
         fs::create_dir_all(&coalition).unwrap();
@@ -910,12 +1018,21 @@ mod tests {
         let project_yaml_path = coalition.join("project.yaml");
         assert!(!project_yaml_path.exists());
 
-        // inspect_or_recover_project recovers the single valid backup
-        let recovered = ArtifactManager::inspect_or_recover_project(dir.path())
-            .unwrap()
-            .expect("should recover project");
-        assert_eq!(recovered.project_id, backup_project.project_id);
-        assert_eq!(recovered.name, "recovered-project");
+        // inspect_project_artifacts identifies the single valid backup WITHOUT mutating
+        let inspection = ArtifactManager::inspect_project_artifacts(dir.path()).unwrap();
+        assert!(inspection.canonical.is_none());
+        assert_eq!(inspection.valid_backups.len(), 1);
+        assert_eq!(
+            inspection.valid_backups[0].project.project_id,
+            backup_project.project_id
+        );
+        assert!(!inspection.ambiguous_or_invalid_recovery_state);
+        // Canonical project.yaml must NOT exist yet (inspection is non-mutating)
+        assert!(!project_yaml_path.exists());
+        assert!(backup_file.exists());
+
+        // Now perform authorized promotion
+        ArtifactManager::promote_backup_to_canonical(&backup_file, &project_yaml_path).unwrap();
 
         // Canonical project.yaml must now exist on disk
         assert!(project_yaml_path.exists());
@@ -957,13 +1074,65 @@ mod tests {
         )
         .unwrap();
 
-        let err = ArtifactManager::inspect_or_recover_project(dir.path()).unwrap_err();
-        assert!(matches!(err, ArtifactError::RecoveryRequired(_)));
+        let inspection = ArtifactManager::inspect_project_artifacts(dir.path()).unwrap();
+        assert!(inspection.canonical.is_none());
+        assert!(inspection.ambiguous_or_invalid_recovery_state);
 
         // Neither backup should be deleted
         assert!(coalition.join("project.yaml.bak.1").exists());
         assert!(coalition.join("project.yaml.bak.2").exists());
         assert!(!coalition.join("project.yaml").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_native_replace_file_w_success() {
+        let dir = tempdir().unwrap();
+        let canonical_root = dir.path().canonicalize().unwrap();
+        let coalition = canonical_root.join(".coalition");
+        fs::create_dir_all(&coalition).unwrap();
+
+        let initial_project = ProjectYaml {
+            schema_version: 1,
+            project_id: Uuid::new_v4().to_string(),
+            name: "initial-replace-w".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+        let project_yaml_path = coalition.join("project.yaml");
+        fs::write(
+            &project_yaml_path,
+            serde_yaml::to_string(&initial_project).unwrap(),
+        )
+        .unwrap();
+
+        let mut updated_project = initial_project.clone();
+        updated_project.name = "updated-replace-w".to_string();
+
+        // Exercise the actual ReplaceFileW path (destination exists, flags = 0, backup path used)
+        ArtifactManager::write_project_yaml_atomic(&project_yaml_path, &updated_project).unwrap();
+
+        // 1. Verify destination replaced with new content
+        let read_back = ArtifactManager::read_project_yaml(&project_yaml_path).unwrap();
+        assert_eq!(read_back.name, "updated-replace-w");
+        assert_eq!(read_back.project_id, initial_project.project_id);
+
+        // 2. Verify no stale generated backup or temp files remain after confirmed success
+        let entries: Vec<_> = fs::read_dir(&coalition)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !entries.iter().any(|f| f.starts_with("project.yaml.bak.")),
+            "Generated backup must be cleaned up on confirmed success: found {:?}",
+            entries
+        );
+        assert!(
+            !entries.iter().any(|f| f.starts_with("project.yaml.tmp.")),
+            "Temporary file must be cleaned up on confirmed success: found {:?}",
+            entries
+        );
     }
 
     #[test]

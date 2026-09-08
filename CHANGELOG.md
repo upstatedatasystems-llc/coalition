@@ -7,12 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added - Stage 1 Final Durability and Identity Closure
-- Genuine crash-safe platform-native atomic replacement for `project.yaml` via Windows `ReplaceFileW` with `REPLACEFILE_WRITE_THROUGH` (and `MoveFileExW` write-through fallback), eliminating the vulnerability window where existing contracts could be lost during unlinking/rename steps.
-- Stale temp file cleanup and single valid backup recovery in `ArtifactManager::inspect_or_recover_project`, with ambiguous/corrupted backups returning typed `ARTIFACT_RECOVERY_REQUIRED` (`ArtifactError::RecoveryRequired`).
+- Genuine crash-safe platform-native atomic replacement for `project.yaml` via Windows `ReplaceFileW` with `dwReplaceFlags = 0` (Microsoft documents `REPLACEFILE_WRITE_THROUGH` as unsupported for `ReplaceFileW`), an explicit same-directory backup (`project.yaml.bak.<uuid>`), post-call destination validation, and reconciliation of documented failure states.
+- Separation of artifact inspection from recovery mutation via `inspect_project_artifacts()`, enforcing strict identity-before-promotion in `ProjectService` so that recovery candidates are never promoted until identity is validated against SQLite registration history.
+- Coalition flushes replacement data before invoking the native replacement primitive. On Windows it uses `ReplaceFileW` with a same-directory backup, reconciles documented failure states, and never authorizes recovery candidate promotion until project identity has been validated.
+- Stale temp file cleanup and single valid backup recovery in `ArtifactManager`, with ambiguous/corrupted backups returning typed `ARTIFACT_RECOVERY_REQUIRED` (`ArtifactError::RecoveryRequired`).
 - Strict UUID v4 enforcement in `ArtifactManager::validate_project_yaml` requiring RFC 4122 version 4 (`Version::Random`), rejecting Nil UUIDs, v1, v3, v5, and malformed strings.
 - Exact Draft architecture version invariant: `architecture_state: draft` strictly requires `current_architecture_version` to be `None` / omitted (rejecting empty string `""` and whitespace `"   "` with `INVALID_ARCHITECTURE_STATE`).
 - Operational-first project registration ordering querying SQLite canonical path before touching durable files; missing contract for registered path (Case D) returns typed `DURABLE_CONTRACT_MISSING` with zero durable identity mutation.
-- Replacement failure injection test seam and comprehensive tests covering UUID v4 validation, draft invariants, backup recovery, stale temp cleanup, and Case D/E identity reconciliation.
+- Replacement failure injection test seam and comprehensive tests covering Windows native `ReplaceFileW` replacement, UUID v4 validation, draft invariants, backup recovery, stale temp cleanup, and Case D/E identity reconciliation.
 
 ### Added - Phase 1 (Coalition Core and Project Persistence)
 - Authoritative Rust workflow state machine implementing all 19 V1 states with strict transition validation, pause/resume state preservation, atomic revision increments, and human architecture change requests from `PAUSED` and `INTERRUPTED` states when paused from post-freeze development.

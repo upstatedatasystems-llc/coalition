@@ -71,34 +71,32 @@ All standard `.coalition/` subdirectories (`design`, `implementation`, `decision
 
 ### Crash-Safe Platform-Native Atomic Replacement
 
-Updating `project.yaml` via `ArtifactManager::write_project_yaml_atomic` provides genuine crash-safe replacement without ever leaving the system in a window where no canonical file exists:
+> Coalition flushes replacement data before invoking the native replacement primitive. On Windows it uses `ReplaceFileW` with a same-directory backup, reconciles documented failure states, and never authorizes recovery candidate promotion until project identity has been validated.
+
+Updating `project.yaml` via `ArtifactManager::write_project_yaml_atomic` guarantees durability and handles all documented failure states:
 1. Validates the `ProjectYaml` descriptor in memory against all schema v1 invariants before touching the disk.
 2. Writes serialized YAML to a unique temporary file (`project.yaml.tmp.<uuid>`) in the `.coalition/` folder.
-3. Flushes and syncs the file descriptor (`sync_all()`) to ensure physical disk commitment.
+3. Flushes and syncs the file descriptor (`sync_all()`) to ensure physical disk commitment before replacement.
 4. Atomically replaces destination using native platform APIs:
-   - **Windows**: `ReplaceFileW` with `REPLACEFILE_WRITE_THROUGH` (falling back to `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` if destination does not exist). The existing file is never renamed to a backup on normal writes, eliminating any crash window between an unlinking and renaming step.
+   - **Windows**: `ReplaceFileW` with `dwReplaceFlags = 0` (Microsoft documents `REPLACEFILE_WRITE_THROUGH` as unsupported for `ReplaceFileW`) and an explicit same-directory backup path (`project.yaml.bak.<uuid>`). If destination does not exist initially, falls back to `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`.
    - **POSIX**: `std::fs::rename` plus directory `sync_all()`.
-5. If replacement fails, the temporary file is deleted and the existing `project.yaml` is left completely intact.
+5. **Post-Call Reconciliation**:
+   - **On Success**: Validates and reads canonical destination `project.yaml`. Only after successful validation is the generated backup safely deleted.
+   - **On Failure**: Explicitly inspects destination, temporary file, and generated backup. If destination was unlinked/renamed to backup by the OS prior to failure, destination is restored from backup; if destination is intact and valid, the temp file is removed; if state is ambiguous, all files are preserved and `ARTIFACT_RECOVERY_REQUIRED` is returned.
 
-### Stale Backup & Temp File Recovery Policy
+### Non-Mutating Artifact Inspection & Identity-Before-Promotion Policy
 
-If an unexpected crash or interrupted operation occurred, `ArtifactManager::inspect_or_recover_project` resolves state with strict precedence:
-1. **Canonical `project.yaml` exists and is valid**: Project truth is intact. Any stale `project.yaml.tmp.*` files are safely pruned.
-2. **Canonical `project.yaml` is missing**:
-   - The `.coalition` directory is scanned for legacy or recovery backups (`project.yaml.bak.*`).
-   - If **exactly 1** valid backup exists: It is safely and atomically promoted to `project.yaml` via `replace_file_atomically`, stale temp files are cleaned, and the project is loaded.
-   - If **multiple** backups exist, or if a single backup is corrupted/invalid: The system refuses to guess, avoids arbitrary selection, and returns structured error `ARTIFACT_RECOVERY_REQUIRED` (`ArtifactError::RecoveryRequired`).
-   - If no backups exist: Returns `None`.
-
-### Operational-First Registration Ordering & Missing Contract Semantics
-
-When opening or registering a project repository:
-1. SQLite is queried by canonical path *first*, before any durable files are created or identity is generated.
-2. If the canonical path is already registered in SQLite, but `project.yaml` is missing on disk (Case D):
-   - The operation fails immediately with structured error `DURABLE_CONTRACT_MISSING` (`ProjectError::DurableContractMissing`).
-   - **Zero durable identity mutation occurs on disk** (no new `project.yaml` is created).
-3. If the repository is completely new to both SQLite and disk (Case A), a new UUID v4 `project.yaml` is initialized.
-4. When a project's repository is offline or deleted from disk:
+1. **Non-Mutating Inspection**:
+   - `ArtifactManager::inspect_project_artifacts` inspects `.coalition/` and reports `ProjectArtifactInspection` (`canonical`, `valid_backups`, `temp_files_present`, `ambiguous_or_invalid_recovery_state`) without mutating, promoting, or removing any files.
+2. **Identity-Before-Promotion Reconciliation**:
+   - `ProjectService::register_or_open_project` queries SQLite by canonical path *before* evaluating backups.
+   - **Matching Candidate**: If path is known and single valid backup shares the registered `project_id`, promotion to `project.yaml` is authorized and executed.
+   - **Conflicting Candidate**: If path is known but candidate backup has a different `project_id`, returns `PROJECT_IDENTITY_CONFLICT` with zero promotion (filesystem remains completely untouched).
+   - **Moved Repository / Rehydration**: If path is unknown, candidate ID is checked against SQLite to detect checkout collisions or moved paths before promotion.
+   - **Ambiguous State**: If multiple backups or corrupted backups exist, returns `ARTIFACT_RECOVERY_REQUIRED` with zero mutation.
+   - **Incomplete Writes (Temp-only)**: If canonical is missing and only temp files exist, returns `ARTIFACT_RECOVERY_REQUIRED` with zero mutation.
+   - **Case D (Missing Contract)**: If SQLite path is known, but no canonical contract or valid backup exists, returns `DURABLE_CONTRACT_MISSING` with zero durable identity mutation.
+3. When a project's repository is offline or deleted from disk:
    - Coalition returns `artifact: None` in `ProjectDetails`.
    - The system never fabricates a synthetic or assumed "Draft" contract.
    - The UI visibly alerts the user that durable architecture state exists only in `.coalition/project.yaml` and is currently offline.

@@ -18,7 +18,7 @@ This repository is currently at **Phase 1 — Coalition Core and Project Persist
 Phase 1 establishes:
 - Local project registration and re-opening with Git root canonicalization and explicit identity conflict/move reconciliation.
 - Durable `.coalition/` project contract hierarchy (`design/`, `implementation/`, `decisions/`, `architecture-versions/`, `changes/`, `reviews/`, `evidence/`) with full layout validation preventing path escape and reparse point traversal.
-- Portable, schema-v1 `project.yaml` metadata (strictly validated UUID v4, RFC3339 timestamps, non-empty names, exact draft invariants) with crash-safe platform-native atomic replacement and backup recovery.
+- Portable, schema-v1 `project.yaml` metadata (strictly validated UUID v4, RFC3339 timestamps, non-empty names, exact draft invariants) with crash-safe platform-native atomic replacement: Coalition flushes replacement data before invoking the native replacement primitive. On Windows it uses `ReplaceFileW` with a same-directory backup, reconciles documented failure states, and never authorizes recovery candidate promotion until project identity has been validated.
 - Transactional operational SQLite persistence with forward migrations for projects, workflow state, activity events, and app settings with automatic rollback on failure.
 - Authoritative Rust workflow state machine enforcing all 19 V1 states, explicit transition validation, pause/resume state tracking, post-freeze architecture change requests from paused/interrupted states, and atomic revision increments.
 - SQLite-loss recovery and rehydration reconstructing operational state from durable `.coalition/project.yaml`.
