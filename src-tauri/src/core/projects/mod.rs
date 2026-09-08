@@ -1086,6 +1086,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
         fs::write(&stale_backup, serde_yaml::to_string(&stale_proj).unwrap()).unwrap();
 
@@ -1163,6 +1164,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
         fs::write(
             &backup_path,
@@ -1289,6 +1291,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
         fs::write(
             coalition.join("project.yaml.bak.1"),
@@ -1333,6 +1336,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
         let proj2 = ProjectYaml {
             schema_version: 1,
@@ -1341,6 +1345,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
 
         fs::write(
@@ -1582,6 +1587,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
         fs::write(
             coalition.join("project.yaml"),

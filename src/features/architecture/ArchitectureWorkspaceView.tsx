@@ -7,6 +7,7 @@ import {
   ReadinessReport,
   ArtifactReadinessItem,
   ArtifactContentDetails,
+  ArtifactApplicability,
   CommandError,
 } from '../../types';
 
@@ -252,7 +253,30 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
     }
   };
 
-  // Keyboard shortcuts: in-window Ctrl+Shift+R and Ctrl+Shift+I, and Tauri global shortcuts
+  const handleApplicabilityChange = async (
+    artifactPath: string,
+    newApplicability: ArtifactApplicability,
+    e: React.SyntheticEvent
+  ) => {
+    e.stopPropagation();
+    setIsLoading(true);
+    setErrorMessage(null);
+    try {
+      const updated = await invoke<WorkspaceState>('set_project_artifact_applicability', {
+        projectId,
+        artifactPath,
+        applicability: newApplicability,
+      });
+      setWorkspace(updated);
+      await onRefreshProject();
+    } catch (err: unknown) {
+      setErrorMessage(formatError(err));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Listen to in-window keyboard shortcuts and relay events dispatched from top-level shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.shiftKey) {
@@ -267,29 +291,26 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
     };
     window.addEventListener('keydown', handleKeyDown);
 
-    let unlistenCopy: (() => void) | undefined;
-    let unlistenImport: (() => void) | undefined;
-    const registerGlobalShortcuts = async () => {
-      try {
-        const { listen } = await import('@tauri-apps/api/event');
-        unlistenCopy = await listen('coalition:shortcut-copy-relay', () => {
-          handleCopyPacket();
-        });
-        unlistenImport = await listen('coalition:shortcut-import-clipboard', () => {
-          handleImportClipboard();
-        });
-      } catch (_e) {
-        // Ignored in non-Tauri / test environments
+    const handleCopied = () => {
+      setCopyFeedback('Prompt copied to clipboard!');
+      setTimeout(() => setCopyFeedback(null), 3000);
+    };
+    const handleImported = (e: Event) => {
+      const customEvent = e as CustomEvent<ImportPreview>;
+      if (customEvent.detail) {
+        setWorkspace((prev) => (prev ? { ...prev, pending_preview: customEvent.detail } : prev));
+      } else {
+        loadWorkspaceState();
       }
     };
-    registerGlobalShortcuts();
-
+    window.addEventListener('coalition:relay-packet-copied', handleCopied);
+    window.addEventListener('coalition:relay-imported', handleImported);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
-      if (unlistenCopy) unlistenCopy();
-      if (unlistenImport) unlistenImport();
+      window.removeEventListener('coalition:relay-packet-copied', handleCopied);
+      window.removeEventListener('coalition:relay-imported', handleImported);
     };
-  }, [handleCopyPacket, handleImportClipboard]);
+  }, [handleCopyPacket, handleImportClipboard, loadWorkspaceState]);
 
   const formatError = (err: unknown): string => {
     if (typeof err === 'object' && err !== null && 'message' in err) {
@@ -540,9 +561,26 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
                     </span>
                     <div className="card-titles">
                       <span className="artifact-title">{art.title}</span>
-                      <span className={`applicability-badge badge-${(art.applicability || 'REQUIRED').toLowerCase()}`}>
-                        {art.applicability || 'REQUIRED'}
-                      </span>
+                      <div className="applicability-row">
+                        <select
+                          className={`applicability-select badge-${(art.applicability || 'REQUIRED').toLowerCase()}`}
+                          value={art.applicability || 'REQUIRED'}
+                          onClick={(e) => e.stopPropagation()}
+                          onChange={(e) =>
+                            handleApplicabilityChange(
+                              art.path,
+                              e.target.value as ArtifactApplicability,
+                              e
+                            )
+                          }
+                          aria-label={`Applicability for ${art.title}`}
+                          title="Change artifact applicability"
+                        >
+                          <option value="REQUIRED">REQUIRED</option>
+                          <option value="OPTIONAL">OPTIONAL</option>
+                          <option value="NOT_APPLICABLE">NOT APPLICABLE</option>
+                        </select>
+                      </div>
                       <code className="artifact-path">{art.path}</code>
                       {art.details && <span className="artifact-details-hint">{art.details}</span>}
                     </div>

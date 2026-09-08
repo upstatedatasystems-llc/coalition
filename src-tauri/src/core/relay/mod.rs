@@ -77,6 +77,7 @@ pub enum ArtifactAction {
 pub struct ProposedArtifactChange {
     pub path: String,
     pub action: ArtifactAction,
+    #[serde(default)]
     pub content: String,
 }
 
@@ -237,6 +238,10 @@ pub enum RelayError {
     },
     #[error("Import record not found: {0}")]
     ImportNotFound(String),
+    #[error("Duplicate artifact path in response: {0}")]
+    DuplicateArtifactPath(String),
+    #[error("Direct modification of 'design/open-questions.md' in artifacts is disallowed; use top-level 'open_questions:' field instead")]
+    OpenQuestionsDirectArtifactRejected(String),
     #[error("Import already decided: status is {0}")]
     AlreadyDecided(String),
     #[cfg(test)]
@@ -255,6 +260,8 @@ impl From<ArtifactError> for RelayError {
         Self::Artifact(e.to_string())
     }
 }
+
+pub const RELAY_CONTEXT_CHARACTER_BUDGET: usize = 60_000;
 
 pub struct RelayPromptBuilder;
 
@@ -275,27 +282,73 @@ impl RelayPromptBuilder {
             project_name, project_id, readiness.ready_required_count, readiness.total_required_count
         );
 
+        // Canonical artifact guidance based on actual disk presence
+        let mut artifact_guidance = String::from("\nCanonical Architecture Package Disk Status:\n");
+        for item in &readiness.artifacts {
+            let exists = ArtifactManager::read_artifact(root, &item.path)
+                .ok()
+                .flatten()
+                .is_some();
+            let action_guide = if exists {
+                "EXISTS ON DISK -> Use action: \"MODIFY\" (or \"DELETE\")"
+            } else {
+                "ABSENT FROM DISK -> Use action: \"CREATE\""
+            };
+            artifact_guidance.push_str(&format!("- `{}`: {}\n", item.path, action_guide));
+        }
+        context_summary.push_str(&artifact_guidance);
+
         let mut existing_artifacts_text = String::new();
+        let mut current_chars: usize = context_summary.len();
+
         for item in &readiness.artifacts {
             if let Ok(Some(content)) = ArtifactManager::read_artifact(root, &item.path) {
-                let preview: String = content.chars().take(300).collect();
-                existing_artifacts_text.push_str(&format!(
-                    "\n--- {} ({}) ---\n{}...\n",
-                    item.title,
-                    item.path,
-                    preview.trim()
-                ));
+                let header = format!("\n--- {} ({}) ---\n", item.title, item.path);
+                if current_chars + header.len() >= RELAY_CONTEXT_CHARACTER_BUDGET {
+                    existing_artifacts_text.push_str(
+                        "\n[TRUNCATED: Remaining artifacts omitted due to size budget]\n",
+                    );
+                    break;
+                }
+                existing_artifacts_text.push_str(&header);
+                current_chars += header.len();
+
+                let available_budget = RELAY_CONTEXT_CHARACTER_BUDGET.saturating_sub(current_chars);
+                if content.len() <= available_budget {
+                    existing_artifacts_text.push_str(content.trim());
+                    existing_artifacts_text.push('\n');
+                    current_chars += content.len() + 1;
+                } else {
+                    let truncated: String = content.chars().take(available_budget).collect();
+                    existing_artifacts_text.push_str(truncated.trim());
+                    existing_artifacts_text
+                        .push_str("\n[TRUNCATED: Remaining content omitted due to size budget]\n");
+                    current_chars = RELAY_CONTEXT_CHARACTER_BUDGET;
+                    break;
+                }
             }
         }
 
         if !existing_artifacts_text.is_empty() {
-            context_summary.push_str("\nExisting Project Artifacts Summary:");
+            context_summary.push_str("\nExisting Project Artifacts:\n");
             context_summary.push_str(&existing_artifacts_text);
         }
 
         if let Ok(Some(oq)) = ArtifactManager::read_artifact(root, "design/open-questions.md") {
-            context_summary.push_str("\nCurrent Open Questions:\n");
-            context_summary.push_str(&oq);
+            if current_chars < RELAY_CONTEXT_CHARACTER_BUDGET {
+                context_summary.push_str("\nCurrent Open Questions:\n");
+                let available_budget =
+                    RELAY_CONTEXT_CHARACTER_BUDGET.saturating_sub(context_summary.len());
+                if oq.len() <= available_budget {
+                    context_summary.push_str(&oq);
+                } else {
+                    let truncated: String = oq.chars().take(available_budget).collect();
+                    context_summary.push_str(&truncated);
+                    context_summary.push_str(
+                        "\n[TRUNCATED: Remaining open questions omitted due to size budget]\n",
+                    );
+                }
+            }
         }
 
         let human_instructions = format!(
@@ -306,7 +359,7 @@ impl RelayPromptBuilder {
             3. No AI may freeze architecture; architecture freeze is an explicit human action.\n\
             4. Preserved decisions must not be silently removed or contradicted.\n\
             5. Unresolved questions and architectural tradeoffs must be surfaced clearly.\n\
-            6. Return all proposed artifact updates in the structured YAML code block requested below.",
+            6. Return all proposed artifact updates in the structured YAML or JSON code block requested below.",
             project_name
         );
 
@@ -336,9 +389,15 @@ impl RelayPromptBuilder {
             }
         }
 
-        prompt.push_str(
+        let pv_exists = ArtifactManager::read_artifact(root, "design/product-vision.md")
+            .ok()
+            .flatten()
+            .is_some();
+        let pv_action_example = if pv_exists { "MODIFY" } else { "CREATE" };
+
+        prompt.push_str(&format!(
             "\n## Response Instructions\n\
-            Discuss your analysis freely in prose. When proposing artifact additions or updates, include exactly one structured YAML code block as follows:\n\n\
+            Discuss your analysis freely in prose. When proposing artifact additions or updates, include exactly one structured YAML (or JSON) code block with the `coalition_response:` envelope as follows:\n\n\
             ```yaml\n\
             coalition_response:\n\
               schema: 1\n\
@@ -348,14 +407,9 @@ impl RelayPromptBuilder {
               summary: \"<Brief summary of proposed changes>\"\n\
               artifacts:\n\
                 - path: \"design/product-vision.md\"\n\
-                  action: \"CREATE\" # or MODIFY or DELETE\n\
+                  action: \"{}\" # CREATE if file does not exist, MODIFY if file exists, DELETE to remove\n\
                   content: |\n\
                     # Product Vision\n\
-                    ...\n\
-                - path: \"design/requirements.md\"\n\
-                  action: \"CREATE\"\n\
-                  content: |\n\
-                    # Requirements\n\
                     ...\n\
               open_questions:\n\
                 - id: \"OQ-1\"\n\
@@ -363,9 +417,15 @@ impl RelayPromptBuilder {
                   status: \"OPEN\" # or RESOLVED\n\
                   resolution: null\n\
             ```\n\
-            Only propose relative paths within the canonical architecture package: \n\
-            design/product-vision.md, design/requirements.md, design/architecture.md, design/constraints.md, design/interfaces.md, design/security.md, implementation/implementation-plan.md, implementation/acceptance-criteria.yaml, implementation/test-plan.md, design/open-questions.md, decisions/ADR-*.md.\n"
-        );
+            Action Semantic Rules:\n\
+            - If a target artifact already exists on disk, you MUST specify action: \"MODIFY\" (or \"DELETE\"). Action \"CREATE\" on an existing file is rejected.\n\
+            - If a target artifact does not yet exist on disk, you MUST specify action: \"CREATE\". Action \"MODIFY\" or \"DELETE\" on an absent file is rejected.\n\
+            - Duplicate paths in the `artifacts:` list are rejected.\n\
+            - Do NOT include `design/open-questions.md` directly in `artifacts:`. Always specify open questions using the dedicated top-level `open_questions:` field.\n\
+            - Only propose relative paths within the canonical architecture package: \n\
+            design/product-vision.md, design/requirements.md, design/architecture.md, design/constraints.md, design/interfaces.md, design/security.md, implementation/implementation-plan.md, implementation/acceptance-criteria.yaml, implementation/test-plan.md, decisions/ADR-*.md.\n",
+            pv_action_example
+        ));
 
         (prompt, human_instructions, context_summary)
     }
@@ -376,6 +436,7 @@ pub struct RelayParser;
 impl RelayParser {
     /// Extracts and parses the structured Coalition response from raw clipboard text.
     /// Strictly requires the `coalition_response:` envelope, schema: 1, and response_type: "ARCHITECT_UPDATE".
+    /// Supports both YAML and JSON code blocks.
     pub fn parse_response(
         raw_text: &str,
         expected_project_id: &str,
@@ -383,12 +444,18 @@ impl RelayParser {
     ) -> Result<ArchitectResponsePayload, RelayError> {
         let block = Self::extract_structured_block(raw_text)?;
 
-        let envelope: ArchitectResponseEnvelope = serde_yaml::from_str(&block).map_err(|e| {
-            RelayError::ParseError(format!(
-                "Failed to parse response YAML into coalition_response envelope: {}",
-                e
-            ))
-        })?;
+        let envelope: ArchitectResponseEnvelope = match serde_yaml::from_str(&block) {
+            Ok(env) => env,
+            Err(yaml_err) => match serde_json::from_str(&block) {
+                Ok(env) => env,
+                Err(json_err) => {
+                    return Err(RelayError::ParseError(format!(
+                        "Failed to parse response into coalition_response envelope (YAML: {}; JSON: {})",
+                        yaml_err, json_err
+                    )));
+                }
+            },
+        };
 
         let payload = envelope.coalition_response;
 
@@ -457,7 +524,9 @@ impl RelayParser {
         }
 
         for candidate in candidates {
-            if candidate.contains("coalition_response:") {
+            if candidate.contains("coalition_response:")
+                || candidate.contains("\"coalition_response\"")
+            {
                 return Ok(candidate);
             }
         }
@@ -468,15 +537,103 @@ impl RelayParser {
             return Ok(sub.to_string());
         }
 
+        if let Some(idx) = text.find("\"coalition_response\"") {
+            let prefix = &text[..idx];
+            if let Some(brace_idx) = prefix.rfind('{') {
+                return Ok(text[brace_idx..].to_string());
+            } else {
+                return Ok(text[idx..].to_string());
+            }
+        }
+
         Err(RelayError::UnrelatedContent(
-            "No structured 'coalition_response:' block found in clipboard text. Ensure you copied ChatGPT's response containing the YAML code block.".to_string(),
+            "No structured 'coalition_response' block found in clipboard text. Ensure you copied ChatGPT's response containing the YAML or JSON code block.".to_string(),
         ))
+    }
+}
+
+/// RAII transaction guard for Connection references ensuring commit or automatic rollback.
+struct SqliteTx<'a> {
+    conn: &'a Connection,
+    committed: bool,
+}
+
+impl<'a> SqliteTx<'a> {
+    fn begin(conn: &'a Connection) -> Result<Self, RelayError> {
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| RelayError::Database(e.to_string()))?;
+        Ok(Self {
+            conn,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) -> Result<(), RelayError> {
+        self.conn
+            .execute("COMMIT", [])
+            .map_err(|e| RelayError::Database(e.to_string()))?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl<'a> Drop for SqliteTx<'a> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.conn.execute("ROLLBACK", []);
+        }
     }
 }
 
 pub struct RelayService;
 
 impl RelayService {
+    /// Ensures that no unresolved batch journal exists for the project.
+    /// Attempts reconciliation. If an unresolved batch persists or reconciliation errors, fails closed with BatchRecoveryRequired.
+    pub fn ensure_clean_batch_state<P: AsRef<Path>>(
+        conn: &Connection,
+        repo_root: P,
+        project_id: &str,
+    ) -> Result<(), RelayError> {
+        let journal_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM relay_import_batch_journal WHERE project_id = ?1",
+                params![project_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if journal_exists {
+            match Self::reconcile_interrupted_batches(conn, repo_root.as_ref(), project_id) {
+                Ok(_) => {
+                    let still_exists: bool = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM relay_import_batch_journal WHERE project_id = ?1",
+                            params![project_id],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .map(|c| c > 0)
+                        .unwrap_or(false);
+                    if still_exists {
+                        return Err(RelayError::BatchRecoveryRequired(format!(
+                            "Active batch journal remains unresolved for project {}",
+                            project_id
+                        )));
+                    }
+                }
+                Err(e) => {
+                    return Err(RelayError::BatchRecoveryRequired(format!(
+                        "Active batch recovery failed for project {}: {}",
+                        project_id, e
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Prepares a new Architect relay packet, persists it in SQLite as PENDING,
     /// advances workflow from DRAFT to ARCHITECTING if applicable, and logs the event.
     pub fn prepare_architect_packet<P: AsRef<Path>>(
@@ -496,7 +653,10 @@ impl RelayService {
             )
             .map_err(|_| RelayError::ProjectNotFound(project_id.to_string()))?;
 
-        // 2. Check workflow state
+        // 2. Ensure clean batch state
+        Self::ensure_clean_batch_state(conn, root, project_id)?;
+
+        // 3. Check workflow state
         let current_state_str: String = conn
             .query_row(
                 "SELECT state FROM workflow_state WHERE project_id = ?1",
@@ -555,7 +715,7 @@ impl RelayService {
             tx.commit()?;
         }
 
-        // 3. Determine packet type: ARCHITECT_INITIAL if no prior packets, else ARCHITECT_UPDATE
+        // 4. Determine packet type: ARCHITECT_INITIAL if no prior packets, else ARCHITECT_UPDATE
         let prior_packets_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM relay_packets WHERE project_id = ?1",
             params![project_id],
@@ -568,7 +728,7 @@ impl RelayService {
             RelayPacketType::ArchitectUpdate
         };
 
-        // 4. Supersede any previous PENDING or DECISION_PENDING packets
+        // 5. Supersede any previous PENDING or DECISION_PENDING packets
         let old_packets: Vec<String> = {
             let mut stmt = conn.prepare(
                 "SELECT packet_id FROM relay_packets WHERE project_id = ?1 AND status IN ('PENDING', 'DECISION_PENDING')",
@@ -577,29 +737,6 @@ impl RelayService {
             rows.filter_map(|r| r.ok()).collect()
         };
 
-        for old_pkt in &old_packets {
-            conn.execute(
-                "UPDATE relay_packets SET status = 'SUPERSEDED' WHERE packet_id = ?1",
-                params![old_pkt],
-            )?;
-            Self::record_relay_history(
-                conn,
-                project_id,
-                Some(old_pkt),
-                None,
-                "PACKET_SUPERSEDED",
-                "Relay packet superseded by newly generated packet",
-                None,
-            )?;
-        }
-
-        // Supersede any pending import
-        conn.execute(
-            "UPDATE relay_imports SET decision = 'SUPERSEDED' WHERE project_id = ?1 AND decision = 'PENDING'",
-            params![project_id],
-        )?;
-
-        // 5. Build packet
         let packet_id = Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().to_rfc3339();
         let (prompt, human_instructions, context_summary) = RelayPromptBuilder::build_prompt(
@@ -628,34 +765,62 @@ impl RelayService {
             created_at: created_at.clone(),
         };
 
-        // 6. Persist packet in SQLite
-        conn.execute(
-            "INSERT INTO relay_packets (packet_id, project_id, role, packet_type, architecture_version, expected_response, prompt, created_at, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'PENDING')",
-            params![
-                packet_id,
-                project_id,
-                "ARCHITECT",
-                type_str,
-                "draft",
-                "ARCHITECT_UPDATE",
-                prompt,
-                created_at
-            ],
-        )?;
+        {
+            let tx = SqliteTx::begin(conn)?;
 
-        Self::record_relay_history(
-            conn,
-            project_id,
-            Some(&packet_id),
-            None,
-            "PACKET_GENERATED",
-            &format!("Generated Architect relay prompt packet ({})", type_str),
-            Some(&serde_json::json!({
-                "packet_type": type_str,
-                "packet_id": packet_id,
-            })),
-        )?;
+            for old_pkt in &old_packets {
+                conn.execute(
+                    "UPDATE relay_packets SET status = 'SUPERSEDED' WHERE packet_id = ?1",
+                    params![old_pkt],
+                )?;
+                Self::record_relay_history(
+                    conn,
+                    project_id,
+                    Some(old_pkt),
+                    None,
+                    "PACKET_SUPERSEDED",
+                    "Relay packet superseded by newly generated packet",
+                    None,
+                )?;
+            }
+
+            // Supersede any pending import
+            conn.execute(
+                "UPDATE relay_imports SET decision = 'SUPERSEDED' WHERE project_id = ?1 AND decision = 'PENDING'",
+                params![project_id],
+            )?;
+
+            // 6. Persist packet in SQLite
+            conn.execute(
+                "INSERT INTO relay_packets (packet_id, project_id, role, packet_type, architecture_version, expected_response, prompt, created_at, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'PENDING')",
+                params![
+                    packet_id,
+                    project_id,
+                    "ARCHITECT",
+                    type_str,
+                    "draft",
+                    "ARCHITECT_UPDATE",
+                    prompt,
+                    created_at
+                ],
+            )?;
+
+            Self::record_relay_history(
+                conn,
+                project_id,
+                Some(&packet_id),
+                None,
+                "PACKET_GENERATED",
+                &format!("Generated Architect relay prompt packet ({})", type_str),
+                Some(&serde_json::json!({
+                    "packet_type": type_str,
+                    "packet_id": packet_id,
+                })),
+            )?;
+
+            tx.commit()?;
+        }
 
         let packet = RelayPacket {
             metadata,
@@ -728,106 +893,34 @@ impl RelayService {
         Ok(res)
     }
 
-    /// Processes imported clipboard text, validates, parses, computes diff preview,
-    /// captures optimistic concurrency baselines, validates action preconditions,
-    /// and persists import record in SQLite without mutating project artifacts.
-    pub fn process_import<P: AsRef<Path>>(
-        conn: &Connection,
-        repo_root: P,
-        project_id: &str,
-        raw_clipboard_text: &str,
+    /// Shared preview builder and validator used by both process_import and retry_parse_import.
+    /// Validates uniqueness of proposed paths, disallows direct modification of design/open-questions.md,
+    /// validates action semantic preconditions (CREATE absent, MODIFY/DELETE present), validates YAML syntax,
+    /// computes baseline fingerprints, and synthesizes open_questions into design/open-questions.md.
+    pub fn validate_and_build_preview(
+        root: &Path,
+        parsed: &ArchitectResponsePayload,
+        raw_text: &str,
+        import_id: &str,
     ) -> Result<ImportPreview, RelayError> {
-        let root = repo_root.as_ref();
-
-        // 1. Verify workflow state
-        let state_str: String = conn
-            .query_row(
-                "SELECT state FROM workflow_state WHERE project_id = ?1",
-                params![project_id],
-                |r| r.get(0),
-            )
-            .map_err(|_| RelayError::ProjectNotFound(project_id.to_string()))?;
-
-        let current_state: WorkflowState = state_str
-            .parse()
-            .map_err(|e: workflow::WorkflowError| RelayError::Workflow(e.to_string()))?;
-
-        if current_state != WorkflowState::Draft
-            && current_state != WorkflowState::Architecting
-            && current_state != WorkflowState::ReadyToFreeze
-        {
-            return Err(RelayError::IllegalWorkflowState {
-                current: current_state.to_string(),
-                operation: "import_from_clipboard".to_string(),
-            });
-        }
-
-        // 2. Strict relay lifecycle: MUST have an active pending packet
-        let pending = Self::get_pending_packet(conn, project_id)?
-            .ok_or_else(|| RelayError::NoPendingPacket(project_id.to_string()))?;
-
-        // 3. Prevent multiple pending imports
-        let existing_pending_import: Option<String> = conn
-            .query_row(
-                "SELECT import_id FROM relay_imports WHERE project_id = ?1 AND decision = 'PENDING' AND parse_status = 'SUCCESS'",
-                params![project_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-
-        if let Some(existing_id) = existing_pending_import {
-            return Err(RelayError::ImportAlreadyPending(existing_id));
-        }
-
-        let import_id = Uuid::new_v4().to_string();
-        let now = chrono::Utc::now().to_rfc3339();
-
-        // 4. Parse response with exact envelope and matching IDs
-        let parsed = match RelayParser::parse_response(
-            raw_clipboard_text,
-            project_id,
-            Some(&pending.metadata.packet_id),
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                let error_msg = e.to_string();
-                conn.execute(
-                    "INSERT INTO relay_imports (import_id, packet_id, project_id, raw_content, parsed_payload_json, parse_status, error_message, decision, imported_at, decided_at)
-                     VALUES (?1, ?2, ?3, ?4, NULL, 'PARSE_ERROR', ?5, 'PENDING', ?6, NULL)",
-                    params![import_id, pending.metadata.packet_id, project_id, raw_clipboard_text, error_msg, now],
-                )?;
-
-                Self::record_relay_history(
-                    conn,
-                    project_id,
-                    Some(&pending.metadata.packet_id),
-                    Some(&import_id),
-                    "IMPORT_PARSE_FAILURE",
-                    &format!("Failed to parse import response: {}", error_msg),
-                    Some(&serde_json::json!({ "error": error_msg })),
-                )?;
-
-                return Err(RelayError::ParseFailure {
-                    import_id,
-                    raw_content: raw_clipboard_text.to_string(),
-                    message: error_msg,
-                });
+        // 1. Enforce unique paths
+        let mut seen_paths = std::collections::HashSet::new();
+        for art in &parsed.artifacts {
+            if !seen_paths.insert(&art.path) {
+                return Err(RelayError::DuplicateArtifactPath(art.path.clone()));
             }
-        };
-
-        // 5. Check duplicate import (prevent identical raw content re-import)
-        let dup_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM relay_imports WHERE project_id = ?1 AND raw_content = ?2 AND decision = 'ACCEPTED'",
-            params![project_id, raw_clipboard_text],
-            |r| r.get(0),
-        )?;
-        if dup_count > 0 {
-            return Err(RelayError::DuplicateImport(
-                "Identical architect response has already been accepted".to_string(),
-            ));
         }
 
-        // 6. Compute diff, baseline fingerprints, and validate action preconditions
+        // 2. Reject direct design/open-questions.md in artifacts
+        for art in &parsed.artifacts {
+            if art.path == "design/open-questions.md" {
+                return Err(RelayError::OpenQuestionsDirectArtifactRejected(
+                    art.path.clone(),
+                ));
+            }
+        }
+
+        // 3. Validate semantic preconditions, YAML syntax, and capture baselines
         let mut preview_items = Vec::new();
         let policy = readiness::default_readiness_policy();
 
@@ -838,7 +931,6 @@ impl RelayService {
             let current_exists = current.is_some();
             let baseline_fp = ArtifactManager::compute_file_fingerprint(root, &art.path)?;
 
-            // Enforce ArtifactAction semantic preconditions
             match art.action {
                 ArtifactAction::Create => {
                     if current_exists {
@@ -875,6 +967,17 @@ impl RelayService {
                 }
             }
 
+            if (art.path.ends_with(".yaml") || art.path.ends_with(".yml"))
+                && (art.action == ArtifactAction::Create || art.action == ArtifactAction::Modify)
+            {
+                if let Err(e) = serde_yaml::from_str::<serde_yaml::Value>(&art.content) {
+                    return Err(RelayError::InvalidYamlContent {
+                        path: art.path.clone(),
+                        error: e.to_string(),
+                    });
+                }
+            }
+
             let title = policy
                 .rules
                 .iter()
@@ -907,7 +1010,7 @@ impl RelayService {
             });
         }
 
-        // 7. Incorporate open-questions.md into the batch if questions are present
+        // 4. Incorporate open-questions.md if open questions exist
         if !parsed.open_questions.is_empty() {
             let oq_path = "design/open-questions.md";
             let mut oq_md = String::from("# Architectural Open Questions\n\n");
@@ -952,43 +1055,154 @@ impl RelayService {
             });
         }
 
-        let preview = ImportPreview {
-            import_id: import_id.clone(),
+        Ok(ImportPreview {
+            import_id: import_id.to_string(),
             packet_id: parsed.packet_id.clone(),
-            project_id: project_id.to_string(),
-            summary: parsed.summary,
+            project_id: parsed.project_id.clone(),
+            summary: parsed.summary.clone(),
             artifacts: preview_items,
-            open_questions: parsed.open_questions,
-            raw_response: raw_clipboard_text.to_string(),
+            open_questions: parsed.open_questions.clone(),
+            raw_response: raw_text.to_string(),
+        })
+    }
+
+    /// Processes imported clipboard text, validates, parses, computes diff preview,
+    /// captures optimistic concurrency baselines, validates action preconditions,
+    /// and persists import record in SQLite without mutating project artifacts.
+    pub fn process_import<P: AsRef<Path>>(
+        conn: &Connection,
+        repo_root: P,
+        project_id: &str,
+        raw_clipboard_text: &str,
+    ) -> Result<ImportPreview, RelayError> {
+        let root = repo_root.as_ref();
+
+        // 1. Verify workflow state
+        let state_str: String = conn
+            .query_row(
+                "SELECT state FROM workflow_state WHERE project_id = ?1",
+                params![project_id],
+                |r| r.get(0),
+            )
+            .map_err(|_| RelayError::ProjectNotFound(project_id.to_string()))?;
+
+        let current_state: WorkflowState = state_str
+            .parse()
+            .map_err(|e: workflow::WorkflowError| RelayError::Workflow(e.to_string()))?;
+
+        if current_state != WorkflowState::Draft
+            && current_state != WorkflowState::Architecting
+            && current_state != WorkflowState::ReadyToFreeze
+        {
+            return Err(RelayError::IllegalWorkflowState {
+                current: current_state.to_string(),
+                operation: "import_from_clipboard".to_string(),
+            });
+        }
+
+        // 2. Ensure clean batch state
+        Self::ensure_clean_batch_state(conn, root, project_id)?;
+
+        // 3. Strict relay lifecycle: MUST have an active pending packet
+        let pending = Self::get_pending_packet(conn, project_id)?
+            .ok_or_else(|| RelayError::NoPendingPacket(project_id.to_string()))?;
+
+        // 4. Prevent multiple pending imports
+        let existing_pending_import: Option<String> = conn
+            .query_row(
+                "SELECT import_id FROM relay_imports WHERE project_id = ?1 AND decision = 'PENDING' AND parse_status = 'SUCCESS'",
+                params![project_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        if let Some(existing_id) = existing_pending_import {
+            return Err(RelayError::ImportAlreadyPending(existing_id));
+        }
+
+        let import_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // 5. Parse response with exact envelope and matching IDs
+        let parsed = match RelayParser::parse_response(
+            raw_clipboard_text,
+            project_id,
+            Some(&pending.metadata.packet_id),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                let error_msg = e.to_string();
+                conn.execute(
+                    "INSERT INTO relay_imports (import_id, packet_id, project_id, raw_content, parsed_payload_json, parse_status, error_message, decision, imported_at, decided_at)
+                     VALUES (?1, ?2, ?3, ?4, NULL, 'PARSE_ERROR', ?5, 'PENDING', ?6, NULL)",
+                    params![import_id, pending.metadata.packet_id, project_id, raw_clipboard_text, error_msg, now],
+                )?;
+
+                Self::record_relay_history(
+                    conn,
+                    project_id,
+                    Some(&pending.metadata.packet_id),
+                    Some(&import_id),
+                    "IMPORT_PARSE_FAILURE",
+                    &format!("Failed to parse import response: {}", error_msg),
+                    Some(&serde_json::json!({ "error": error_msg })),
+                )?;
+
+                return Err(RelayError::ParseFailure {
+                    import_id,
+                    raw_content: raw_clipboard_text.to_string(),
+                    message: error_msg,
+                });
+            }
         };
+
+        // 6. Check duplicate import (prevent identical raw content re-import)
+        let dup_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM relay_imports WHERE project_id = ?1 AND raw_content = ?2 AND decision = 'ACCEPTED'",
+            params![project_id, raw_clipboard_text],
+            |r| r.get(0),
+        )?;
+        if dup_count > 0 {
+            return Err(RelayError::DuplicateImport(
+                "Identical architect response has already been accepted".to_string(),
+            ));
+        }
+
+        // 7. Validate and build preview using shared path
+        let preview =
+            Self::validate_and_build_preview(root, &parsed, raw_clipboard_text, &import_id)?;
 
         let preview_json =
             serde_json::to_string(&preview).map_err(|e| RelayError::ParseError(e.to_string()))?;
 
-        // 8. Persist import record and update packet status to DECISION_PENDING
-        conn.execute(
-            "INSERT INTO relay_imports (import_id, packet_id, project_id, raw_content, parsed_payload_json, parse_status, error_message, decision, imported_at, decided_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'SUCCESS', NULL, 'PENDING', ?6, NULL)",
-            params![import_id, parsed.packet_id, project_id, raw_clipboard_text, preview_json, now],
-        )?;
+        // 8. Persist import record and update packet status in transaction
+        {
+            let tx = SqliteTx::begin(conn)?;
+            conn.execute(
+                "INSERT INTO relay_imports (import_id, packet_id, project_id, raw_content, parsed_payload_json, parse_status, error_message, decision, imported_at, decided_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'SUCCESS', NULL, 'PENDING', ?6, NULL)",
+                params![import_id, parsed.packet_id, project_id, raw_clipboard_text, preview_json, now],
+            )?;
 
-        conn.execute(
-            "UPDATE relay_packets SET status = 'DECISION_PENDING' WHERE packet_id = ?1",
-            params![parsed.packet_id],
-        )?;
+            conn.execute(
+                "UPDATE relay_packets SET status = 'DECISION_PENDING' WHERE packet_id = ?1",
+                params![parsed.packet_id],
+            )?;
 
-        Self::record_relay_history(
-            conn,
-            project_id,
-            Some(&parsed.packet_id),
-            Some(&import_id),
-            "IMPORT_PARSED",
-            &format!("Parsed response: {}", preview.summary),
-            Some(&serde_json::json!({
-                "artifacts_count": preview.artifacts.len(),
-                "summary": preview.summary
-            })),
-        )?;
+            Self::record_relay_history(
+                conn,
+                project_id,
+                Some(&parsed.packet_id),
+                Some(&import_id),
+                "IMPORT_PARSED",
+                &format!("Parsed response: {}", preview.summary),
+                Some(&serde_json::json!({
+                    "artifacts_count": preview.artifacts.len(),
+                    "summary": preview.summary
+                })),
+            )?;
+            tx.commit()?;
+        }
 
         Ok(preview)
     }
@@ -1002,10 +1216,37 @@ impl RelayService {
         edited_raw_text: &str,
     ) -> Result<ImportPreview, RelayError> {
         let root = repo_root.as_ref();
+
+        // 1. Verify workflow state
+        let state_str: String = conn
+            .query_row(
+                "SELECT state FROM workflow_state WHERE project_id = ?1",
+                params![project_id],
+                |r| r.get(0),
+            )
+            .map_err(|_| RelayError::ProjectNotFound(project_id.to_string()))?;
+
+        let current_state: WorkflowState = state_str
+            .parse()
+            .map_err(|e: workflow::WorkflowError| RelayError::Workflow(e.to_string()))?;
+
+        if current_state != WorkflowState::Draft
+            && current_state != WorkflowState::Architecting
+            && current_state != WorkflowState::ReadyToFreeze
+        {
+            return Err(RelayError::IllegalWorkflowState {
+                current: current_state.to_string(),
+                operation: "retry_parse_import".to_string(),
+            });
+        }
+
+        // 2. Ensure clean batch state
+        Self::ensure_clean_batch_state(conn, root, project_id)?;
+
         let pending = Self::get_pending_packet(conn, project_id)?
             .ok_or_else(|| RelayError::NoPendingPacket(project_id.to_string()))?;
 
-        // Verify import record is unresolved
+        // 3. Verify import record is unresolved
         let decision: String = conn
             .query_row(
                 "SELECT decision FROM relay_imports WHERE import_id = ?1 AND project_id = ?2",
@@ -1024,125 +1265,36 @@ impl RelayService {
             Some(&pending.metadata.packet_id),
         )?;
 
-        let policy = readiness::default_readiness_policy();
-        let mut preview_items = Vec::new();
-
-        for art in &parsed.artifacts {
-            let current = ArtifactManager::read_artifact(root, &art.path)
-                .ok()
-                .flatten();
-            let current_exists = current.is_some();
-            let baseline_fp = ArtifactManager::compute_file_fingerprint(root, &art.path)?;
-
-            let title = policy
-                .rules
-                .iter()
-                .find(|r| r.path == art.path)
-                .map(|r| r.title.as_str())
-                .unwrap_or("Architecture Artifact");
-
-            let status = match (&art.action, &current) {
-                (ArtifactAction::Delete, _) => ArtifactDiffStatus::Deleted,
-                (ArtifactAction::Create, _) => ArtifactDiffStatus::New,
-                (ArtifactAction::Modify, Some(existing)) => {
-                    if existing.trim() == art.content.trim() {
-                        ArtifactDiffStatus::Unchanged
-                    } else {
-                        ArtifactDiffStatus::Modified
-                    }
-                }
-                (ArtifactAction::Modify, None) => ArtifactDiffStatus::Modified,
-            };
-
-            preview_items.push(ArtifactPreviewItem {
-                path: art.path.clone(),
-                title: title.to_string(),
-                action: art.action,
-                status,
-                current_content: current,
-                proposed_content: art.content.clone(),
-                baseline_fingerprint: baseline_fp,
-                baseline_exists: current_exists,
-            });
-        }
-
-        if !parsed.open_questions.is_empty() {
-            let oq_path = "design/open-questions.md";
-            let mut oq_md = String::from("# Architectural Open Questions\n\n");
-            for q in &parsed.open_questions {
-                let status_str = match q.status {
-                    OpenQuestionStatus::Open => "OPEN",
-                    OpenQuestionStatus::Resolved => "RESOLVED",
-                };
-                oq_md.push_str(&format!("## [{}] {}\n", status_str, q.id));
-                oq_md.push_str(&format!("**Question:** {}\n\n", q.question));
-                if let Some(ref res) = q.resolution {
-                    oq_md.push_str(&format!("**Resolution:** {}\n\n", res));
-                }
-            }
-
-            let current_oq = ArtifactManager::read_artifact(root, oq_path).ok().flatten();
-            let oq_exists = current_oq.is_some();
-            let oq_fp = ArtifactManager::compute_file_fingerprint(root, oq_path)?;
-            let oq_action = if oq_exists {
-                ArtifactAction::Modify
-            } else {
-                ArtifactAction::Create
-            };
-
-            let oq_status = if !oq_exists {
-                ArtifactDiffStatus::New
-            } else if current_oq.as_deref().unwrap_or("").trim() == oq_md.trim() {
-                ArtifactDiffStatus::Unchanged
-            } else {
-                ArtifactDiffStatus::Modified
-            };
-
-            preview_items.push(ArtifactPreviewItem {
-                path: oq_path.to_string(),
-                title: "Open Questions".to_string(),
-                action: oq_action,
-                status: oq_status,
-                current_content: current_oq,
-                proposed_content: oq_md,
-                baseline_fingerprint: oq_fp,
-                baseline_exists: oq_exists,
-            });
-        }
-
-        let preview = ImportPreview {
-            import_id: import_id.to_string(),
-            packet_id: parsed.packet_id.clone(),
-            project_id: project_id.to_string(),
-            summary: parsed.summary,
-            artifacts: preview_items,
-            open_questions: parsed.open_questions,
-            raw_response: edited_raw_text.to_string(),
-        };
+        // 4. Validate and build preview using shared path
+        let preview = Self::validate_and_build_preview(root, &parsed, edited_raw_text, import_id)?;
 
         let preview_json =
             serde_json::to_string(&preview).map_err(|e| RelayError::ParseError(e.to_string()))?;
 
-        conn.execute(
-            "UPDATE relay_imports SET raw_content = ?1, parsed_payload_json = ?2, parse_status = 'SUCCESS', error_message = NULL
-             WHERE import_id = ?3 AND project_id = ?4",
-            params![edited_raw_text, preview_json, import_id, project_id],
-        )?;
+        {
+            let tx = SqliteTx::begin(conn)?;
+            conn.execute(
+                "UPDATE relay_imports SET raw_content = ?1, parsed_payload_json = ?2, parse_status = 'SUCCESS', error_message = NULL
+                 WHERE import_id = ?3 AND project_id = ?4",
+                params![edited_raw_text, preview_json, import_id, project_id],
+            )?;
 
-        conn.execute(
-            "UPDATE relay_packets SET status = 'DECISION_PENDING' WHERE packet_id = ?1",
-            params![parsed.packet_id],
-        )?;
+            conn.execute(
+                "UPDATE relay_packets SET status = 'DECISION_PENDING' WHERE packet_id = ?1",
+                params![parsed.packet_id],
+            )?;
 
-        Self::record_relay_history(
-            conn,
-            project_id,
-            Some(&parsed.packet_id),
-            Some(import_id),
-            "IMPORT_PARSED",
-            &format!("Successfully recovered import: {}", preview.summary),
-            None,
-        )?;
+            Self::record_relay_history(
+                conn,
+                project_id,
+                Some(&parsed.packet_id),
+                Some(import_id),
+                "IMPORT_PARSED",
+                &format!("Successfully recovered import: {}", preview.summary),
+                None,
+            )?;
+            tx.commit()?;
+        }
 
         Ok(preview)
     }
@@ -1187,7 +1339,10 @@ impl RelayService {
             });
         }
 
-        // 2. Fetch import record
+        // 2. Ensure clean batch state
+        Self::ensure_clean_batch_state(conn, root, project_id)?;
+
+        // 3. Fetch import record
         let (parsed_json_opt, decision, packet_id): (Option<String>, String, Option<String>) = conn
             .query_row(
                 "SELECT parsed_payload_json, decision, packet_id FROM relay_imports WHERE import_id = ?1 AND project_id = ?2",
@@ -1210,7 +1365,7 @@ impl RelayService {
         let preview: ImportPreview = serde_json::from_str(&parsed_json)
             .map_err(|e| RelayError::ParseError(e.to_string()))?;
 
-        // 3. Optimistic concurrency & semantic precondition revalidation across ALL items
+        // 4. Optimistic concurrency & semantic precondition revalidation across ALL items
         for item in &preview.artifacts {
             let current_exists = ArtifactManager::read_artifact(root, &item.path)?.is_some();
             let current_fp = ArtifactManager::compute_file_fingerprint(root, &item.path)?;
@@ -1264,36 +1419,47 @@ impl RelayService {
             }
         }
 
-        // 4. Build deterministic batch operations (sorted alphabetically by path)
+        let coalition_dir = ArtifactManager::resolve_coalition_dir(root)?;
+
+        // 5. Build deterministic batch operations with exact backup paths assigned upfront
         let mut operations: Vec<BatchOperation> = preview
             .artifacts
             .iter()
-            .map(|item| BatchOperation {
-                path: item.path.clone(),
-                action: item.action,
-                content: item.proposed_content.clone(),
-                baseline_exists: item.baseline_exists,
-                baseline_fingerprint: item.baseline_fingerprint.clone(),
-                staged_temp_path: None,
-                backup_path: None,
+            .map(|item| {
+                let target_path = coalition_dir.join(&item.path);
+                let backup_path = if item.baseline_exists {
+                    let backup_name = format!(
+                        "{}.bak.{}",
+                        target_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy(),
+                        Uuid::new_v4()
+                    );
+                    let bp = target_path
+                        .parent()
+                        .unwrap_or(&coalition_dir)
+                        .join(&backup_name);
+                    Some(bp.to_string_lossy().to_string())
+                } else {
+                    None
+                };
+
+                BatchOperation {
+                    path: item.path.clone(),
+                    action: item.action,
+                    content: item.proposed_content.clone(),
+                    baseline_exists: item.baseline_exists,
+                    baseline_fingerprint: item.baseline_fingerprint.clone(),
+                    staged_temp_path: None,
+                    backup_path,
+                }
             })
             .collect();
 
         operations.sort_by(|a, b| a.path.cmp(&b.path));
 
-        let now = chrono::Utc::now().to_rfc3339();
-        let ops_json = serde_json::to_string(&operations)
-            .map_err(|e| RelayError::ParseError(e.to_string()))?;
-
-        // 5. Insert batch journal in STAGING phase
-        conn.execute(
-            "INSERT OR REPLACE INTO relay_import_batch_journal (import_id, project_id, packet_id, phase, operations_json, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'STAGING', ?4, ?5, ?6)",
-            params![import_id, project_id, preview.packet_id, ops_json, now, now],
-        )?;
-
         // 6. Stage all replacement content
-        let coalition_dir = ArtifactManager::resolve_coalition_dir(root)?;
         for op in &mut operations {
             if op.action == ArtifactAction::Create || op.action == ArtifactAction::Modify {
                 let target_path = coalition_dir.join(&op.path);
@@ -1334,12 +1500,15 @@ impl RelayService {
             }
         }
 
-        let staged_ops_json = serde_json::to_string(&operations)
-            .map_err(|e| RelayError::ParseError(e.to_string()))?;
+        // 7. Insert batch journal in STAGED phase (with exact staged and planned backup paths)
         let now = chrono::Utc::now().to_rfc3339();
+        let ops_json = serde_json::to_string(&operations)
+            .map_err(|e| RelayError::ParseError(e.to_string()))?;
+
         conn.execute(
-            "UPDATE relay_import_batch_journal SET phase = 'STAGED', operations_json = ?1, updated_at = ?2 WHERE import_id = ?3",
-            params![staged_ops_json, now, import_id],
+            "INSERT INTO relay_import_batch_journal (import_id, project_id, packet_id, phase, operations_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'STAGED', ?4, ?5, ?6)",
+            params![import_id, project_id, preview.packet_id, ops_json, now, now],
         )?;
 
         #[cfg(test)]
@@ -1353,7 +1522,7 @@ impl RelayService {
             }
         }
 
-        // 7. Commit phase: apply changes with backups
+        // 8. Commit phase: update journal to COMMITTING before mutating disk
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE relay_import_batch_journal SET phase = 'COMMITTING', updated_at = ?1 WHERE import_id = ?2",
@@ -1362,11 +1531,16 @@ impl RelayService {
 
         #[allow(unused_variables)]
         let total_ops = operations.len();
-        for i in 0..total_ops {
-            let (action, path, staged_temp_path) = {
-                let op = &operations[i];
-                (op.action, op.path.clone(), op.staged_temp_path.clone())
-            };
+        #[allow(clippy::unused_enumerate_index)]
+        for (_i, op) in operations.iter().enumerate() {
+            #[cfg(test)]
+            let i = _i;
+            let (action, path, staged_temp_path, backup_path_str) = (
+                op.action,
+                op.path.clone(),
+                op.staged_temp_path.clone(),
+                op.backup_path.clone(),
+            );
             let target_path = coalition_dir.join(&path);
 
             #[cfg(test)]
@@ -1402,49 +1576,33 @@ impl RelayService {
                 }
                 ArtifactAction::Modify => {
                     let temp_path = Path::new(staged_temp_path.as_ref().unwrap());
-                    let backup_name = format!(
-                        "{}.bak.{}",
-                        target_path.file_name().unwrap().to_string_lossy(),
-                        Uuid::new_v4()
-                    );
-                    let backup_path = target_path.parent().unwrap().join(&backup_name);
+                    let backup_path = Path::new(backup_path_str.as_ref().unwrap());
 
-                    // Create explicit backup before replacing
-                    std::fs::copy(&target_path, &backup_path).map_err(|e| {
+                    // Create backup file and flush to disk
+                    std::fs::copy(&target_path, backup_path).map_err(|e| {
                         RelayError::Artifact(format!("Failed to create batch backup: {}", e))
                     })?;
-                    operations[i].backup_path = Some(backup_path.to_string_lossy().to_string());
+                    let f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(backup_path)
+                        .map_err(|e| {
+                            RelayError::Artifact(format!("Failed to open backup for sync: {}", e))
+                        })?;
+                    f.sync_all().map_err(|e| {
+                        RelayError::Artifact(format!("Failed to sync backup file: {}", e))
+                    })?;
 
-                    let interim_ops_json = serde_json::to_string(&operations)
-                        .map_err(|e| RelayError::ParseError(e.to_string()))?;
-                    conn.execute(
-                        "UPDATE relay_import_batch_journal SET operations_json = ?1 WHERE import_id = ?2",
-                        params![interim_ops_json, import_id],
-                    )?;
-
+                    // Replace atomically
                     ArtifactManager::replace_file_atomically(temp_path, &target_path)?;
                 }
                 ArtifactAction::Delete => {
-                    let backup_name = format!(
-                        "{}.bak.{}",
-                        target_path.file_name().unwrap().to_string_lossy(),
-                        Uuid::new_v4()
-                    );
-                    let backup_path = target_path.parent().unwrap().join(&backup_name);
-                    std::fs::rename(&target_path, &backup_path).map_err(|e| {
+                    let backup_path = Path::new(backup_path_str.as_ref().unwrap());
+                    std::fs::rename(&target_path, backup_path).map_err(|e| {
                         RelayError::Artifact(format!(
                             "Failed to rename target to backup for DELETE: {}",
                             e
                         ))
                     })?;
-                    operations[i].backup_path = Some(backup_path.to_string_lossy().to_string());
-
-                    let interim_ops_json = serde_json::to_string(&operations)
-                        .map_err(|e| RelayError::ParseError(e.to_string()))?;
-                    conn.execute(
-                        "UPDATE relay_import_batch_journal SET operations_json = ?1 WHERE import_id = ?2",
-                        params![interim_ops_json, import_id],
-                    )?;
                 }
             }
         }
@@ -1460,13 +1618,11 @@ impl RelayService {
             }
         }
 
-        // 8. Mark journal COMMITTED
-        let committed_ops_json = serde_json::to_string(&operations)
-            .map_err(|e| RelayError::ParseError(e.to_string()))?;
+        // 9. Mark journal COMMITTED
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE relay_import_batch_journal SET phase = 'COMMITTED', operations_json = ?1, updated_at = ?2 WHERE import_id = ?3",
-            params![committed_ops_json, now, import_id],
+            "UPDATE relay_import_batch_journal SET phase = 'COMMITTED', updated_at = ?1 WHERE import_id = ?2",
+            params![now, import_id],
         )?;
 
         #[cfg(test)]
@@ -1480,47 +1636,51 @@ impl RelayService {
             }
         }
 
-        // 9. Update SQLite bookkeeping
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE relay_imports SET decision = 'ACCEPTED', decided_at = ?1 WHERE import_id = ?2",
-            params![now, import_id],
-        )?;
-
-        if let Some(ref pkt_id) = packet_id {
+        // 10. Update SQLite bookkeeping in transaction
+        {
+            let tx = SqliteTx::begin(conn)?;
+            let now = chrono::Utc::now().to_rfc3339();
             conn.execute(
-                "UPDATE relay_packets SET status = 'IMPORTED' WHERE packet_id = ?1",
-                params![pkt_id],
+                "UPDATE relay_imports SET decision = 'ACCEPTED', decided_at = ?1 WHERE import_id = ?2",
+                params![now, import_id],
             )?;
+
+            if let Some(ref pkt_id) = packet_id {
+                conn.execute(
+                    "UPDATE relay_packets SET status = 'IMPORTED' WHERE packet_id = ?1",
+                    params![pkt_id],
+                )?;
+            }
+
+            let affected_paths: Vec<String> =
+                preview.artifacts.iter().map(|a| a.path.clone()).collect();
+            ActivityManager::record_event(
+                conn,
+                project_id,
+                "ARCHITECT_IMPORT_ACCEPTED",
+                "Human",
+                &format!("Accepted architect changes: {}", preview.summary),
+                Some(&serde_json::json!({
+                    "import_id": import_id,
+                    "summary": preview.summary,
+                    "affected_artifacts": affected_paths,
+                })),
+            )
+            .map_err(|e| RelayError::Database(e.to_string()))?;
+
+            Self::record_relay_history(
+                conn,
+                project_id,
+                packet_id.as_deref(),
+                Some(import_id),
+                "IMPORT_ACCEPTED",
+                &format!("Accepted changes: {}", preview.summary),
+                Some(&serde_json::json!({ "summary": preview.summary })),
+            )?;
+            tx.commit()?;
         }
 
-        let affected_paths: Vec<String> =
-            preview.artifacts.iter().map(|a| a.path.clone()).collect();
-        ActivityManager::record_event(
-            conn,
-            project_id,
-            "ARCHITECT_IMPORT_ACCEPTED",
-            "Human",
-            &format!("Accepted architect changes: {}", preview.summary),
-            Some(&serde_json::json!({
-                "import_id": import_id,
-                "summary": preview.summary,
-                "affected_artifacts": affected_paths,
-            })),
-        )
-        .map_err(|e| RelayError::Database(e.to_string()))?;
-
-        Self::record_relay_history(
-            conn,
-            project_id,
-            packet_id.as_deref(),
-            Some(import_id),
-            "IMPORT_ACCEPTED",
-            &format!("Accepted changes: {}", preview.summary),
-            Some(&serde_json::json!({ "summary": preview.summary })),
-        )?;
-
-        // 10. Re-evaluate readiness and reconcile workflow state
+        // 11. Re-evaluate readiness and reconcile workflow state
         let readiness = ReadinessEvaluator::evaluate(root);
         Self::reconcile_workflow_readiness_state(conn, project_id, &readiness, "Human")?;
 
@@ -1535,7 +1695,7 @@ impl RelayService {
             }
         }
 
-        // 11. Clean up backups and delete batch journal
+        // 12. Clean up backups and delete batch journal
         for op in &operations {
             if let Some(ref bak) = op.backup_path {
                 let p = Path::new(bak);
@@ -1559,6 +1719,15 @@ impl RelayService {
         project_id: &str,
         import_id: &str,
     ) -> Result<(), RelayError> {
+        let repo_path_str: String = conn
+            .query_row(
+                "SELECT repository_path FROM projects WHERE project_id = ?1",
+                params![project_id],
+                |r| r.get(0),
+            )
+            .map_err(|_| RelayError::ProjectNotFound(project_id.to_string()))?;
+        Self::ensure_clean_batch_state(conn, &repo_path_str, project_id)?;
+
         let (decision, packet_id): (String, Option<String>) = conn
             .query_row(
                 "SELECT decision, packet_id FROM relay_imports WHERE import_id = ?1 AND project_id = ?2",
@@ -1571,41 +1740,44 @@ impl RelayService {
             return Err(RelayError::AlreadyDecided(decision));
         }
 
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE relay_imports SET decision = 'REJECTED', decided_at = ?1 WHERE import_id = ?2",
-            params![now, import_id],
-        )?;
-
-        // Reset packet status to PENDING so user can try again or wait for another prompt
-        if let Some(ref pkt_id) = packet_id {
+        {
+            let tx = SqliteTx::begin(conn)?;
+            let now = chrono::Utc::now().to_rfc3339();
             conn.execute(
-                "UPDATE relay_packets SET status = 'PENDING' WHERE packet_id = ?1",
-                params![pkt_id],
+                "UPDATE relay_imports SET decision = 'REJECTED', decided_at = ?1 WHERE import_id = ?2",
+                params![now, import_id],
             )?;
+
+            if let Some(ref pkt_id) = packet_id {
+                conn.execute(
+                    "UPDATE relay_packets SET status = 'PENDING' WHERE packet_id = ?1",
+                    params![pkt_id],
+                )?;
+            }
+
+            ActivityManager::record_event(
+                conn,
+                project_id,
+                "ARCHITECT_IMPORT_REJECTED",
+                "Human",
+                "Rejected architect import proposal without changing project artifacts",
+                Some(&serde_json::json!({
+                    "import_id": import_id
+                })),
+            )
+            .map_err(|e| RelayError::Database(e.to_string()))?;
+
+            Self::record_relay_history(
+                conn,
+                project_id,
+                packet_id.as_deref(),
+                Some(import_id),
+                "IMPORT_REJECTED",
+                "Rejected architect import proposal",
+                None,
+            )?;
+            tx.commit()?;
         }
-
-        ActivityManager::record_event(
-            conn,
-            project_id,
-            "ARCHITECT_IMPORT_REJECTED",
-            "Human",
-            "Rejected architect import proposal without changing project artifacts",
-            Some(&serde_json::json!({
-                "import_id": import_id
-            })),
-        )
-        .map_err(|e| RelayError::Database(e.to_string()))?;
-
-        Self::record_relay_history(
-            conn,
-            project_id,
-            packet_id.as_deref(),
-            Some(import_id),
-            "IMPORT_REJECTED",
-            "Rejected architect import proposal",
-            None,
-        )?;
 
         Ok(())
     }
@@ -1677,31 +1849,12 @@ impl RelayService {
                 )?;
             }
             "COMMITTING" => {
-                // Roll back to pre-import state using backup files.
+                // Roll back to pre-import state using exact backup files declared in journal.
                 for op in &ops {
                     let target_path = coalition_dir.join(&op.path);
-                    let mut found_bak = op.backup_path.as_ref().map(std::path::PathBuf::from);
-                    if found_bak.as_ref().map(|p| !p.exists()).unwrap_or(true) {
-                        if let Some(parent) = target_path.parent() {
-                            if let Ok(entries) = std::fs::read_dir(parent) {
-                                let prefix = format!(
-                                    "{}.bak.",
-                                    target_path
-                                        .file_name()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
-                                );
-                                for entry in entries.flatten() {
-                                    if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                                        found_bak = Some(entry.path());
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
 
-                    if let Some(ref bak_path) = found_bak {
+                    if let Some(ref bak_path_str) = op.backup_path {
+                        let bak_path = Path::new(bak_path_str);
                         if bak_path.exists() {
                             if target_path.exists() {
                                 let _ = std::fs::remove_file(&target_path);
@@ -1712,6 +1865,17 @@ impl RelayService {
                                     bak_path, target_path, e
                                 ))
                             })?;
+                        } else {
+                            // Exact backup declared in journal was not found!
+                            // Check if target file matches its baseline fingerprint.
+                            let current_fp =
+                                ArtifactManager::compute_file_fingerprint(root, &op.path)?;
+                            if current_fp != op.baseline_fingerprint {
+                                return Err(RelayError::BatchRecoveryRequired(format!(
+                                    "Expected backup file '{}' for target '{}' was not found on disk, and target differs from baseline",
+                                    bak_path_str, op.path
+                                )));
+                            }
                         }
                     } else if op.action == ArtifactAction::Create && target_path.exists() {
                         let _ = std::fs::remove_file(&target_path);
@@ -1818,14 +1982,17 @@ impl RelayService {
             });
         }
 
-        // 2. Validate path in allowlist
+        // 2. Ensure clean batch state before saving manual changes
+        Self::ensure_clean_batch_state(conn, root, project_id)?;
+
+        // 3. Validate path in allowlist
         if !ArtifactManager::is_valid_architecture_artifact_path(relative_path) {
             return Err(RelayError::DisallowedArtifactPath(
                 relative_path.to_string(),
             ));
         }
 
-        // 3. Optimistic concurrency check
+        // 4. Optimistic concurrency check
         let current_fp = ArtifactManager::compute_file_fingerprint(root, relative_path)?;
         if current_fp.as_deref() != expected_fingerprint {
             return Err(RelayError::StaleArtifactContent {
@@ -1837,7 +2004,7 @@ impl RelayService {
             });
         }
 
-        // 4. If structured YAML, validate syntax
+        // 5. If structured YAML, validate syntax
         if relative_path.ends_with(".yaml") || relative_path.ends_with(".yml") {
             let parsed: Result<serde_yaml::Value, _> = serde_yaml::from_str(content);
             if let Err(e) = parsed {
@@ -1848,10 +2015,10 @@ impl RelayService {
             }
         }
 
-        // 5. Atomically write replacement
+        // 6. Atomically write replacement
         ArtifactManager::write_artifact_atomic(root, relative_path, content)?;
 
-        // 6. Log activity event
+        // 7. Log activity event
         ActivityManager::record_event(
             conn,
             project_id,
@@ -1865,10 +2032,10 @@ impl RelayService {
         )
         .map_err(|e| RelayError::Database(e.to_string()))?;
 
-        // 7. Re-evaluate readiness
+        // 8. Re-evaluate readiness
         let readiness = ReadinessEvaluator::evaluate(root);
 
-        // 8. Reconcile workflow state
+        // 9. Reconcile workflow state
         Self::reconcile_workflow_readiness_state(conn, project_id, &readiness, "Human")?;
 
         Ok(readiness)
@@ -1990,6 +2157,8 @@ impl RelayService {
         let root = repo_root.as_ref();
         let pending_packet = Self::get_pending_packet(conn, project_id)?;
         let readiness = ReadinessEvaluator::evaluate(root);
+        // Reconcile workflow state based on current readiness (e.g. external edits or applicability change)
+        Self::reconcile_workflow_readiness_state(conn, project_id, &readiness, "System")?;
         let history = Self::get_relay_history(conn, project_id, 20)?;
 
         // Check if there is a pending import preview
@@ -2463,5 +2632,497 @@ mod tests {
             invalid_yaml_res,
             Err(RelayError::InvalidYamlContent { .. })
         ));
+    }
+
+    #[test]
+    fn test_batch_recovery_seam_before_first_replacement() {
+        let (dir, mut db, pid) = setup_test_project();
+        let pkt =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+        let resp = format!(
+            "```yaml\ncoalition_response:\n  schema: 1\n  packet_id: \"{}\"\n  project_id: \"{}\"\n  response_type: \"ARCHITECT_UPDATE\"\n  summary: \"Test\"\n  artifacts:\n    - path: \"design/product-vision.md\"\n      action: \"CREATE\"\n      content: \"# Vision\\nCreated vision content.\"\n```",
+            pkt.metadata.packet_id, pid
+        );
+        let preview =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &resp).unwrap();
+
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::BeforeFirstReplacement));
+        let res =
+            RelayService::accept_import(db.connection(), dir.path(), &pid, &preview.import_id);
+        assert!(res.is_err());
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::None));
+
+        let recovered =
+            RelayService::reconcile_interrupted_batches(db.connection(), dir.path(), &pid).unwrap();
+        assert!(recovered);
+        assert!(
+            ArtifactManager::read_artifact(dir.path(), "design/product-vision.md")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_batch_recovery_seam_mid_batch() {
+        let (dir, mut db, pid) = setup_test_project();
+        let pkt =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+        ArtifactManager::write_artifact_atomic(
+            dir.path(),
+            "design/product-vision.md",
+            "# Vision\nOriginal",
+        )
+        .unwrap();
+
+        let resp = format!(
+            "```yaml\ncoalition_response:\n  schema: 1\n  packet_id: \"{}\"\n  project_id: \"{}\"\n  response_type: \"ARCHITECT_UPDATE\"\n  summary: \"3 ops\"\n  artifacts:\n    - path: \"design/architecture.md\"\n      action: \"CREATE\"\n      content: \"# Arch\\nArch content.\"\n    - path: \"design/product-vision.md\"\n      action: \"MODIFY\"\n      content: \"# Vision\\nModified.\"\n    - path: \"design/requirements.md\"\n      action: \"CREATE\"\n      content: \"# Req\\nReq content.\"\n```",
+            pkt.metadata.packet_id, pid
+        );
+        let preview =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &resp).unwrap();
+
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::MidBatch));
+        let res =
+            RelayService::accept_import(db.connection(), dir.path(), &pid, &preview.import_id);
+        assert!(res.is_err());
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::None));
+
+        let recovered =
+            RelayService::reconcile_interrupted_batches(db.connection(), dir.path(), &pid).unwrap();
+        assert!(recovered);
+
+        // Pre-import state must be authoritatively restored
+        assert_eq!(
+            ArtifactManager::read_artifact(dir.path(), "design/product-vision.md")
+                .unwrap()
+                .unwrap(),
+            "# Vision\nOriginal"
+        );
+        assert!(
+            ArtifactManager::read_artifact(dir.path(), "design/architecture.md")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ArtifactManager::read_artifact(dir.path(), "design/requirements.md")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_batch_recovery_seam_during_delete_operation() {
+        let (dir, mut db, pid) = setup_test_project();
+        let pkt =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+        ArtifactManager::write_artifact_atomic(
+            dir.path(),
+            "design/constraints.md",
+            "# Constraints\nOriginal",
+        )
+        .unwrap();
+
+        let resp = format!(
+            "```yaml\ncoalition_response:\n  schema: 1\n  packet_id: \"{}\"\n  project_id: \"{}\"\n  response_type: \"ARCHITECT_UPDATE\"\n  summary: \"Delete op\"\n  artifacts:\n    - path: \"design/constraints.md\"\n      action: \"DELETE\"\n```",
+            pkt.metadata.packet_id, pid
+        );
+        let preview =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &resp).unwrap();
+
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::DuringDeleteOperation));
+        let res =
+            RelayService::accept_import(db.connection(), dir.path(), &pid, &preview.import_id);
+        assert!(res.is_err());
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::None));
+
+        let recovered =
+            RelayService::reconcile_interrupted_batches(db.connection(), dir.path(), &pid).unwrap();
+        assert!(recovered);
+        // Original deleted file must be restored
+        assert_eq!(
+            ArtifactManager::read_artifact(dir.path(), "design/constraints.md")
+                .unwrap()
+                .unwrap(),
+            "# Constraints\nOriginal"
+        );
+    }
+
+    #[test]
+    fn test_batch_recovery_seams_after_final_replacement_and_sqlite_decisions() {
+        let (dir, mut db, pid) = setup_test_project();
+        let pkt =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+        let resp = format!(
+            "```yaml\ncoalition_response:\n  schema: 1\n  packet_id: \"{}\"\n  project_id: \"{}\"\n  response_type: \"ARCHITECT_UPDATE\"\n  summary: \"AfterFinalReplacement\"\n  artifacts:\n    - path: \"design/product-vision.md\"\n      action: \"CREATE\"\n      content: \"# Vision\\nSubstantive content.\"\n```",
+            pkt.metadata.packet_id, pid
+        );
+        let preview =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &resp).unwrap();
+
+        // Seam: AfterFinalReplacement (fails before COMMITTED phase -> rolls back to pre-import state)
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::AfterFinalReplacement));
+        assert!(
+            RelayService::accept_import(db.connection(), dir.path(), &pid, &preview.import_id)
+                .is_err()
+        );
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::None));
+
+        let recovered =
+            RelayService::reconcile_interrupted_batches(db.connection(), dir.path(), &pid).unwrap();
+        assert!(recovered);
+        assert!(
+            ArtifactManager::read_artifact(dir.path(), "design/product-vision.md")
+                .unwrap()
+                .is_none()
+        );
+
+        // Seam: BeforeSqliteDecisionUpdate (fails after COMMITTED phase -> rolls forward)
+        let pkt2 =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+        let resp2 = format!(
+            "```yaml\ncoalition_response:\n  schema: 1\n  packet_id: \"{}\"\n  project_id: \"{}\"\n  response_type: \"ARCHITECT_UPDATE\"\n  summary: \"BeforeSqliteDecisionUpdate\"\n  artifacts:\n    - path: \"design/product-vision.md\"\n      action: \"CREATE\"\n      content: \"# Vision\\nSubstantive content.\"\n```",
+            pkt2.metadata.packet_id, pid
+        );
+        let preview2 =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &resp2).unwrap();
+
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::BeforeSqliteDecisionUpdate));
+        assert!(RelayService::accept_import(
+            db.connection(),
+            dir.path(),
+            &pid,
+            &preview2.import_id
+        )
+        .is_err());
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::None));
+
+        let recovered2 =
+            RelayService::reconcile_interrupted_batches(db.connection(), dir.path(), &pid).unwrap();
+        assert!(recovered2);
+        assert_eq!(
+            ArtifactManager::read_artifact(dir.path(), "design/product-vision.md")
+                .unwrap()
+                .unwrap(),
+            "# Vision\nSubstantive content."
+        );
+    }
+
+    #[test]
+    fn test_batch_recovery_seam_during_reconciliation() {
+        let (dir, mut db, pid) = setup_test_project();
+        let pkt =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+        let resp = format!(
+            "```yaml\ncoalition_response:\n  schema: 1\n  packet_id: \"{}\"\n  project_id: \"{}\"\n  response_type: \"ARCHITECT_UPDATE\"\n  summary: \"Reconciliation crash\"\n  artifacts:\n    - path: \"design/product-vision.md\"\n      action: \"CREATE\"\n      content: \"# Vision\\nContent.\"\n```",
+            pkt.metadata.packet_id, pid
+        );
+        let preview =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &resp).unwrap();
+
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::BeforeFirstReplacement));
+        let _ = RelayService::accept_import(db.connection(), dir.path(), &pid, &preview.import_id);
+
+        // Inject failure during reconciliation
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::DuringRecoveryReconciliation));
+        let err = RelayService::reconcile_interrupted_batches(db.connection(), dir.path(), &pid);
+        assert!(err.is_err());
+
+        // Clear injection seam and rerun reconciliation -> must succeed deterministically!
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::None));
+        let recovered =
+            RelayService::reconcile_interrupted_batches(db.connection(), dir.path(), &pid).unwrap();
+        assert!(recovered);
+    }
+
+    #[test]
+    fn test_batch_recovery_missing_backup_fails_closed() {
+        let (dir, mut db, pid) = setup_test_project();
+        let pkt =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+        ArtifactManager::write_artifact_atomic(
+            dir.path(),
+            "design/product-vision.md",
+            "# Vision\nOriginal",
+        )
+        .unwrap();
+
+        let resp = format!(
+            "```yaml\ncoalition_response:\n  schema: 1\n  packet_id: \"{}\"\n  project_id: \"{}\"\n  response_type: \"ARCHITECT_UPDATE\"\n  summary: \"Missing backup\"\n  artifacts:\n    - path: \"design/product-vision.md\"\n      action: \"MODIFY\"\n      content: \"# Vision\\nModified.\"\n    - path: \"design/requirements.md\"\n      action: \"CREATE\"\n      content: \"# Req\\nCreated.\"\n```",
+            pkt.metadata.packet_id, pid
+        );
+        let preview =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &resp).unwrap();
+
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::AfterFirstReplacement));
+        let res =
+            RelayService::accept_import(db.connection(), dir.path(), &pid, &preview.import_id);
+        println!("DEBUG ACCEPT_IMPORT RESULT: {:?}", res);
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::None));
+
+        // Locate and delete the backup file to simulate corrupted/missing backup
+        let ops_json: String = db
+            .connection()
+            .query_row(
+                "SELECT operations_json FROM relay_import_batch_journal WHERE import_id = ?1",
+                params![preview.import_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let ops: Vec<BatchOperation> = serde_json::from_str(&ops_json).unwrap();
+        for op in ops {
+            if let Some(bak) = op.backup_path {
+                let p = Path::new(&bak);
+                if p.exists() {
+                    std::fs::remove_file(p).unwrap();
+                }
+            }
+        }
+
+        // Recovery reconciliation must fail-closed with BatchRecoveryRequired
+        let err = RelayService::reconcile_interrupted_batches(db.connection(), dir.path(), &pid)
+            .unwrap_err();
+        assert!(matches!(err, RelayError::BatchRecoveryRequired(_)));
+
+        // Active batch journal must remain intact in DB
+        let journal_count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM relay_import_batch_journal WHERE import_id = ?1",
+                params![preview.import_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(journal_count, 1);
+    }
+
+    #[test]
+    fn test_active_batch_journal_blocks_packet_prep_import_and_manual_save() {
+        let (dir, mut db, pid) = setup_test_project();
+        let pkt =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+        ArtifactManager::write_artifact_atomic(
+            dir.path(),
+            "design/product-vision.md",
+            "# Vision\nOriginal",
+        )
+        .unwrap();
+
+        let resp = format!(
+            "```yaml\ncoalition_response:\n  schema: 1\n  packet_id: \"{}\"\n  project_id: \"{}\"\n  response_type: \"ARCHITECT_UPDATE\"\n  summary: \"Blocked ops\"\n  artifacts:\n    - path: \"design/product-vision.md\"\n      action: \"MODIFY\"\n      content: \"# Vision\\nNew.\"\n    - path: \"design/requirements.md\"\n      action: \"CREATE\"\n      content: \"# Req\\nNew.\"\n```",
+            pkt.metadata.packet_id, pid
+        );
+        let preview =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &resp).unwrap();
+
+        // Inject mid-batch failure and delete backup to keep journal unrecoverable
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::AfterFirstReplacement));
+        let _ = RelayService::accept_import(db.connection(), dir.path(), &pid, &preview.import_id);
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::None));
+
+        let ops_json: String = db
+            .connection()
+            .query_row(
+                "SELECT operations_json FROM relay_import_batch_journal WHERE import_id = ?1",
+                params![preview.import_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let ops: Vec<BatchOperation> = serde_json::from_str(&ops_json).unwrap();
+        for op in ops {
+            if let Some(bak) = op.backup_path {
+                let p = Path::new(&bak);
+                if p.exists() {
+                    std::fs::remove_file(p).unwrap();
+                }
+            }
+        }
+
+        // 1. prepare_architect_packet must fail closed
+        let prep_err =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap_err();
+        assert!(matches!(prep_err, RelayError::BatchRecoveryRequired(_)));
+
+        // 2. process_import must fail closed
+        let import_err =
+            RelayService::process_import(db.connection(), dir.path(), &pid, "irrelevant")
+                .unwrap_err();
+        assert!(matches!(import_err, RelayError::BatchRecoveryRequired(_)));
+
+        // 3. save_artifact_content must fail closed
+        let save_err = RelayService::save_artifact_content(
+            db.connection(),
+            dir.path(),
+            &pid,
+            "design/product-vision.md",
+            "# Vision\nManual",
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(save_err, RelayError::BatchRecoveryRequired(_)));
+    }
+
+    #[test]
+    fn test_duplicate_artifact_paths_rejected() {
+        let (dir, mut db, pid) = setup_test_project();
+        let pkt =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+
+        let dup_resp = format!(
+            "```yaml\ncoalition_response:\n  schema: 1\n  packet_id: \"{}\"\n  project_id: \"{}\"\n  response_type: \"ARCHITECT_UPDATE\"\n  summary: \"Duplicate paths\"\n  artifacts:\n    - path: \"design/product-vision.md\"\n      action: \"CREATE\"\n      content: \"# Vision\\nFirst\"\n    - path: \"design/product-vision.md\"\n      action: \"CREATE\"\n      content: \"# Vision\\nDuplicate\"\n```",
+            pkt.metadata.packet_id, pid
+        );
+
+        let err =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &dup_resp).unwrap_err();
+        assert!(
+            matches!(err, RelayError::DuplicateArtifactPath(p) if p == "design/product-vision.md")
+        );
+    }
+
+    #[test]
+    fn test_open_questions_direct_artifact_rejected() {
+        let (dir, mut db, pid) = setup_test_project();
+        let pkt =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+
+        let oq_resp = format!(
+            "```yaml\ncoalition_response:\n  schema: 1\n  packet_id: \"{}\"\n  project_id: \"{}\"\n  response_type: \"ARCHITECT_UPDATE\"\n  summary: \"Open questions artifact\"\n  artifacts:\n    - path: \"design/open-questions.md\"\n      action: \"CREATE\"\n      content: \"# Direct OQ\"\n```",
+            pkt.metadata.packet_id, pid
+        );
+
+        let err =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &oq_resp).unwrap_err();
+        assert!(matches!(
+            err,
+            RelayError::OpenQuestionsDirectArtifactRejected(_)
+        ));
+    }
+
+    #[test]
+    fn test_json_response_envelope_parsing() {
+        let (dir, mut db, pid) = setup_test_project();
+        let pkt =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+
+        // 1. JSON inside markdown code fence
+        let fenced_json = format!(
+            "```json\n{{\n  \"coalition_response\": {{\n    \"schema\": 1,\n    \"packet_id\": \"{}\",\n    \"project_id\": \"{}\",\n    \"response_type\": \"ARCHITECT_UPDATE\",\n    \"summary\": \"Fenced JSON\",\n    \"artifacts\": [\n      {{\n        \"path\": \"design/product-vision.md\",\n        \"action\": \"CREATE\",\n        \"content\": \"# Vision\\nFrom JSON\"\n      }}\n    ]\n  }}\n}}\n```",
+            pkt.metadata.packet_id, pid
+        );
+
+        let preview1 =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &fenced_json).unwrap();
+        assert_eq!(preview1.summary, "Fenced JSON");
+        assert_eq!(preview1.artifacts.len(), 1);
+
+        // Reject so we can test raw JSON without PENDING conflict
+        RelayService::reject_import(db.connection(), &pid, &preview1.import_id).unwrap();
+
+        // 2. Raw JSON without fences
+        let raw_json = format!(
+            "{{\n  \"coalition_response\": {{\n    \"schema\": 1,\n    \"packet_id\": \"{}\",\n    \"project_id\": \"{}\",\n    \"response_type\": \"ARCHITECT_UPDATE\",\n    \"summary\": \"Raw JSON\",\n    \"artifacts\": [\n      {{\n        \"path\": \"design/product-vision.md\",\n        \"action\": \"CREATE\",\n        \"content\": \"# Vision\\nFrom Raw JSON\"\n      }}\n    ]\n  }}\n}}",
+            pkt.metadata.packet_id, pid
+        );
+
+        let preview2 =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &raw_json).unwrap();
+        assert_eq!(preview2.summary, "Raw JSON");
+        assert_eq!(preview2.artifacts.len(), 1);
+    }
+
+    #[test]
+    fn test_external_readiness_change_reconciles_workflow_state() {
+        let (dir, mut db, pid) = setup_test_project();
+        let pkt =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+
+        // Populate all 9 canonical files with substantive content
+        let full_resp = format!(
+            "```yaml\ncoalition_response:\n  schema: 1\n  packet_id: \"{}\"\n  project_id: \"{}\"\n  response_type: \"ARCHITECT_UPDATE\"\n  summary: \"Full\"\n  artifacts:\n    - path: \"design/product-vision.md\"\n      action: \"CREATE\"\n      content: \"# Vision\\nSubstantive vision document.\"\n    - path: \"design/requirements.md\"\n      action: \"CREATE\"\n      content: \"# Requirements\\nREQ-01: System must enforce invariants reliably.\"\n    - path: \"design/architecture.md\"\n      action: \"CREATE\"\n      content: \"# Architecture\\nLayered modular architecture with Rust backend.\"\n    - path: \"design/constraints.md\"\n      action: \"CREATE\"\n      content: \"# Constraints\\nOffline-first operation and bounded local resource usage.\"\n    - path: \"design/interfaces.md\"\n      action: \"CREATE\"\n      content: \"# Interfaces\\nTyped IPC contracts across frontend and machine side.\"\n    - path: \"design/security.md\"\n      action: \"CREATE\"\n      content: \"# Security\\nLeast privilege process management and local safe paths.\"\n    - path: \"implementation/implementation-plan.md\"\n      action: \"CREATE\"\n      content: \"# Plan\\nPhased delivery with deterministic test milestones.\"\n    - path: \"implementation/acceptance-criteria.yaml\"\n      action: \"CREATE\"\n      content: \"criteria:\\n  - id: AC-1\\n    name: Verified passes\\n\"\n    - path: \"implementation/test-plan.md\"\n      action: \"CREATE\"\n      content: \"# Test Plan\\nDeterministic automated test suite and regression checks.\"\n```",
+            pkt.metadata.packet_id, pid
+        );
+        let preview =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &full_resp).unwrap();
+        let report =
+            RelayService::accept_import(db.connection(), dir.path(), &pid, &preview.import_id)
+                .unwrap();
+        assert_eq!(report.overall_readiness, OverallReadiness::ReadyToFreeze);
+
+        let st1: String = db
+            .connection()
+            .query_row(
+                "SELECT state FROM workflow_state WHERE project_id = ?1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(st1, "READY_TO_FREEZE");
+
+        // Simulate external editor or git change removing one required file
+        std::fs::remove_file(
+            dir.path()
+                .join(".coalition")
+                .join("design")
+                .join("product-vision.md"),
+        )
+        .unwrap();
+
+        // get_workspace_state must detect this and reconcile workflow state back to ARCHITECTING
+        let ws = RelayService::get_workspace_state(db.connection(), dir.path(), &pid).unwrap();
+        assert_eq!(ws.readiness.overall_readiness, OverallReadiness::Incomplete);
+
+        let st2: String = db
+            .connection()
+            .query_row(
+                "SELECT state FROM workflow_state WHERE project_id = ?1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(st2, "ARCHITECTING");
+    }
+
+    #[test]
+    fn test_architect_update_prompt_instructs_modify_for_existing_artifacts() {
+        let (dir, mut db, pid) = setup_test_project();
+        ArtifactManager::write_artifact_atomic(
+            dir.path(),
+            "design/product-vision.md",
+            "# Vision\nExisting vision content",
+        )
+        .unwrap();
+
+        // Initial packet is ARCHITECT_INITIAL
+        let pkt1 =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+        assert_eq!(pkt1.metadata.packet_type, RelayPacketType::ArchitectInitial);
+
+        // Subsequent packet is ARCHITECT_UPDATE
+        let pkt2 =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+        assert_eq!(pkt2.metadata.packet_type, RelayPacketType::ArchitectUpdate);
+
+        // Check guidance in prompt
+        assert!(pkt2
+            .prompt
+            .contains("- `design/product-vision.md`: EXISTS ON DISK -> Use action: \"MODIFY\""));
+        assert!(pkt2
+            .prompt
+            .contains("- `design/requirements.md`: ABSENT FROM DISK -> Use action: \"CREATE\""));
     }
 }

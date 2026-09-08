@@ -1,15 +1,9 @@
+pub use crate::core::artifacts::ArtifactApplicability;
 use crate::core::artifacts::ArtifactManager;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const CURRENT_READINESS_POLICY_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ArtifactApplicability {
-    Required,
-    Optional,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -140,10 +134,39 @@ pub struct ReadinessReport {
 pub struct ReadinessEvaluator;
 
 impl ReadinessEvaluator {
-    /// Evaluates the current durable artifacts in `.coalition/` against a readiness policy.
+    /// Evaluates the current durable artifacts in `.coalition/` against the project's readiness policy.
     pub fn evaluate<P: AsRef<Path>>(repo_root: P) -> ReadinessReport {
-        let policy = default_readiness_policy();
-        Self::evaluate_with_policy(repo_root, &policy)
+        let root = repo_root.as_ref();
+        let mut policy = default_readiness_policy();
+
+        let project_yaml_path = root.join(".coalition").join("project.yaml");
+        if let Ok(project) = ArtifactManager::read_project_yaml(&project_yaml_path) {
+            if let Some(ref cfg) = project.readiness {
+                policy.policy_version = cfg.policy_version;
+                for (path, app) in &cfg.applicability {
+                    if let Some(rule) = policy.rules.iter_mut().find(|r| r.path == *path) {
+                        rule.applicability = *app;
+                    }
+                }
+            }
+        }
+
+        Self::evaluate_with_policy(root, &policy)
+    }
+
+    /// Sets the durable readiness applicability for an artifact in the project's project.yaml.
+    pub fn set_artifact_applicability<P: AsRef<Path>>(
+        repo_root: P,
+        artifact_path: &str,
+        applicability: ArtifactApplicability,
+    ) -> Result<ReadinessReport, crate::core::artifacts::ArtifactError> {
+        let root = repo_root.as_ref();
+        ArtifactManager::update_project_readiness_applicability(
+            root,
+            artifact_path,
+            applicability,
+        )?;
+        Ok(Self::evaluate(root))
     }
 
     pub fn evaluate_with_policy<P: AsRef<Path>>(
@@ -167,7 +190,11 @@ impl ReadinessEvaluator {
             let (status, details) = match content.as_deref() {
                 None => (
                     ArtifactReadinessStatus::Missing,
-                    Some("File is absent from .coalition/".to_string()),
+                    if rule.applicability == ArtifactApplicability::NotApplicable {
+                        Some("Marked NOT_APPLICABLE for this project".to_string())
+                    } else {
+                        Some("File is absent from .coalition/".to_string())
+                    },
                 ),
                 Some(text) => match rule.kind {
                     ArtifactKind::Markdown => Self::evaluate_markdown(text),
@@ -678,5 +705,85 @@ mod tests {
         let report2 = ReadinessEvaluator::evaluate(dir.path());
         assert_eq!(report2.overall_readiness, OverallReadiness::Incomplete);
         assert_eq!(report2.ready_required_count, 8);
+    }
+
+    #[test]
+    fn test_project_specific_applicability_override() {
+        let dir = tempfile::tempdir().unwrap();
+        ArtifactManager::initialize_new_project(dir.path(), "test-applicability").unwrap();
+
+        // Initially total_required_count is 9
+        let report0 = ReadinessEvaluator::evaluate(dir.path());
+        assert_eq!(report0.total_required_count, 9);
+
+        // Mark test-plan.md as NOT_APPLICABLE and constraints.md as OPTIONAL
+        let report1 = ReadinessEvaluator::set_artifact_applicability(
+            dir.path(),
+            "implementation/test-plan.md",
+            ArtifactApplicability::NotApplicable,
+        )
+        .unwrap();
+        assert_eq!(report1.total_required_count, 8);
+
+        let report2 = ReadinessEvaluator::set_artifact_applicability(
+            dir.path(),
+            "design/constraints.md",
+            ArtifactApplicability::Optional,
+        )
+        .unwrap();
+        assert_eq!(report2.total_required_count, 7);
+
+        // Provide content for the 7 remaining required artifacts
+        let remaining_required = [
+            (
+                "design/product-vision.md",
+                "# Vision\nThis is a substantive vision document for the system.",
+            ),
+            (
+                "design/requirements.md",
+                "# Requirements\nREQ-01: System must enforce invariants reliably.",
+            ),
+            (
+                "design/architecture.md",
+                "# Architecture\nLayered modular architecture with Rust backend.",
+            ),
+            (
+                "design/interfaces.md",
+                "# Interfaces\nTyped IPC contracts across frontend and machine side.",
+            ),
+            (
+                "design/security.md",
+                "# Security\nLeast privilege process management and local safe paths.",
+            ),
+            (
+                "implementation/implementation-plan.md",
+                "# Plan\nPhased delivery with deterministic test milestones.",
+            ),
+            (
+                "implementation/acceptance-criteria.yaml",
+                "criteria:\n  - id: AC-1\n    name: Verified passes\n",
+            ),
+        ];
+
+        for (p, c) in remaining_required {
+            ArtifactManager::write_artifact_atomic(dir.path(), p, c).unwrap();
+        }
+
+        let report3 = ReadinessEvaluator::evaluate(dir.path());
+        assert_eq!(report3.ready_required_count, 7);
+        assert_eq!(report3.total_required_count, 7);
+        assert_eq!(report3.overall_readiness, OverallReadiness::ReadyToFreeze);
+
+        // Verify NOT_APPLICABLE item has correct item status
+        let na_item = report3
+            .artifacts
+            .iter()
+            .find(|a| a.path == "implementation/test-plan.md")
+            .unwrap();
+        assert_eq!(na_item.applicability, ArtifactApplicability::NotApplicable);
+        assert_eq!(
+            na_item.details,
+            Some("Marked NOT_APPLICABLE for this project".to_string())
+        );
     }
 }

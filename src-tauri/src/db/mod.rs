@@ -150,6 +150,7 @@ impl DbManager {
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_batch_journal_project ON relay_import_batch_journal(project_id);
                 CREATE TABLE IF NOT EXISTS relay_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,

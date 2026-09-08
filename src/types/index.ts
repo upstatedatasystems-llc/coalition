@@ -203,7 +203,7 @@ export interface ImportPreview {
 
 export type ArtifactReadinessStatus = 'MISSING' | 'INCOMPLETE' | 'READY';
 export type OverallReadiness = 'INCOMPLETE' | 'READY_TO_FREEZE';
-export type ArtifactApplicability = 'REQUIRED' | 'OPTIONAL';
+export type ArtifactApplicability = 'REQUIRED' | 'OPTIONAL' | 'NOT_APPLICABLE';
 
 export interface ArtifactReadinessItem {
   path: string;

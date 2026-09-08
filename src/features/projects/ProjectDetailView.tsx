@@ -21,6 +21,18 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
   const { project, workflow_state, artifact, git, is_available } = details;
   const [activeSubTab, setActiveSubTab] = useState<'workspace' | 'overview'>('workspace');
 
+  React.useEffect(() => {
+    const handleRelayImported = () => {
+      if (is_available) {
+        setActiveSubTab('workspace');
+      }
+    };
+    window.addEventListener('coalition:relay-imported', handleRelayImported);
+    return () => {
+      window.removeEventListener('coalition:relay-imported', handleRelayImported);
+    };
+  }, [is_available]);
+
   return (
     <div className="project-detail-container">
       <div className="detail-top-nav">

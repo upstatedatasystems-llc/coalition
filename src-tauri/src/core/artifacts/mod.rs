@@ -47,6 +47,36 @@ impl std::fmt::Display for ArchitectureState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ArtifactApplicability {
+    Required,
+    Optional,
+    NotApplicable,
+}
+
+impl std::fmt::Display for ArtifactApplicability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Required => write!(f, "REQUIRED"),
+            Self::Optional => write!(f, "OPTIONAL"),
+            Self::NotApplicable => write!(f, "NOT_APPLICABLE"),
+        }
+    }
+}
+
+fn default_readiness_policy_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectReadinessConfig {
+    #[serde(default = "default_readiness_policy_version")]
+    pub policy_version: u32,
+    #[serde(default)]
+    pub applicability: std::collections::BTreeMap<String, ArtifactApplicability>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectYaml {
     pub schema_version: u32,
@@ -55,6 +85,8 @@ pub struct ProjectYaml {
     pub current_architecture_version: Option<String>,
     pub architecture_state: ArchitectureState,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<ProjectReadinessConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,6 +411,7 @@ impl ArtifactManager {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: chrono::Utc::now().to_rfc3339(),
+            readiness: None,
         };
 
         Self::write_project_yaml_atomic(&project_yaml_path, &new_project)?;
@@ -436,6 +469,33 @@ impl ArtifactManager {
         Self::validate_project_yaml(&parsed)?;
 
         Ok(parsed)
+    }
+
+    /// Updates the durable readiness applicability for a specific artifact path in project.yaml.
+    pub fn update_project_readiness_applicability<P: AsRef<Path>>(
+        repo_root: P,
+        artifact_path: &str,
+        applicability: ArtifactApplicability,
+    ) -> Result<ProjectYaml, ArtifactError> {
+        let root = repo_root.as_ref();
+        let project_yaml_path = root.join(".coalition").join("project.yaml");
+        let mut project = Self::read_project_yaml(&project_yaml_path)?;
+
+        let mut config = project
+            .readiness
+            .take()
+            .unwrap_or_else(|| ProjectReadinessConfig {
+                policy_version: default_readiness_policy_version(),
+                applicability: std::collections::BTreeMap::new(),
+            });
+
+        config
+            .applicability
+            .insert(artifact_path.to_string(), applicability);
+        project.readiness = Some(config);
+
+        Self::write_project_yaml_atomic(&project_yaml_path, &project)?;
+        Ok(project)
     }
 
     /// Performs genuinely crash-safe atomic file replacement.
@@ -1040,6 +1100,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Frozen,
             created_at: project.created_at.clone(),
+            readiness: None,
         };
 
         let err =
@@ -1161,6 +1222,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
 
         // Valid UUID v4
@@ -1206,6 +1268,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
 
         // Draft + None => valid
@@ -1330,6 +1393,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
 
         let backup_file = coalition.join("project.yaml.bak.20260908");
@@ -1374,6 +1438,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
         let proj2 = ProjectYaml {
             schema_version: 1,
@@ -1382,6 +1447,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
 
         fs::write(
@@ -1420,6 +1486,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
         let project_yaml_path = coalition.join("project.yaml");
         fs::write(
@@ -1533,6 +1600,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
         let project_yaml_path = coalition.join("project.yaml");
         fs::write(
@@ -1594,6 +1662,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
         let project_yaml_path = coalition.join("project.yaml");
         fs::write(
@@ -1638,6 +1707,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
         fs::write(
             coalition.join("project.yaml.bak.1"),
@@ -1699,6 +1769,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            readiness: None,
         };
 
         let backup_file = coalition.join("project.yaml.bak.promotion_fail");

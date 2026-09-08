@@ -1,5 +1,5 @@
 use crate::core::activity::{ActivityEventRecord, ActivityManager};
-use crate::core::artifacts::ArtifactError;
+use crate::core::artifacts::{ArtifactApplicability, ArtifactError, ArtifactManager};
 use crate::core::builder::{
     AgyEvent, AntigravityCliAdapter, BuilderTurnRequest, BuilderTurnResponse, ModelInfo,
 };
@@ -24,6 +24,7 @@ pub struct AppState {
     pub git: Mutex<Option<GitAdapter>>,
     pub agy: Mutex<Option<AntigravityCliAdapter>>,
     pub cancel_flag: Arc<AtomicBool>,
+    pub active_project_id: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -275,6 +276,16 @@ impl From<RelayError> for CommandError {
             RelayError::ImportNotFound(id) => {
                 Self::new("IMPORT_NOT_FOUND", format!("Import {} not found", id))
             }
+            RelayError::DuplicateArtifactPath(path) => Self::with_details(
+                "DUPLICATE_ARTIFACT_PATH",
+                format!("Duplicate artifact path in response: {}", path),
+                serde_json::json!({ "path": path }),
+            ),
+            RelayError::OpenQuestionsDirectArtifactRejected(path) => Self::with_details(
+                "OPEN_QUESTIONS_DIRECT_ARTIFACT_REJECTED",
+                "Direct modification of 'design/open-questions.md' in artifacts is disallowed; use top-level 'open_questions:' field instead",
+                serde_json::json!({ "path": path }),
+            ),
             RelayError::AlreadyDecided(s) => {
                 Self::new("IMPORT_ALREADY_DECIDED", format!("Import already {}", s))
             }
@@ -337,12 +348,15 @@ pub async fn register_or_open_project(
 
     if details.is_available {
         let repo_path = PathBuf::from(&details.project.repository_path);
-        let _ = RelayService::reconcile_interrupted_batches(
+        RelayService::reconcile_interrupted_batches(
             db.connection(),
             &repo_path,
             &details.project.project_id,
-        );
+        )
+        .map_err(CommandError::from)?;
     }
+
+    *state.active_project_id.lock().await = Some(details.project.project_id.clone());
 
     Ok(details)
 }
@@ -366,12 +380,15 @@ pub async fn get_project_details(
 
     if details.is_available {
         let repo_path = PathBuf::from(&details.project.repository_path);
-        let _ = RelayService::reconcile_interrupted_batches(
+        RelayService::reconcile_interrupted_batches(
             db.connection(),
             &repo_path,
             &details.project.project_id,
-        );
+        )
+        .map_err(CommandError::from)?;
     }
+
+    *state.active_project_id.lock().await = Some(details.project.project_id.clone());
 
     Ok(details)
 }
@@ -860,4 +877,34 @@ pub async fn save_artifact_content(
         expected_fingerprint.as_deref(),
     )
     .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn set_active_project_id(
+    state: State<'_, AppState>,
+    project_id: Option<String>,
+) -> Result<(), CommandError> {
+    *state.active_project_id.lock().await = project_id;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_project_artifact_applicability(
+    state: State<'_, AppState>,
+    project_id: String,
+    artifact_path: String,
+    applicability: ArtifactApplicability,
+) -> Result<WorkspaceState, CommandError> {
+    let db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    RelayService::ensure_clean_batch_state(db.connection(), &repo_path, &project_id)
+        .map_err(CommandError::from)?;
+    ArtifactManager::update_project_readiness_applicability(
+        &repo_path,
+        &artifact_path,
+        applicability,
+    )
+    .map_err(CommandError::from)?;
+    RelayService::get_workspace_state(db.connection(), &repo_path, &project_id)
+        .map_err(CommandError::from)
 }

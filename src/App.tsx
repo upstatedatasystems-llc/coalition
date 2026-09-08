@@ -25,11 +25,93 @@ export const App: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [globalError, setGlobalError] = useState<CommandError | null>(null);
+  const [relayToast, setRelayToast] = useState<string | null>(null);
 
   // On mount: load projects and restore last-opened project if possible
   useEffect(() => {
     loadProjectsAndLastOpened();
   }, []);
+
+  const showRelayToast = (msg: string) => {
+    setRelayToast(msg);
+    setTimeout(() => setRelayToast(null), 3000);
+  };
+
+  const handleGlobalCopyRelay = async () => {
+    if (!selectedProjectId) return;
+    try {
+      const packet = await invoke<{ metadata: { packet_id: string } } | null>(
+        'get_pending_relay_packet',
+        { projectId: selectedProjectId }
+      );
+      if (packet) {
+        await invoke('copy_relay_packet_to_clipboard', {
+          packetId: packet.metadata.packet_id,
+        });
+        showRelayToast('Prompt copied to clipboard!');
+        window.dispatchEvent(new CustomEvent('coalition:relay-packet-copied'));
+      } else {
+        showRelayToast('No pending relay packet to copy');
+      }
+    } catch (err: unknown) {
+      handleError(err);
+    }
+  };
+
+  const handleGlobalImportClipboard = async () => {
+    if (!selectedProjectId) return;
+    try {
+      const preview = await invoke('import_from_clipboard', {
+        projectId: selectedProjectId,
+      });
+      showRelayToast('Import preview generated from clipboard!');
+      window.dispatchEvent(new CustomEvent('coalition:relay-imported', { detail: preview }));
+      await handleRefresh();
+    } catch (err: unknown) {
+      handleError(err);
+    }
+  };
+
+  // Top-level keyboard and Tauri global shortcut listeners
+  useEffect(() => {
+    if (!selectedProjectId) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey) {
+        if (e.key === 'R' || e.key === 'r') {
+          e.preventDefault();
+          handleGlobalCopyRelay();
+        } else if (e.key === 'I' || e.key === 'i') {
+          e.preventDefault();
+          handleGlobalImportClipboard();
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+
+    let unlistenCopy: (() => void) | undefined;
+    let unlistenImport: (() => void) | undefined;
+    const registerTauriShortcuts = async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+        unlistenCopy = await listen('coalition:shortcut-copy-relay', () => {
+          handleGlobalCopyRelay();
+        });
+        unlistenImport = await listen('coalition:shortcut-import-clipboard', () => {
+          handleGlobalImportClipboard();
+        });
+      } catch (_e) {
+        // Ignored in non-Tauri / test environments
+      }
+    };
+    registerTauriShortcuts();
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      if (unlistenCopy) unlistenCopy();
+      if (unlistenImport) unlistenImport();
+    };
+  }, [selectedProjectId]);
 
   const loadProjectsAndLastOpened = async () => {
     setIsLoading(true);
@@ -60,6 +142,7 @@ export const App: React.FC = () => {
       const details = await invoke<ProjectDetails>('get_project_details', { projectId });
       setProjectDetails(details);
       setSelectedProjectId(projectId);
+      invoke('set_active_project_id', { projectId }).catch(() => {});
 
       const activity = await invoke<ActivityEventRecord[]>('get_project_activity', {
         projectId,
@@ -188,6 +271,7 @@ export const App: React.FC = () => {
               onBack={() => {
                 setSelectedProjectId(null);
                 setProjectDetails(null);
+                invoke('set_active_project_id', { projectId: null }).catch(() => {});
               }}
               onRefresh={handleRefresh}
               isRefreshing={isRefreshing}
@@ -217,6 +301,12 @@ export const App: React.FC = () => {
         error={modalError}
         isLoading={isLoading}
       />
+
+      {relayToast && (
+        <div className="global-toast-banner" role="status">
+          {relayToast}
+        </div>
+      )}
     </div>
   );
 };

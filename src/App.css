@@ -1166,3 +1166,53 @@ body {
   font-size: 0.82rem;
   white-space: pre-wrap;
 }
+
+/* Global Toast Banner */
+.global-toast-banner {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  background: #1e293b;
+  color: #f8fafc;
+  padding: 10px 18px;
+  border-radius: 8px;
+  font-size: 0.88rem;
+  font-weight: 500;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+  z-index: 1000;
+}
+
+/* Applicability Select and Badges */
+.applicability-row {
+  margin: 3px 0;
+}
+
+.applicability-select {
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  outline: none;
+}
+
+.applicability-select:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 1px #3b82f6;
+}
+
+.badge-required {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.badge-optional {
+  background: #e0e7ff;
+  color: #3730a3;
+}
+
+.badge-not_applicable {
+  background: #f3f4f6;
+  color: #6b7280;
+}

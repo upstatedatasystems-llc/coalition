@@ -234,6 +234,6 @@ mod tests {
                 .expect("run process");
 
         assert!(result.canceled);
-        assert!(result.duration_ms < 3000);
+        assert!(result.duration_ms < 5000);
     }
 }

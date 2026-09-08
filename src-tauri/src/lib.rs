@@ -35,6 +35,7 @@ pub fn run() {
                 git: Mutex::new(None),
                 agy: Mutex::new(None),
                 cancel_flag: Arc::new(AtomicBool::new(false)),
+                active_project_id: Mutex::new(None),
             };
 
             app.manage(state);
@@ -98,6 +99,8 @@ pub fn run() {
             commands::get_architecture_workspace_state,
             commands::get_artifact_content,
             commands::save_artifact_content,
+            commands::set_active_project_id,
+            commands::set_project_artifact_applicability,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
