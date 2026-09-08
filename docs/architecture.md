@@ -68,7 +68,10 @@ Authored and enforced authoritatively in Rust across 19 explicit states:
 
 ## 6. Project Rehydration & Persistence
 
-- **Project Registration**: Canonicalizes Git repository root, creates or loads `.coalition/project.yaml`, registers or updates the operational record in SQLite, ensures workflow state exists, and records `PROJECT_REGISTERED`, `PROJECT_OPENED`, or `PROJECT_REHYDRATED`.
+## 6. Project Rehydration & Persistence
+
+- **Project Registration**: Canonicalizes Git repository root, queries SQLite canonical path before generating durable identity, inspects or recovers `.coalition/project.yaml`, registers or updates the operational record in SQLite, ensures workflow state exists, and records `PROJECT_REGISTERED`, `PROJECT_OPENED`, or `PROJECT_REHYDRATED`.
+- **Operational-First Path Check (Case D)**: If a repository path is registered in SQLite but its durable `project.yaml` is missing on disk, registration immediately fails with typed `DURABLE_CONTRACT_MISSING` and performs zero durable identity mutation on disk.
 - **Transactional Operational Writes**: Operational state creation/updates across `projects`, `workflow_state`, `activity_events`, and `app_settings` run inside an explicit SQLite transaction. Any error rolls back all operational changes, preventing orphaned partial records.
 - **Identity Conflict & Move Reconciliation**: Deterministically handles collisions between durable `project_id`, canonical filesystem path, and existing SQLite rows:
   - If a project folder was moved/renamed and the old path no longer exists on disk, Coalition updates the registered repository path.
@@ -79,5 +82,9 @@ Authored and enforced authoritatively in Rust across 19 explicit states:
 
 ## 7. Safe Contract Replacement & Filesystem Integrity
 
-- **Windows-Safe Atomic Replacement**: Modifying `project.yaml` validates invariants in memory, writes and syncs to a temporary file (`project.yaml.tmp.<uuid>`), stages the existing file as `.bak`, renames the temporary file into place, and cleans up or rolls back on failure. The valid contract file is never deleted prior to committing the replacement.
+- **Crash-Safe Platform-Native Atomic Replacement**: Modifying `project.yaml` validates invariants (strictly requiring RFC 4122 UUID v4 and exact draft/frozen version rules), writes and syncs to a temporary file (`project.yaml.tmp.<uuid>`), and executes native atomic replacement:
+  - On Windows: `ReplaceFileW` with `REPLACEFILE_WRITE_THROUGH` (fallback to `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`).
+  - On POSIX: `rename` followed by directory sync.
+  - Normal updates avoid intermediate backup unlinking/renaming steps. If replacement fails, the temporary file is purged and the original file remains intact.
+- **Stale Backup & Temp File Recovery**: On project inspection, valid canonical `project.yaml` takes precedence and stale temp files are cleaned. If canonical `project.yaml` is missing, a single valid `project.yaml.bak.*` is safely recovered and promoted; ambiguous or corrupted backups return typed `ARTIFACT_RECOVERY_REQUIRED`.
 - **Hierarchy & Layout Validation**: All standard `.coalition/` subdirectories (`design`, `implementation`, `decisions`, `architecture-versions`, `changes`, `reviews`, `evidence`) and `project.yaml` are validated against path traversal (`..`) and Windows junction / symlink reparse points escaping the repository root.

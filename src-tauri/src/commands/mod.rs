@@ -54,9 +54,18 @@ impl From<ProjectError> for CommandError {
     fn from(e: ProjectError) -> Self {
         match e {
             ProjectError::NotAGitRepository(msg) => Self::new("NOT_A_GIT_REPOSITORY", msg),
+            ProjectError::DurableContractMissing { path, project_id } => Self::with_details(
+                "DURABLE_CONTRACT_MISSING",
+                format!(
+                    "Durable contract missing at '{}' for registered project '{}'",
+                    path, project_id
+                ),
+                serde_json::json!({ "path": path, "project_id": project_id }),
+            ),
             ProjectError::NotFound(msg) => Self::new("PROJECT_NOT_FOUND", msg),
             ProjectError::RepositoryUnavailable(msg) => Self::new("REPOSITORY_UNAVAILABLE", msg),
             ProjectError::IdentityConflict(msg) => Self::new("PROJECT_IDENTITY_CONFLICT", msg),
+            ProjectError::RecoveryRequired(msg) => Self::new("ARTIFACT_RECOVERY_REQUIRED", msg),
             ProjectError::CorruptedState(msg) => Self::new("CORRUPTED_STATE", msg),
             ProjectError::Artifact(msg) => Self::new("ARTIFACT_ERROR", msg),
             ProjectError::Workflow(msg) => Self::new("WORKFLOW_ERROR", msg),
@@ -93,6 +102,7 @@ impl From<ArtifactError> for CommandError {
             ArtifactError::UnsafeReparsePoint(msg) => Self::new("UNSAFE_REPARSE_POINT", msg),
             ArtifactError::InvalidYaml(msg) => Self::new("INVALID_YAML", msg),
             ArtifactError::NotFound(msg) => Self::new("ARTIFACT_NOT_FOUND", msg),
+            ArtifactError::RecoveryRequired(msg) => Self::new("ARTIFACT_RECOVERY_REQUIRED", msg),
             ArtifactError::Io(msg) => Self::new("IO_ERROR", msg),
         }
     }

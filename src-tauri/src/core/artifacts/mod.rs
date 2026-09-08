@@ -63,6 +63,8 @@ pub enum ArtifactError {
     InvalidYaml(String),
     #[error("Project descriptor project.yaml not found at {0}")]
     NotFound(String),
+    #[error("Ambiguous or corrupted backup state requires manual recovery: {0}")]
+    RecoveryRequired(String),
     #[error("IO error: {0}")]
     Io(String),
 }
@@ -78,8 +80,18 @@ impl ArtifactManager {
             ));
         }
 
-        if Uuid::parse_str(&project.project_id).is_err() {
-            return Err(ArtifactError::InvalidProjectId(project.project_id.clone()));
+        match Uuid::parse_str(&project.project_id) {
+            Ok(parsed) => {
+                if parsed.get_version() != Some(uuid::Version::Random) {
+                    return Err(ArtifactError::InvalidProjectId(format!(
+                        "{}: only UUID v4 is supported",
+                        project.project_id
+                    )));
+                }
+            }
+            Err(_) => {
+                return Err(ArtifactError::InvalidProjectId(project.project_id.clone()));
+            }
         }
 
         if project.name.trim().is_empty() {
@@ -92,13 +104,10 @@ impl ArtifactManager {
 
         match project.architecture_state {
             ArchitectureState::Draft => {
-                if let Some(ref ver) = project.current_architecture_version {
-                    if !ver.trim().is_empty() {
-                        return Err(ArtifactError::InvalidArchitectureState(
-                            "Draft project cannot declare an active architecture version"
-                                .to_string(),
-                        ));
-                    }
+                if project.current_architecture_version.is_some() {
+                    return Err(ArtifactError::InvalidArchitectureState(
+                        "Draft project cannot declare an active architecture version".to_string(),
+                    ));
                 }
             }
             ArchitectureState::Frozen => match project.current_architecture_version {
@@ -218,12 +227,94 @@ impl ArtifactManager {
         Ok(())
     }
 
-    /// Initializes standard durable .coalition layout if not present, and writes new project.yaml.
-    /// If .coalition/project.yaml already exists, validates the entire layout and loads project.yaml without overwriting.
-    pub fn initialize_or_load_project<P: AsRef<Path>>(
+    /// Cleans up any stale project.yaml.tmp.* files left over from crashes or aborted writes.
+    pub fn clean_stale_temp_files(coalition_dir: &Path) {
+        if let Ok(entries) = fs::read_dir(coalition_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("project.yaml.tmp.") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    /// Inspects the project state in .coalition or recovers from a single valid backup.
+    /// Precedence:
+    /// 1. If project.yaml exists and is valid: cleans stale temp files and returns Some(project).
+    /// 2. If project.yaml is missing:
+    ///    - Checks for project.yaml.bak.*
+    ///    - If exactly one valid backup exists: promotes it atomically to project.yaml, cleans stale temp files, returns Some(recovered).
+    ///    - If multiple backups or corrupted backup: returns Err(ArtifactError::RecoveryRequired).
+    ///    - If no backups: returns Ok(None).
+    pub fn inspect_or_recover_project<P: AsRef<Path>>(
+        repo_root: P,
+    ) -> Result<Option<ProjectYaml>, ArtifactError> {
+        let canonical_root = repo_root
+            .as_ref()
+            .canonicalize()
+            .map_err(|e| ArtifactError::Io(format!("Failed to canonicalize repo root: {}", e)))?;
+
+        let coalition_dir = canonical_root.join(".coalition");
+        if !coalition_dir.exists() {
+            return Ok(None);
+        }
+
+        Self::validate_safe_path(&canonical_root, &coalition_dir)?;
+
+        let project_yaml_path = coalition_dir.join("project.yaml");
+        if project_yaml_path.exists() {
+            Self::validate_safe_path(&canonical_root, &project_yaml_path)?;
+            let project = Self::read_project_yaml(&project_yaml_path)?;
+            Self::clean_stale_temp_files(&coalition_dir);
+            return Ok(Some(project));
+        }
+
+        // project.yaml is missing; check for backup files
+        let mut backups = Vec::new();
+        if let Ok(entries) = fs::read_dir(&coalition_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("project.yaml.bak.") {
+                    backups.push(entry.path());
+                }
+            }
+        }
+
+        if backups.is_empty() {
+            Self::clean_stale_temp_files(&coalition_dir);
+            return Ok(None);
+        }
+
+        if backups.len() == 1 {
+            let backup_path = &backups[0];
+            Self::validate_safe_path(&canonical_root, backup_path)?;
+            match Self::read_project_yaml(backup_path) {
+                Ok(recovered) => {
+                    Self::replace_file_atomically(backup_path, &project_yaml_path)?;
+                    Self::clean_stale_temp_files(&coalition_dir);
+                    Ok(Some(recovered))
+                }
+                Err(e) => Err(ArtifactError::RecoveryRequired(format!(
+                    "Found single backup file '{:?}', but it is corrupted/invalid: {}",
+                    backup_path.file_name().unwrap_or_default(),
+                    e
+                ))),
+            }
+        } else {
+            Err(ArtifactError::RecoveryRequired(format!(
+                "Multiple project.yaml backup files (count: {}) found in .coalition; manual recovery required to avoid selecting wrong state",
+                backups.len()
+            )))
+        }
+    }
+
+    /// Creates .coalition directory, ensures standard subdirectories, and writes a brand new project.yaml.
+    /// Errors if project.yaml already exists.
+    pub fn initialize_new_project<P: AsRef<Path>>(
         repo_root: P,
         default_name: &str,
-    ) -> Result<(ProjectYaml, bool), ArtifactError> {
+    ) -> Result<ProjectYaml, ArtifactError> {
         let canonical_root = repo_root
             .as_ref()
             .canonicalize()
@@ -233,9 +324,9 @@ impl ArtifactManager {
         let project_yaml_path = coalition_dir.join("project.yaml");
 
         if project_yaml_path.exists() {
-            Self::validate_coalition_layout(&canonical_root, &coalition_dir)?;
-            let project_yaml = Self::read_project_yaml(&project_yaml_path)?;
-            return Ok((project_yaml, false));
+            return Err(ArtifactError::Io(
+                "project.yaml already exists; cannot initialize new project".to_string(),
+            ));
         }
 
         fs::create_dir_all(&coalition_dir).map_err(|e| {
@@ -255,7 +346,29 @@ impl ArtifactManager {
 
         Self::write_project_yaml_atomic(&project_yaml_path, &new_project)?;
 
-        Ok((new_project, true))
+        Ok(new_project)
+    }
+
+    /// Initializes standard durable .coalition layout if not present, and loads/recovers project.yaml.
+    pub fn initialize_or_load_project<P: AsRef<Path>>(
+        repo_root: P,
+        default_name: &str,
+    ) -> Result<(ProjectYaml, bool), ArtifactError> {
+        let canonical_root = repo_root
+            .as_ref()
+            .canonicalize()
+            .map_err(|e| ArtifactError::Io(format!("Failed to canonicalize repo root: {}", e)))?;
+
+        let coalition_dir = canonical_root.join(".coalition");
+        if coalition_dir.exists() {
+            Self::validate_coalition_layout(&canonical_root, &coalition_dir)?;
+            if let Some(existing) = Self::inspect_or_recover_project(&canonical_root)? {
+                return Ok((existing, false));
+            }
+        }
+
+        let created = Self::initialize_new_project(&canonical_root, default_name)?;
+        Ok((created, true))
     }
 
     pub fn read_project_yaml<P: AsRef<Path>>(path: P) -> Result<ProjectYaml, ArtifactError> {
@@ -275,15 +388,23 @@ impl ArtifactManager {
         Ok(parsed)
     }
 
-    /// Writes project.yaml using a Windows-safe / cross-platform replacement strategy:
+    /// Performs genuinely crash-safe atomic file replacement.
+    pub fn replace_file_atomically(temp: &Path, destination: &Path) -> Result<(), ArtifactError> {
+        #[cfg(test)]
+        if INJECTED_REPLACEMENT_FAILURE.with(|f| f.get()) {
+            return Err(ArtifactError::Io(
+                "Injected atomic replacement failure for test".to_string(),
+            ));
+        }
+
+        replace_file_atomically_impl(temp, destination)
+    }
+
+    /// Writes project.yaml using genuinely crash-safe atomic replacement:
     /// 1. Validates the descriptor before any I/O.
     /// 2. Writes to a temporary file in the same directory and flushes/syncs to disk.
-    /// 3. If target file already exists, renames target to a temporary backup file.
-    /// 4. Renames temporary file to target.
-    /// 5. If renaming temp to target fails, restores the original file from backup.
-    /// 6. Cleans up temporary/backup files on success or failure.
-    ///
-    /// This ensures the existing valid project.yaml is never prematurely deleted.
+    /// 3. Atomically replaces target using platform-native atomic replacement.
+    /// 4. If replacement fails, cleans up temporary file and leaves target completely intact.
     pub fn write_project_yaml_atomic<P: AsRef<Path>>(
         path: P,
         project: &ProjectYaml,
@@ -301,7 +422,7 @@ impl ArtifactManager {
         let temp_file_name = format!("project.yaml.tmp.{}", Uuid::new_v4());
         let temp_path = parent.join(&temp_file_name);
 
-        // 1. Write to temp file and sync
+        // 1. Write to temp file and sync to durable storage
         {
             let mut file = fs::OpenOptions::new()
                 .write(true)
@@ -322,41 +443,97 @@ impl ArtifactManager {
             })?;
         }
 
-        // 2. Safe replacement without premature deletion
-        if p.exists() {
-            let backup_file_name = format!("project.yaml.bak.{}", Uuid::new_v4());
-            let backup_path = parent.join(&backup_file_name);
-
-            if let Err(e) = fs::rename(p, &backup_path) {
-                let _ = fs::remove_file(&temp_path);
-                return Err(ArtifactError::Io(format!(
-                    "Failed to stage temporary backup of existing project.yaml: {}",
-                    e
-                )));
-            }
-
-            if let Err(e) = fs::rename(&temp_path, p) {
-                // Restore original file from backup immediately
-                let _ = fs::rename(&backup_path, p);
-                let _ = fs::remove_file(&temp_path);
-                return Err(ArtifactError::Io(format!(
-                    "Failed to commit new project.yaml; original file was restored: {}",
-                    e
-                )));
-            }
-
-            // Successfully committed new file; remove temporary backup
-            let _ = fs::remove_file(&backup_path);
-        } else if let Err(e) = fs::rename(&temp_path, p) {
+        // 2. Atomically replace target using platform native replacement
+        if let Err(e) = Self::replace_file_atomically(&temp_path, p) {
             let _ = fs::remove_file(&temp_path);
-            return Err(ArtifactError::Io(format!(
-                "Failed to rename temp file to project.yaml: {}",
-                e
-            )));
+            return Err(e);
         }
 
         Ok(())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub static INJECTED_REPLACEMENT_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(windows)]
+fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), ArtifactError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        REPLACEFILE_WRITE_THROUGH,
+    };
+
+    let temp_wide: Vec<u16> = temp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let dest_wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    if destination.exists() {
+        let res = unsafe {
+            ReplaceFileW(
+                dest_wide.as_ptr(),
+                temp_wide.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+
+        if res != 0 {
+            return Ok(());
+        }
+
+        let err = unsafe { GetLastError() };
+        if err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND {
+            return Err(ArtifactError::Io(format!(
+                "ReplaceFileW failed with OS error code {}",
+                err
+            )));
+        }
+    }
+
+    let res = unsafe {
+        MoveFileExW(
+            temp_wide.as_ptr(),
+            dest_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+
+    if res != 0 {
+        Ok(())
+    } else {
+        let err = unsafe { GetLastError() };
+        Err(ArtifactError::Io(format!(
+            "MoveFileExW failed with OS error code {}",
+            err
+        )))
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), ArtifactError> {
+    fs::rename(temp, destination)
+        .map_err(|e| ArtifactError::Io(format!("rename failed: {}", e)))?;
+    if let Some(parent) = destination.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -458,13 +635,13 @@ mod tests {
         fs::create_dir_all(&coalition).unwrap();
 
         // Version 0
-        let v0_yaml = "schema_version: 0\nproject_id: '00000000-0000-0000-0000-000000000000'\nname: 'V0 Proj'\narchitecture_state: draft\ncreated_at: '2026-09-08T00:00:00Z'\n";
+        let v0_yaml = "schema_version: 0\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: 'V0 Proj'\narchitecture_state: draft\ncreated_at: '2026-09-08T00:00:00Z'\n";
         fs::write(coalition.join("project.yaml"), v0_yaml).unwrap();
         let err = ArtifactManager::read_project_yaml(coalition.join("project.yaml")).unwrap_err();
         assert_eq!(err, ArtifactError::UnsupportedSchemaVersion(0));
 
         // Version 99
-        let v99_yaml = "schema_version: 99\nproject_id: '00000000-0000-0000-0000-000000000000'\nname: 'V99 Proj'\narchitecture_state: draft\ncreated_at: '2026-09-08T00:00:00Z'\n";
+        let v99_yaml = "schema_version: 99\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: 'V99 Proj'\narchitecture_state: draft\ncreated_at: '2026-09-08T00:00:00Z'\n";
         fs::write(coalition.join("project.yaml"), v99_yaml).unwrap();
         let err2 = ArtifactManager::read_project_yaml(coalition.join("project.yaml")).unwrap_err();
         assert_eq!(err2, ArtifactError::UnsupportedSchemaVersion(99));
@@ -488,7 +665,7 @@ mod tests {
         let coalition = dir.path().join(".coalition");
         fs::create_dir_all(&coalition).unwrap();
 
-        let empty_name_yaml = "schema_version: 1\nproject_id: '00000000-0000-0000-0000-000000000000'\nname: '   '\narchitecture_state: draft\ncreated_at: '2026-09-08T00:00:00Z'\n";
+        let empty_name_yaml = "schema_version: 1\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: '   '\narchitecture_state: draft\ncreated_at: '2026-09-08T00:00:00Z'\n";
         fs::write(coalition.join("project.yaml"), empty_name_yaml).unwrap();
         let err = ArtifactManager::read_project_yaml(coalition.join("project.yaml")).unwrap_err();
         assert_eq!(err, ArtifactError::EmptyProjectName);
@@ -500,7 +677,7 @@ mod tests {
         let coalition = dir.path().join(".coalition");
         fs::create_dir_all(&coalition).unwrap();
 
-        let bad_ts_yaml = "schema_version: 1\nproject_id: '00000000-0000-0000-0000-000000000000'\nname: 'Proj'\narchitecture_state: draft\ncreated_at: 'yesterday'\n";
+        let bad_ts_yaml = "schema_version: 1\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: 'Proj'\narchitecture_state: draft\ncreated_at: 'yesterday'\n";
         fs::write(coalition.join("project.yaml"), bad_ts_yaml).unwrap();
         let err = ArtifactManager::read_project_yaml(coalition.join("project.yaml")).unwrap_err();
         assert!(matches!(err, ArtifactError::InvalidTimestamp(_)));
@@ -512,10 +689,16 @@ mod tests {
         let coalition = dir.path().join(".coalition");
         fs::create_dir_all(&coalition).unwrap();
 
-        let draft_with_ver = "schema_version: 1\nproject_id: '00000000-0000-0000-0000-000000000000'\nname: 'Proj'\narchitecture_state: draft\ncurrent_architecture_version: '1.0'\ncreated_at: '2026-09-08T00:00:00Z'\n";
+        let draft_with_ver = "schema_version: 1\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: 'Proj'\narchitecture_state: draft\ncurrent_architecture_version: '1.0'\ncreated_at: '2026-09-08T00:00:00Z'\n";
         fs::write(coalition.join("project.yaml"), draft_with_ver).unwrap();
         let err = ArtifactManager::read_project_yaml(coalition.join("project.yaml")).unwrap_err();
         assert!(matches!(err, ArtifactError::InvalidArchitectureState(_)));
+
+        // Empty string version in draft must also be rejected
+        let draft_with_empty_ver = "schema_version: 1\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: 'Proj'\narchitecture_state: draft\ncurrent_architecture_version: ''\ncreated_at: '2026-09-08T00:00:00Z'\n";
+        fs::write(coalition.join("project.yaml"), draft_with_empty_ver).unwrap();
+        let err2 = ArtifactManager::read_project_yaml(coalition.join("project.yaml")).unwrap_err();
+        assert!(matches!(err2, ArtifactError::InvalidArchitectureState(_)));
     }
 
     #[test]
@@ -524,7 +707,7 @@ mod tests {
         let coalition = dir.path().join(".coalition");
         fs::create_dir_all(&coalition).unwrap();
 
-        let frozen_no_ver = "schema_version: 1\nproject_id: '00000000-0000-0000-0000-000000000000'\nname: 'Proj'\narchitecture_state: frozen\ncreated_at: '2026-09-08T00:00:00Z'\n";
+        let frozen_no_ver = "schema_version: 1\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: 'Proj'\narchitecture_state: frozen\ncreated_at: '2026-09-08T00:00:00Z'\n";
         fs::write(coalition.join("project.yaml"), frozen_no_ver).unwrap();
         let err = ArtifactManager::read_project_yaml(coalition.join("project.yaml")).unwrap_err();
         assert!(matches!(err, ArtifactError::InvalidArchitectureState(_)));
@@ -536,7 +719,7 @@ mod tests {
         let coalition = dir.path().join(".coalition");
         fs::create_dir_all(&coalition).unwrap();
 
-        let valid_frozen = "schema_version: 1\nproject_id: '00000000-0000-0000-0000-000000000000'\nname: 'Proj'\narchitecture_state: frozen\ncurrent_architecture_version: '1.0'\ncreated_at: '2026-09-08T00:00:00Z'\n";
+        let valid_frozen = "schema_version: 1\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: 'Proj'\narchitecture_state: frozen\ncurrent_architecture_version: '1.0'\ncreated_at: '2026-09-08T00:00:00Z'\n";
         fs::write(coalition.join("project.yaml"), valid_frozen).unwrap();
         let project = ArtifactManager::read_project_yaml(coalition.join("project.yaml")).unwrap();
         assert_eq!(project.architecture_state, ArchitectureState::Frozen);
@@ -544,6 +727,243 @@ mod tests {
             project.current_architecture_version,
             Some("1.0".to_string())
         );
+    }
+
+    #[test]
+    fn test_uuid_v4_validation() {
+        let make_project = |id: &str| ProjectYaml {
+            schema_version: 1,
+            project_id: id.to_string(),
+            name: "uuid-test".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+
+        // Valid UUID v4
+        let valid_v4 = make_project("a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d");
+        assert!(ArtifactManager::validate_project_yaml(&valid_v4).is_ok());
+
+        // Generated v4
+        let generated_v4 = make_project(&Uuid::new_v4().to_string());
+        assert!(ArtifactManager::validate_project_yaml(&generated_v4).is_ok());
+
+        // Nil UUID (rejected)
+        let nil_uuid = make_project("00000000-0000-0000-0000-000000000000");
+        let err_nil = ArtifactManager::validate_project_yaml(&nil_uuid).unwrap_err();
+        assert!(matches!(err_nil, ArtifactError::InvalidProjectId(_)));
+
+        // UUID v1 (rejected)
+        let v1_uuid = make_project("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+        let err_v1 = ArtifactManager::validate_project_yaml(&v1_uuid).unwrap_err();
+        assert!(matches!(err_v1, ArtifactError::InvalidProjectId(_)));
+
+        // UUID v3 (rejected)
+        let v3_uuid = make_project("6ba7b811-9dad-31d1-80b4-00c04fd430c8");
+        let err_v3 = ArtifactManager::validate_project_yaml(&v3_uuid).unwrap_err();
+        assert!(matches!(err_v3, ArtifactError::InvalidProjectId(_)));
+
+        // UUID v5 (rejected)
+        let v5_uuid = make_project("6ba7b811-9dad-51d1-80b4-00c04fd430c8");
+        let err_v5 = ArtifactManager::validate_project_yaml(&v5_uuid).unwrap_err();
+        assert!(matches!(err_v5, ArtifactError::InvalidProjectId(_)));
+
+        // Non-UUID string (rejected)
+        let malformed = make_project("not-even-a-uuid");
+        let err_malformed = ArtifactManager::validate_project_yaml(&malformed).unwrap_err();
+        assert!(matches!(err_malformed, ArtifactError::InvalidProjectId(_)));
+    }
+
+    #[test]
+    fn test_draft_architecture_version_exact_invariant() {
+        let mut proj = ProjectYaml {
+            schema_version: 1,
+            project_id: Uuid::new_v4().to_string(),
+            name: "draft-inv-test".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+
+        // Draft + None => valid
+        assert!(ArtifactManager::validate_project_yaml(&proj).is_ok());
+
+        // Draft + Some("") => rejected
+        proj.current_architecture_version = Some("".to_string());
+        assert!(matches!(
+            ArtifactManager::validate_project_yaml(&proj).unwrap_err(),
+            ArtifactError::InvalidArchitectureState(_)
+        ));
+
+        // Draft + Some("   ") => rejected
+        proj.current_architecture_version = Some("   ".to_string());
+        assert!(matches!(
+            ArtifactManager::validate_project_yaml(&proj).unwrap_err(),
+            ArtifactError::InvalidArchitectureState(_)
+        ));
+
+        // Draft + Some("1.0") => rejected
+        proj.current_architecture_version = Some("1.0".to_string());
+        assert!(matches!(
+            ArtifactManager::validate_project_yaml(&proj).unwrap_err(),
+            ArtifactError::InvalidArchitectureState(_)
+        ));
+
+        // Frozen + None => rejected
+        proj.architecture_state = ArchitectureState::Frozen;
+        proj.current_architecture_version = None;
+        assert!(matches!(
+            ArtifactManager::validate_project_yaml(&proj).unwrap_err(),
+            ArtifactError::InvalidArchitectureState(_)
+        ));
+
+        // Frozen + Some("") => rejected
+        proj.current_architecture_version = Some("".to_string());
+        assert!(matches!(
+            ArtifactManager::validate_project_yaml(&proj).unwrap_err(),
+            ArtifactError::InvalidArchitectureState(_)
+        ));
+
+        // Frozen + Some("   ") => rejected
+        proj.current_architecture_version = Some("   ".to_string());
+        assert!(matches!(
+            ArtifactManager::validate_project_yaml(&proj).unwrap_err(),
+            ArtifactError::InvalidArchitectureState(_)
+        ));
+
+        // Frozen + Some("1.0") => valid
+        proj.current_architecture_version = Some("1.0".to_string());
+        assert!(ArtifactManager::validate_project_yaml(&proj).is_ok());
+    }
+
+    #[test]
+    fn test_replacement_failure_preserves_old_file_authoritatively() {
+        let dir = tempdir().unwrap();
+        let (original_proj, _) =
+            ArtifactManager::initialize_or_load_project(dir.path(), "preserve-me").unwrap();
+        let yaml_path = dir.path().join(".coalition").join("project.yaml");
+
+        let mut updated = original_proj.clone();
+        updated.name = "mutated-name".to_string();
+
+        // Inject replacement failure
+        INJECTED_REPLACEMENT_FAILURE.with(|f| f.set(true));
+
+        let err = ArtifactManager::write_project_yaml_atomic(&yaml_path, &updated).unwrap_err();
+        assert!(matches!(err, ArtifactError::Io(_)));
+
+        // Reset injection flag
+        INJECTED_REPLACEMENT_FAILURE.with(|f| f.set(false));
+
+        // Verify the original file on disk is completely intact and unaltered
+        let current_on_disk = ArtifactManager::read_project_yaml(&yaml_path).unwrap();
+        assert_eq!(current_on_disk.name, "preserve-me");
+        assert_eq!(current_on_disk.project_id, original_proj.project_id);
+
+        // Verify no leftover temp files
+        let entries: Vec<_> = fs::read_dir(dir.path().join(".coalition"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(!entries.iter().any(|f| f.contains(".tmp.")));
+    }
+
+    #[test]
+    fn test_stale_temp_file_cleanup() {
+        let dir = tempdir().unwrap();
+        let (project, _) =
+            ArtifactManager::initialize_or_load_project(dir.path(), "cleanup-test").unwrap();
+        let coalition = dir.path().join(".coalition");
+
+        // Plant stale temp file
+        let stale_temp = coalition.join("project.yaml.tmp.old-crash-file");
+        fs::write(&stale_temp, "temporary stale data").unwrap();
+        assert!(stale_temp.exists());
+
+        // Calling inspect_or_recover_project cleans stale temp files
+        let inspected = ArtifactManager::inspect_or_recover_project(dir.path())
+            .unwrap()
+            .expect("should find project");
+        assert_eq!(inspected.project_id, project.project_id);
+        assert!(!stale_temp.exists(), "stale temp file must be cleaned up");
+    }
+
+    #[test]
+    fn test_single_valid_backup_recovery() {
+        let dir = tempdir().unwrap();
+        let coalition = dir.path().join(".coalition");
+        fs::create_dir_all(&coalition).unwrap();
+
+        let backup_project = ProjectYaml {
+            schema_version: 1,
+            project_id: Uuid::new_v4().to_string(),
+            name: "recovered-project".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+
+        let backup_file = coalition.join("project.yaml.bak.20260908");
+        let backup_yaml = serde_yaml::to_string(&backup_project).unwrap();
+        fs::write(&backup_file, backup_yaml).unwrap();
+
+        let project_yaml_path = coalition.join("project.yaml");
+        assert!(!project_yaml_path.exists());
+
+        // inspect_or_recover_project recovers the single valid backup
+        let recovered = ArtifactManager::inspect_or_recover_project(dir.path())
+            .unwrap()
+            .expect("should recover project");
+        assert_eq!(recovered.project_id, backup_project.project_id);
+        assert_eq!(recovered.name, "recovered-project");
+
+        // Canonical project.yaml must now exist on disk
+        assert!(project_yaml_path.exists());
+        let on_disk = ArtifactManager::read_project_yaml(&project_yaml_path).unwrap();
+        assert_eq!(on_disk.project_id, backup_project.project_id);
+    }
+
+    #[test]
+    fn test_ambiguous_backups_require_recovery() {
+        let dir = tempdir().unwrap();
+        let coalition = dir.path().join(".coalition");
+        fs::create_dir_all(&coalition).unwrap();
+
+        let proj1 = ProjectYaml {
+            schema_version: 1,
+            project_id: Uuid::new_v4().to_string(),
+            name: "backup-1".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+        let proj2 = ProjectYaml {
+            schema_version: 1,
+            project_id: Uuid::new_v4().to_string(),
+            name: "backup-2".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+
+        fs::write(
+            coalition.join("project.yaml.bak.1"),
+            serde_yaml::to_string(&proj1).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            coalition.join("project.yaml.bak.2"),
+            serde_yaml::to_string(&proj2).unwrap(),
+        )
+        .unwrap();
+
+        let err = ArtifactManager::inspect_or_recover_project(dir.path()).unwrap_err();
+        assert!(matches!(err, ArtifactError::RecoveryRequired(_)));
+
+        // Neither backup should be deleted
+        assert!(coalition.join("project.yaml.bak.1").exists());
+        assert!(coalition.join("project.yaml.bak.2").exists());
+        assert!(!coalition.join("project.yaml").exists());
     }
 
     #[test]

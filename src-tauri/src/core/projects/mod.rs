@@ -42,8 +42,12 @@ pub struct ProjectDetails {
 pub enum ProjectError {
     #[error("Not a Git repository: {0}")]
     NotAGitRepository(String),
+    #[error("Durable contract missing at '{path}' for registered project '{project_id}'")]
+    DurableContractMissing { path: String, project_id: String },
     #[error("Artifact error: {0}")]
     Artifact(String),
+    #[error("Recovery required: {0}")]
+    RecoveryRequired(String),
     #[error("Workflow error: {0}")]
     Workflow(String),
     #[error("Git error: {0}")]
@@ -62,7 +66,10 @@ pub enum ProjectError {
 
 impl From<ArtifactError> for ProjectError {
     fn from(e: ArtifactError) -> Self {
-        Self::Artifact(e.to_string())
+        match e {
+            ArtifactError::RecoveryRequired(msg) => Self::RecoveryRequired(msg),
+            other => Self::Artifact(other.to_string()),
+        }
     }
 }
 
@@ -112,19 +119,13 @@ impl ProjectService {
             .and_then(|n| n.to_str())
             .unwrap_or("project");
 
-        // 1. Durable artifact initialization / loading
-        let (project_yaml, created_new_artifact) =
-            ArtifactManager::initialize_or_load_project(&repo_root, default_name)?;
-
-        let now = chrono::Utc::now().to_rfc3339();
-
-        // 2. Identity conflict and move reconciliation against existing SQLite state
-        let record_by_id: Option<ProjectRecord> = conn
+        // 1. Query SQLite operational state by canonical path BEFORE durable identity generation
+        let record_by_path: Option<ProjectRecord> = conn
             .query_row(
                 "SELECT project_id, name, repository_path, created_at, updated_at, last_opened_at
                  FROM projects
-                 WHERE project_id = ?1",
-                params![project_yaml.project_id],
+                 WHERE repository_path = ?1",
+                params![canonical_path_str],
                 |r| {
                     Ok(ProjectRecord {
                         project_id: r.get(0)?,
@@ -138,12 +139,36 @@ impl ProjectService {
             )
             .optional()?;
 
-        let record_by_path: Option<ProjectRecord> = conn
+        // 2. Inspect or recover durable contract from .coalition
+        let artifact_opt = ArtifactManager::inspect_or_recover_project(&repo_root)?;
+
+        // Reconcile Case D: path is registered in SQLite but durable contract is missing on disk
+        if let (Some(by_path), None) = (&record_by_path, &artifact_opt) {
+            return Err(ProjectError::DurableContractMissing {
+                path: canonical_path_str,
+                project_id: by_path.project_id.clone(),
+            });
+        }
+
+        // Obtain or initialize durable project.yaml
+        let (project_yaml, created_new_artifact) = match artifact_opt {
+            Some(yaml) => (yaml, false),
+            None => {
+                // Case A: neither SQLite nor disk knows this project; initialize brand new contract
+                let new_yaml = ArtifactManager::initialize_new_project(&repo_root, default_name)?;
+                (new_yaml, true)
+            }
+        };
+
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // 3. Identity conflict and move reconciliation against existing SQLite state
+        let record_by_id: Option<ProjectRecord> = conn
             .query_row(
                 "SELECT project_id, name, repository_path, created_at, updated_at, last_opened_at
                  FROM projects
-                 WHERE repository_path = ?1",
-                params![canonical_path_str],
+                 WHERE project_id = ?1",
+                params![project_yaml.project_id],
                 |r| {
                     Ok(ProjectRecord {
                         project_id: r.get(0)?,
@@ -862,5 +887,82 @@ mod tests {
             "Corrupted workflow state must return Err(ProjectError::CorruptedState), got {:?}",
             res
         );
+    }
+
+    #[test]
+    fn test_case_d_durable_contract_missing_zero_mutation() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let repo_dir = tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        // Initial registration
+        let details =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap();
+        let original_pid = details.project.project_id.clone();
+
+        // Delete .coalition/project.yaml from disk to simulate Case D
+        let project_yaml_path = repo_dir.path().join(".coalition").join("project.yaml");
+        fs::remove_file(&project_yaml_path).unwrap();
+        assert!(!project_yaml_path.exists());
+
+        // Attempting to register/open must return DurableContractMissing
+        let err =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap_err();
+
+        match err {
+            ProjectError::DurableContractMissing { path, project_id } => {
+                assert_eq!(project_id, original_pid);
+                let canonical = git.resolve_repo_root(repo_dir.path()).unwrap();
+                assert_eq!(path, canonical.to_string_lossy());
+            }
+            other => panic!("Expected DurableContractMissing, got {:?}", other),
+        }
+
+        // CRITICAL: Ensure zero durable identity mutation occurred on disk
+        assert!(
+            !project_yaml_path.exists(),
+            "Must NOT write a new project.yaml when durable contract is missing for a known path"
+        );
+    }
+
+    #[test]
+    fn test_case_e_identity_conflict_zero_mutation() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let repo_dir = tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        // Register project
+        let details =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap();
+        let original_pid = details.project.project_id.clone();
+
+        // Overwrite project.yaml on disk with a brand new project_id
+        let mut rogue_project = details.artifact.unwrap();
+        rogue_project.project_id = uuid::Uuid::new_v4().to_string();
+        ArtifactManager::write_project_yaml_atomic(
+            repo_dir.path().join(".coalition").join("project.yaml"),
+            &rogue_project,
+        )
+        .unwrap();
+
+        // Attempting to reopen must return IdentityConflict
+        let err =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap_err();
+        assert!(matches!(err, ProjectError::IdentityConflict(_)));
+
+        // SQLite must still retain the original project ID
+        let rec = ProjectService::get_project_details(db.connection(), Some(&git), &original_pid)
+            .unwrap();
+        assert_eq!(rec.project.project_id, original_pid);
     }
 }

@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added - Stage 1 Final Durability and Identity Closure
+- Genuine crash-safe platform-native atomic replacement for `project.yaml` via Windows `ReplaceFileW` with `REPLACEFILE_WRITE_THROUGH` (and `MoveFileExW` write-through fallback), eliminating the vulnerability window where existing contracts could be lost during unlinking/rename steps.
+- Stale temp file cleanup and single valid backup recovery in `ArtifactManager::inspect_or_recover_project`, with ambiguous/corrupted backups returning typed `ARTIFACT_RECOVERY_REQUIRED` (`ArtifactError::RecoveryRequired`).
+- Strict UUID v4 enforcement in `ArtifactManager::validate_project_yaml` requiring RFC 4122 version 4 (`Version::Random`), rejecting Nil UUIDs, v1, v3, v5, and malformed strings.
+- Exact Draft architecture version invariant: `architecture_state: draft` strictly requires `current_architecture_version` to be `None` / omitted (rejecting empty string `""` and whitespace `"   "` with `INVALID_ARCHITECTURE_STATE`).
+- Operational-first project registration ordering querying SQLite canonical path before touching durable files; missing contract for registered path (Case D) returns typed `DURABLE_CONTRACT_MISSING` with zero durable identity mutation.
+- Replacement failure injection test seam and comprehensive tests covering UUID v4 validation, draft invariants, backup recovery, stale temp cleanup, and Case D/E identity reconciliation.
+
 ### Added - Phase 1 (Coalition Core and Project Persistence)
 - Authoritative Rust workflow state machine implementing all 19 V1 states with strict transition validation, pause/resume state preservation, atomic revision increments, and human architecture change requests from `PAUSED` and `INTERRUPTED` states when paused from post-freeze development.
 - Durable `.coalition/` project contract hierarchy (`project.yaml`, `design/`, `implementation/`, `decisions/`, `architecture-versions/`, `changes/`, `reviews/`, `evidence/`) with complete layout validation against path traversal and symlink/junction reparse points.

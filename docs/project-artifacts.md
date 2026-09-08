@@ -53,10 +53,10 @@ created_at: "2026-09-08T12:00:00Z"
 ```
 
 - `schema_version`: Explicit unsigned integer (1). Deserialization and validation strictly reject versions != 1.
-- `project_id`: Stable UUID v4 identifier generated on initial registration. Deserialization validates proper UUID syntax. Survives local SQLite deletion.
+- `project_id`: Stable UUID v4 identifier generated on initial registration. Deserialization and validation strictly require RFC 4122 version 4 (Random), rejecting Nil UUIDs, v1, v3, v5, and malformed identifiers. Survives local SQLite deletion.
 - `name`: Human-readable project name. Cannot be empty or whitespace-only.
-- `current_architecture_version`: Immutable version string (e.g. `"1.0"`) once frozen, or `null` while in draft. Schema rules strictly mandate:
-  - If `architecture_state` is `draft`, `current_architecture_version` must be `None` / `null`.
+- `current_architecture_version`: Immutable version string (e.g. `"1.0"`) once frozen, or omitted/`null` while in draft. Schema rules strictly mandate:
+  - If `architecture_state` is `draft`, `current_architecture_version` must be `None` / omitted (any string, including empty `""` or whitespace `"   "`, is rejected with `INVALID_ARCHITECTURE_STATE`).
   - If `architecture_state` is `frozen`, `current_architecture_version` must be `Some(v)` with a non-empty trimmed version string.
 - `architecture_state`: Typed domain state (`draft` | `frozen`).
 - `created_at`: ISO-8601 UTC RFC3339 timestamp validated via `chrono::DateTime::parse_from_rfc3339`.
@@ -69,23 +69,36 @@ All standard `.coalition/` subdirectories (`design`, `implementation`, `decision
 - Rejects path traversal escapes (`..`) with `ArtifactError::PathTraversal`.
 - Rejects Windows directory junctions, symlinks, or reparse points that point outside the repository with `ArtifactError::UnsafeReparsePoint`.
 
-### Windows-Safe Atomic Replacement Algorithm
+### Crash-Safe Platform-Native Atomic Replacement
 
-Updating `project.yaml` via `ArtifactManager::write_project_yaml_atomic` guarantees durable contract preservation even across crashes or filesystem errors:
+Updating `project.yaml` via `ArtifactManager::write_project_yaml_atomic` provides genuine crash-safe replacement without ever leaving the system in a window where no canonical file exists:
 1. Validates the `ProjectYaml` descriptor in memory against all schema v1 invariants before touching the disk.
-2. Writes the serialized YAML to a unique temporary file (`project.yaml.tmp.<uuid>`) in the `.coalition/` folder.
+2. Writes serialized YAML to a unique temporary file (`project.yaml.tmp.<uuid>`) in the `.coalition/` folder.
 3. Flushes and syncs the file descriptor (`sync_all()`) to ensure physical disk commitment.
-4. If a target `project.yaml` already exists:
-   - Renames `project.yaml` to `project.yaml.bak.<uuid>`.
-   - Renames `project.yaml.tmp.<uuid>` to `project.yaml`.
-   - If renaming the replacement into place fails, immediately restores the original file from `.bak`.
-   - Cleans up `.bak` upon confirmed replacement.
-5. If no target file existed initially, renames the temp file directly into place.
-6. The valid original file is never deleted prior to committing the replacement.
+4. Atomically replaces destination using native platform APIs:
+   - **Windows**: `ReplaceFileW` with `REPLACEFILE_WRITE_THROUGH` (falling back to `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` if destination does not exist). The existing file is never renamed to a backup on normal writes, eliminating any crash window between an unlinking and renaming step.
+   - **POSIX**: `std::fs::rename` plus directory `sync_all()`.
+5. If replacement fails, the temporary file is deleted and the existing `project.yaml` is left completely intact.
 
-### Unavailable Repository Contract Semantics
+### Stale Backup & Temp File Recovery Policy
 
-When a project's repository is moved or unavailable on disk:
-- Coalition returns `artifact: None` in `ProjectDetails`.
-- The system never fabricates a synthetic or assumed "Draft" contract.
-- The UI visibly alerts the user that durable architecture state exists only in `.coalition/project.yaml` and is currently offline.
+If an unexpected crash or interrupted operation occurred, `ArtifactManager::inspect_or_recover_project` resolves state with strict precedence:
+1. **Canonical `project.yaml` exists and is valid**: Project truth is intact. Any stale `project.yaml.tmp.*` files are safely pruned.
+2. **Canonical `project.yaml` is missing**:
+   - The `.coalition` directory is scanned for legacy or recovery backups (`project.yaml.bak.*`).
+   - If **exactly 1** valid backup exists: It is safely and atomically promoted to `project.yaml` via `replace_file_atomically`, stale temp files are cleaned, and the project is loaded.
+   - If **multiple** backups exist, or if a single backup is corrupted/invalid: The system refuses to guess, avoids arbitrary selection, and returns structured error `ARTIFACT_RECOVERY_REQUIRED` (`ArtifactError::RecoveryRequired`).
+   - If no backups exist: Returns `None`.
+
+### Operational-First Registration Ordering & Missing Contract Semantics
+
+When opening or registering a project repository:
+1. SQLite is queried by canonical path *first*, before any durable files are created or identity is generated.
+2. If the canonical path is already registered in SQLite, but `project.yaml` is missing on disk (Case D):
+   - The operation fails immediately with structured error `DURABLE_CONTRACT_MISSING` (`ProjectError::DurableContractMissing`).
+   - **Zero durable identity mutation occurs on disk** (no new `project.yaml` is created).
+3. If the repository is completely new to both SQLite and disk (Case A), a new UUID v4 `project.yaml` is initialized.
+4. When a project's repository is offline or deleted from disk:
+   - Coalition returns `artifact: None` in `ProjectDetails`.
+   - The system never fabricates a synthetic or assumed "Draft" contract.
+   - The UI visibly alerts the user that durable architecture state exists only in `.coalition/project.yaml` and is currently offline.
