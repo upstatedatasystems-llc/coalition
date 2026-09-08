@@ -377,6 +377,7 @@ impl ArtifactManager {
     }
 
     /// Initializes standard durable .coalition layout if not present, and loads project.yaml if already present.
+    /// Initializes standard durable .coalition layout if not present, and loads project.yaml if already present.
     pub fn initialize_or_load_project<P: AsRef<Path>>(
         repo_root: P,
         default_name: &str,
@@ -388,10 +389,21 @@ impl ArtifactManager {
 
         let coalition_dir = canonical_root.join(".coalition");
         if coalition_dir.exists() {
-            Self::validate_coalition_layout(&canonical_root, &coalition_dir)?;
+            Self::validate_safe_path(&canonical_root, &coalition_dir)?;
             let inspection = Self::inspect_project_artifacts(&canonical_root)?;
             if let Some(existing) = inspection.canonical {
+                Self::validate_coalition_layout(&canonical_root, &coalition_dir)?;
                 return Ok((existing, false));
+            }
+
+            // Option A: If recovery artifacts exist and canonical is absent, never generate a new project identity
+            if !inspection.valid_backups.is_empty()
+                || inspection.temp_files_present
+                || inspection.ambiguous_or_invalid_recovery_state
+            {
+                return Err(ArtifactError::RecoveryRequired(
+                    "Recovery artifacts detected in .coalition; cannot initialize new project identity while recovery evidence exists".to_string(),
+                ));
             }
         }
 
@@ -419,10 +431,17 @@ impl ArtifactManager {
     /// Performs genuinely crash-safe atomic file replacement.
     pub fn replace_file_atomically(temp: &Path, destination: &Path) -> Result<(), ArtifactError> {
         #[cfg(test)]
-        if INJECTED_REPLACEMENT_FAILURE.with(|f| f.get()) {
-            return Err(ArtifactError::Io(
-                "Injected atomic replacement failure for test".to_string(),
-            ));
+        {
+            if INJECTED_REPLACEMENT_FAILURE.with(|f| f.get()) {
+                return Err(ArtifactError::Io(
+                    "Injected atomic replacement failure for test".to_string(),
+                ));
+            }
+            if INJECTED_SEAM.with(|f| f.get()) == InjectedSeam::PreCallFailure {
+                return Err(ArtifactError::Io(
+                    "Injected pre-call atomic replacement failure for test".to_string(),
+                ));
+            }
         }
 
         replace_file_atomically_impl(temp, destination)
@@ -432,7 +451,8 @@ impl ArtifactManager {
     /// 1. Validates the descriptor before any I/O.
     /// 2. Writes to a temporary file in the same directory and flushes/syncs to disk.
     /// 3. Atomically replaces target using platform-native atomic replacement.
-    /// 4. If replacement fails, cleans up temporary file and leaves target completely intact.
+    /// 4. If replacement fails with RecoveryRequired, preserves all recovery artifacts intact.
+    ///    On ordinary safe failures, cleans up the staged temporary file.
     pub fn write_project_yaml_atomic<P: AsRef<Path>>(
         path: P,
         project: &ProjectYaml,
@@ -473,7 +493,16 @@ impl ArtifactManager {
 
         // 2. Atomically replace target using platform native replacement
         if let Err(e) = Self::replace_file_atomically(&temp_path, p) {
-            let _ = fs::remove_file(&temp_path);
+            match &e {
+                ArtifactError::RecoveryRequired(_) => {
+                    // Crucial: preserve any remaining recognized temp/backup/canonical artifacts
+                    // for manual or administrative recovery inspection.
+                }
+                _ => {
+                    // Ordinary known-safe failures: clean up temp file if not already cleaned.
+                    let _ = fs::remove_file(&temp_path);
+                }
+            }
             return Err(e);
         }
 
@@ -482,16 +511,24 @@ impl ArtifactManager {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InjectedSeam {
+    None,
+    PreCallFailure,
+    SimulateAmbiguousRecovery,
+    SimulateReplaceFileWError(u32),
+}
+
+#[cfg(test)]
 thread_local! {
+    pub static INJECTED_SEAM: std::cell::Cell<InjectedSeam> = const { std::cell::Cell::new(InjectedSeam::None) };
     pub static INJECTED_REPLACEMENT_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(windows)]
 fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), ArtifactError> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{
-        GetLastError, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
-    };
+    use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
@@ -507,7 +544,9 @@ fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), A
         .chain(std::iter::once(0))
         .collect();
 
-    if destination.exists() {
+    let destination_existed_at_start = destination.exists();
+
+    if destination_existed_at_start {
         let parent = destination.parent().ok_or_else(|| {
             ArtifactError::Io("Destination path has no parent directory".to_string())
         })?;
@@ -518,15 +557,45 @@ fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), A
             .chain(std::iter::once(0))
             .collect();
 
-        let res = unsafe {
-            ReplaceFileW(
-                dest_wide.as_ptr(),
-                temp_wide.as_ptr(),
-                backup_wide.as_ptr(),
-                0, // dwReplaceFlags = 0 (REPLACEFILE_WRITE_THROUGH is unsupported for ReplaceFileW)
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
+        #[cfg(test)]
+        let (res, err) = match INJECTED_SEAM.with(|f| f.get()) {
+            InjectedSeam::SimulateAmbiguousRecovery => {
+                // Simulate an interrupted/ambiguous crash where destination was unlinked
+                // but no valid backup was committed.
+                let _ = fs::remove_file(destination);
+                (0, 31) // ERROR_GEN_FAILURE
+            }
+            InjectedSeam::SimulateReplaceFileWError(code) => (0, code),
+            _ => {
+                let r = unsafe {
+                    ReplaceFileW(
+                        dest_wide.as_ptr(),
+                        temp_wide.as_ptr(),
+                        backup_wide.as_ptr(),
+                        0, // dwReplaceFlags = 0 (REPLACEFILE_WRITE_THROUGH is unsupported for ReplaceFileW)
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                let e = if r == 0 { unsafe { GetLastError() } } else { 0 };
+                (r, e)
+            }
+        };
+
+        #[cfg(not(test))]
+        let (res, err) = {
+            let r = unsafe {
+                ReplaceFileW(
+                    dest_wide.as_ptr(),
+                    temp_wide.as_ptr(),
+                    backup_wide.as_ptr(),
+                    0, // dwReplaceFlags = 0 (REPLACEFILE_WRITE_THROUGH is unsupported for ReplaceFileW)
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            let e = if r == 0 { unsafe { GetLastError() } } else { 0 };
+            (r, e)
         };
 
         if res != 0 {
@@ -558,55 +627,53 @@ fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), A
             }
         }
 
-        let err = unsafe { GetLastError() };
-        if err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND {
-            // Failure occurred. Inspect actual filesystem state.
-            let dest_exists = destination.exists();
-            let backup_exists = backup_path.exists();
+        // ReplaceFileW failed. Inspect actual filesystem state.
+        // Crucial: do NOT fall through into MoveFileExW creation path!
+        let dest_exists = destination.exists();
+        let backup_exists = backup_path.exists();
 
-            if !dest_exists && backup_exists {
-                // The destination was moved/renamed to backup before failure occurred!
-                // Restore destination from backup.
-                let restore_res = unsafe {
-                    MoveFileExW(
-                        backup_wide.as_ptr(),
-                        dest_wide.as_ptr(),
-                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                    )
-                };
-                if restore_res != 0 && ArtifactManager::read_project_yaml(destination).is_ok() {
-                    let _ = fs::remove_file(temp);
-                    return Err(ArtifactError::Io(format!(
-                        "ReplaceFileW failed (OS error {}). Destination was restored from backup.",
-                        err
-                    )));
-                } else {
-                    return Err(ArtifactError::RecoveryRequired(format!(
-                        "ReplaceFileW failed (OS error {}). Destination lost and backup restore failed. Manual recovery required.",
-                        err
-                    )));
-                }
-            } else if dest_exists && ArtifactManager::read_project_yaml(destination).is_ok() {
-                // Destination is still intact and valid.
+        if !dest_exists && backup_exists {
+            // The destination was moved/renamed to backup before failure occurred!
+            // Restore destination from backup.
+            let restore_res = unsafe {
+                MoveFileExW(
+                    backup_wide.as_ptr(),
+                    dest_wide.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if restore_res != 0 && ArtifactManager::read_project_yaml(destination).is_ok() {
                 let _ = fs::remove_file(temp);
-                if backup_exists {
-                    let _ = fs::remove_file(&backup_path);
-                }
                 return Err(ArtifactError::Io(format!(
-                    "ReplaceFileW failed with OS error code {}. Original destination remains intact.",
+                    "ReplaceFileW failed (OS error {}). Destination was restored from backup.",
                     err
                 )));
             } else {
-                // Ambiguous or corrupted state
                 return Err(ArtifactError::RecoveryRequired(format!(
-                    "ReplaceFileW failed with OS error code {}. Filesystem in ambiguous recovery state.",
+                    "ReplaceFileW failed (OS error {}). Destination lost and backup restore failed. Manual recovery required.",
                     err
                 )));
             }
+        } else if dest_exists && ArtifactManager::read_project_yaml(destination).is_ok() {
+            // Destination is still intact and valid.
+            let _ = fs::remove_file(temp);
+            if backup_exists {
+                let _ = fs::remove_file(&backup_path);
+            }
+            return Err(ArtifactError::Io(format!(
+                "ReplaceFileW failed with OS error code {}. Original destination remains intact.",
+                err
+            )));
+        } else {
+            // Ambiguous or corrupted state (e.g. destination missing and backup missing, or destination corrupted)
+            return Err(ArtifactError::RecoveryRequired(format!(
+                "ReplaceFileW failed with OS error code {}. Filesystem in ambiguous recovery state.",
+                err
+            )));
         }
     }
 
-    // Destination did not exist initially (or raced): use MoveFileExW
+    // Destination was genuinely absent at the start of the operation: use MoveFileExW creation path
     let res = unsafe {
         MoveFileExW(
             temp_wide.as_ptr(),
@@ -619,8 +686,9 @@ fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), A
         Ok(())
     } else {
         let err = unsafe { GetLastError() };
+        let _ = fs::remove_file(temp);
         Err(ArtifactError::Io(format!(
-            "MoveFileExW failed with OS error code {}",
+            "MoveFileExW creation failed with OS error code {}",
             err
         )))
     }
@@ -628,6 +696,14 @@ fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), A
 
 #[cfg(not(windows))]
 fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), ArtifactError> {
+    #[cfg(test)]
+    if INJECTED_SEAM.with(|f| f.get()) == InjectedSeam::SimulateAmbiguousRecovery {
+        let _ = fs::remove_file(destination);
+        return Err(ArtifactError::RecoveryRequired(
+            "Simulated ambiguous recovery state on POSIX".to_string(),
+        ));
+    }
+
     fs::rename(temp, destination)
         .map_err(|e| ArtifactError::Io(format!("rename failed: {}", e)))?;
     if let Some(parent) = destination.parent() {
@@ -1195,6 +1271,172 @@ mod tests {
         assert!(
             !serialized.contains(&dir_str),
             "project.yaml must never contain local absolute paths"
+        );
+    }
+
+    #[test]
+    fn test_ambiguous_replacement_preserves_temp_file() {
+        let dir = tempdir().unwrap();
+        let canonical_root = dir.path().canonicalize().unwrap();
+        let coalition = canonical_root.join(".coalition");
+        fs::create_dir_all(&coalition).unwrap();
+
+        let initial_project = ProjectYaml {
+            schema_version: 1,
+            project_id: Uuid::new_v4().to_string(),
+            name: "initial-ambiguous-test".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+        let project_yaml_path = coalition.join("project.yaml");
+        fs::write(
+            &project_yaml_path,
+            serde_yaml::to_string(&initial_project).unwrap(),
+        )
+        .unwrap();
+
+        let mut updated = initial_project.clone();
+        updated.name = "mutated-ambiguous-name".to_string();
+
+        // Force ambiguous recovery condition via seam
+        INJECTED_SEAM.with(|f| f.set(InjectedSeam::SimulateAmbiguousRecovery));
+
+        let err =
+            ArtifactManager::write_project_yaml_atomic(&project_yaml_path, &updated).unwrap_err();
+        assert!(
+            matches!(err, ArtifactError::RecoveryRequired(_)),
+            "Ambiguous replacement must return RecoveryRequired error, got: {:?}",
+            err
+        );
+
+        // Reset injection seam
+        INJECTED_SEAM.with(|f| f.set(InjectedSeam::None));
+
+        // Distinct from pre-call failure (which removes temp files),
+        // ambiguous recovery MUST preserve the staged temporary file for recovery inspection!
+        let entries: Vec<_> = fs::read_dir(&coalition)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        let temp_found = entries.iter().any(|f| f.starts_with("project.yaml.tmp."));
+        assert!(
+            temp_found,
+            "Ambiguous replacement failure must preserve staged temporary file: found {:?}",
+            entries
+        );
+
+        // Non-mutating inspection must detect temp_files_present
+        let inspection = ArtifactManager::inspect_project_artifacts(&canonical_root).unwrap();
+        assert!(
+            inspection.temp_files_present,
+            "Inspection must report temp_files_present"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_failed_existing_file_replacement_does_not_fall_through_to_creation() {
+        let dir = tempdir().unwrap();
+        let canonical_root = dir.path().canonicalize().unwrap();
+        let coalition = canonical_root.join(".coalition");
+        fs::create_dir_all(&coalition).unwrap();
+
+        let initial_project = ProjectYaml {
+            schema_version: 1,
+            project_id: Uuid::new_v4().to_string(),
+            name: "original-before-replace".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+        let project_yaml_path = coalition.join("project.yaml");
+        fs::write(
+            &project_yaml_path,
+            serde_yaml::to_string(&initial_project).unwrap(),
+        )
+        .unwrap();
+
+        let mut updated = initial_project.clone();
+        updated.name = "mutated-should-not-overwrite".to_string();
+
+        // Simulate ReplaceFileW failing with ERROR_FILE_NOT_FOUND (code 2)
+        INJECTED_SEAM.with(|f| f.set(InjectedSeam::SimulateReplaceFileWError(2)));
+
+        let res = ArtifactManager::write_project_yaml_atomic(&project_yaml_path, &updated);
+        assert!(
+            res.is_err(),
+            "Must NOT fall through to MoveFileExW creation path and succeed!"
+        );
+
+        // Reset injection seam
+        INJECTED_SEAM.with(|f| f.set(InjectedSeam::None));
+
+        // Verify original destination remains intact with original content
+        let on_disk = ArtifactManager::read_project_yaml(&project_yaml_path).unwrap();
+        assert_eq!(
+            on_disk.name, "original-before-replace",
+            "Destination must not have been overwritten by MoveFileExW creation fallback"
+        );
+    }
+
+    #[test]
+    fn test_initialize_or_load_project_backup_only_returns_recovery_required() {
+        let dir = tempdir().unwrap();
+        let coalition = dir.path().join(".coalition");
+        fs::create_dir_all(&coalition).unwrap();
+
+        let backup_proj = ProjectYaml {
+            schema_version: 1,
+            project_id: Uuid::new_v4().to_string(),
+            name: "backup-only-proj".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+        fs::write(
+            coalition.join("project.yaml.bak.1"),
+            serde_yaml::to_string(&backup_proj).unwrap(),
+        )
+        .unwrap();
+
+        // Must return RecoveryRequired and NOT initialize a new project identity
+        let err = ArtifactManager::initialize_or_load_project(dir.path(), "new-should-not-create")
+            .unwrap_err();
+        assert!(
+            matches!(err, ArtifactError::RecoveryRequired(_)),
+            "Expected RecoveryRequired, got: {:?}",
+            err
+        );
+        assert!(
+            !coalition.join("project.yaml").exists(),
+            "Must NOT create project.yaml while recovery artifacts exist"
+        );
+    }
+
+    #[test]
+    fn test_initialize_or_load_project_temp_only_returns_recovery_required() {
+        let dir = tempdir().unwrap();
+        let coalition = dir.path().join(".coalition");
+        fs::create_dir_all(&coalition).unwrap();
+
+        fs::write(
+            coalition.join("project.yaml.tmp.incomplete"),
+            "temporary write data",
+        )
+        .unwrap();
+
+        // Must return RecoveryRequired and NOT initialize a new project identity
+        let err = ArtifactManager::initialize_or_load_project(dir.path(), "new-should-not-create")
+            .unwrap_err();
+        assert!(
+            matches!(err, ArtifactError::RecoveryRequired(_)),
+            "Expected RecoveryRequired, got: {:?}",
+            err
+        );
+        assert!(
+            !coalition.join("project.yaml").exists(),
+            "Must NOT create project.yaml while temp files exist"
         );
     }
 }

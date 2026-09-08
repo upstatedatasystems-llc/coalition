@@ -443,6 +443,10 @@ impl ProjectService {
         // 5. Update last opened project in app_settings
         Self::set_app_setting(&tx, "last_opened_project_id", &project_record.project_id)?;
 
+        // 6. Re-validate complete .coalition hierarchy, recreating any missing standard
+        // directories and rejecting symlink/junction reparse points that escape the repository.
+        ArtifactManager::validate_coalition_layout(&repo_root, &coalition_dir)?;
+
         // Commit transaction
         tx.commit()?;
 
@@ -1387,5 +1391,111 @@ mod tests {
             temp_file.exists(),
             "Temp file must remain for recovery inspection"
         );
+    }
+
+    #[test]
+    fn test_reopen_recreates_missing_standard_subdirectories() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let repo_dir = tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        // 1. Register project initially
+        let details =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap();
+        let pid = details.project.project_id;
+        let coalition = repo_dir.path().join(".coalition");
+
+        // 2. Remove several empty standard subdirectories
+        let design_dir = coalition.join("design");
+        let reviews_dir = coalition.join("reviews");
+        let evidence_dir = coalition.join("evidence");
+        fs::remove_dir(&design_dir).unwrap();
+        fs::remove_dir(&reviews_dir).unwrap();
+        fs::remove_dir(&evidence_dir).unwrap();
+        assert!(!design_dir.exists());
+        assert!(!reviews_dir.exists());
+        assert!(!evidence_dir.exists());
+
+        // 3. Reopen project
+        let reopened =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap();
+        assert_eq!(reopened.project.project_id, pid);
+
+        // 4. Missing standard directories must be recreated safely
+        assert!(design_dir.is_dir(), "design directory must be recreated");
+        assert!(reviews_dir.is_dir(), "reviews directory must be recreated");
+        assert!(
+            evidence_dir.is_dir(),
+            "evidence directory must be recreated"
+        );
+    }
+
+    #[test]
+    fn test_reopen_rejects_escaping_symlink_or_junction() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let repo_dir = tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        // 1. Register project
+        let _details =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap();
+        let coalition = repo_dir.path().join(".coalition");
+        let changes_dir = coalition.join("changes");
+
+        // 2. Create external directory outside repository root
+        let external_dir = tempdir().unwrap();
+        let external_target = external_dir.path().join("external_target");
+        fs::create_dir_all(&external_target).unwrap();
+
+        // 3. Replace standard subdirectory with a junction / symlink pointing outside repo
+        fs::remove_dir(&changes_dir).unwrap();
+
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(changes_dir.as_os_str())
+                .arg(external_target.as_os_str())
+                .status()
+                .unwrap();
+            assert!(status.success(), "mklink /J must succeed");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&external_target, &changes_dir).unwrap();
+        }
+
+        // 4. Reopen project: must reject before Coalition writes through that path!
+        let err =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap_err();
+        match err {
+            ProjectError::Artifact(ref msg) => {
+                assert!(
+                    msg.contains("outside repository root") || msg.contains("Path traversal"),
+                    "Expected reparse point or traversal error message, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ProjectError::Artifact, got {:?}", other),
+        }
+
+        // Windows cleanup of junction so tempdir destructor can delete it without issue
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "rmdir"])
+                .arg(changes_dir.as_os_str())
+                .status();
+        }
     }
 }

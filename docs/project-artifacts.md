@@ -78,11 +78,11 @@ Updating `project.yaml` via `ArtifactManager::write_project_yaml_atomic` guarant
 2. Writes serialized YAML to a unique temporary file (`project.yaml.tmp.<uuid>`) in the `.coalition/` folder.
 3. Flushes and syncs the file descriptor (`sync_all()`) to ensure physical disk commitment before replacement.
 4. Atomically replaces destination using native platform APIs:
-   - **Windows**: `ReplaceFileW` with `dwReplaceFlags = 0` (Microsoft documents `REPLACEFILE_WRITE_THROUGH` as unsupported for `ReplaceFileW`) and an explicit same-directory backup path (`project.yaml.bak.<uuid>`). If destination does not exist initially, falls back to `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`.
+   - **Windows**: `ReplaceFileW` with `dwReplaceFlags = 0` (Microsoft documents `REPLACEFILE_WRITE_THROUGH` as unsupported for `ReplaceFileW`) and an explicit same-directory backup path (`project.yaml.bak.<uuid>`). If destination was genuinely absent at entry, uses `MoveFileExW` creation path. If destination existed at entry, failure never falls through into file creation.
    - **POSIX**: `std::fs::rename` plus directory `sync_all()`.
-5. **Post-Call Reconciliation**:
+5. **Post-Call Reconciliation & Recovery Artifact Preservation**:
    - **On Success**: Validates and reads canonical destination `project.yaml`. Only after successful validation is the generated backup safely deleted.
-   - **On Failure**: Explicitly inspects destination, temporary file, and generated backup. If destination was unlinked/renamed to backup by the OS prior to failure, destination is restored from backup; if destination is intact and valid, the temp file is removed; if state is ambiguous, all files are preserved and `ARTIFACT_RECOVERY_REQUIRED` is returned.
+   - **On Failure**: Explicitly inspects destination, temporary file, and generated backup. If destination was unlinked/renamed to backup by the OS prior to failure, destination is restored from backup; if destination is intact and valid, the temp file is removed; if state is ambiguous or returns `RecoveryRequired`, all recognized temp, backup, and canonical artifacts are preserved intact for recovery inspection.
 
 ### Non-Mutating Artifact Inspection & Identity-Before-Promotion Policy
 
@@ -96,7 +96,11 @@ Updating `project.yaml` via `ArtifactManager::write_project_yaml_atomic` guarant
    - **Ambiguous State**: If multiple backups or corrupted backups exist, returns `ARTIFACT_RECOVERY_REQUIRED` with zero mutation.
    - **Incomplete Writes (Temp-only)**: If canonical is missing and only temp files exist, returns `ARTIFACT_RECOVERY_REQUIRED` with zero mutation.
    - **Case D (Missing Contract)**: If SQLite path is known, but no canonical contract or valid backup exists, returns `DURABLE_CONTRACT_MISSING` with zero durable identity mutation.
-3. When a project's repository is offline or deleted from disk:
+3. **Complete Layout Validation on Every Project Open**:
+   - Every successful open validates the complete `.coalition/` hierarchy, ensuring that all standard subdirectories (`design/`, `implementation/`, `decisions/`, `architecture-versions/`, `changes/`, `reviews/`, `evidence/`) exist and resolve safely inside the repository root.
+   - Missing standard directories are recreated safely.
+   - Symlink or junction escapes outside the repository root are strictly rejected before Coalition writes through that path.
+4. When a project's repository is offline or deleted from disk:
    - Coalition returns `artifact: None` in `ProjectDetails`.
    - The system never fabricates a synthetic or assumed "Draft" contract.
    - The UI visibly alerts the user that durable architecture state exists only in `.coalition/project.yaml` and is currently offline.

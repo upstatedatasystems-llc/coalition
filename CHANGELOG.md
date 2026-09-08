@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added - Stage 1 Final Durability and Identity Closure
 - Genuine crash-safe platform-native atomic replacement for `project.yaml` via Windows `ReplaceFileW` with `dwReplaceFlags = 0` (Microsoft documents `REPLACEFILE_WRITE_THROUGH` as unsupported for `ReplaceFileW`), an explicit same-directory backup (`project.yaml.bak.<uuid>`), post-call destination validation, and reconciliation of documented failure states.
+- Preservation of recovery artifacts when replacement returns `RecoveryRequired`, making cleanup ownership explicit so callers never purge staged temporary files or backups during ambiguous failure states.
+- Prevention of failed existing-file `ReplaceFileW` calls from falling through into `MoveFileExW` creation path, ensuring disappearance or replacement failure is not silently reinterpreted as file creation.
+- Complete `.coalition/` layout validation restored on every project open, recreating missing standard subdirectories (`design/`, `implementation/`, `decisions/`, `architecture-versions/`, `changes/`, `reviews/`, `evidence/`) and rejecting symlink/junction reparse points escaping repository root before writes can occur.
+- Hardened `ArtifactManager::initialize_or_load_project` to reject initialization with `RecoveryRequired` when backup or temp recovery evidence exists.
 - Separation of artifact inspection from recovery mutation via `inspect_project_artifacts()`, enforcing strict identity-before-promotion in `ProjectService` so that recovery candidates are never promoted until identity is validated against SQLite registration history.
 - Coalition flushes replacement data before invoking the native replacement primitive. On Windows it uses `ReplaceFileW` with a same-directory backup, reconciles documented failure states, and never authorizes recovery candidate promotion until project identity has been validated.
 - Stale temp file cleanup and single valid backup recovery in `ArtifactManager`, with ambiguous/corrupted backups returning typed `ARTIFACT_RECOVERY_REQUIRED` (`ArtifactError::RecoveryRequired`).
