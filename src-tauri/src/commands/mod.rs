@@ -1,4 +1,5 @@
 use crate::core::activity::{ActivityEventRecord, ActivityManager};
+use crate::core::artifacts::ArtifactError;
 use crate::core::builder::{
     AgyEvent, AntigravityCliAdapter, BuilderTurnRequest, BuilderTurnResponse, ModelInfo,
 };
@@ -55,10 +56,44 @@ impl From<ProjectError> for CommandError {
             ProjectError::NotAGitRepository(msg) => Self::new("NOT_A_GIT_REPOSITORY", msg),
             ProjectError::NotFound(msg) => Self::new("PROJECT_NOT_FOUND", msg),
             ProjectError::RepositoryUnavailable(msg) => Self::new("REPOSITORY_UNAVAILABLE", msg),
+            ProjectError::IdentityConflict(msg) => Self::new("PROJECT_IDENTITY_CONFLICT", msg),
+            ProjectError::CorruptedState(msg) => Self::new("CORRUPTED_STATE", msg),
             ProjectError::Artifact(msg) => Self::new("ARTIFACT_ERROR", msg),
             ProjectError::Workflow(msg) => Self::new("WORKFLOW_ERROR", msg),
             ProjectError::Git(msg) => Self::new("GIT_ERROR", msg),
             ProjectError::Database(msg) => Self::new("DATABASE_ERROR", msg),
+        }
+    }
+}
+
+impl From<ArtifactError> for CommandError {
+    fn from(e: ArtifactError) -> Self {
+        match e {
+            ArtifactError::UnsupportedSchemaVersion(v) => Self::with_details(
+                "UNSUPPORTED_SCHEMA_VERSION",
+                format!(
+                    "Unsupported schema version {}. Only version 1 is supported",
+                    v
+                ),
+                serde_json::json!({ "version": v }),
+            ),
+            ArtifactError::InvalidProjectId(msg) => Self::new("INVALID_PROJECT_ID", msg),
+            ArtifactError::EmptyProjectName => {
+                Self::new("EMPTY_PROJECT_NAME", "Project name cannot be empty")
+            }
+            ArtifactError::InvalidTimestamp(msg) => Self::new("INVALID_TIMESTAMP", msg),
+            ArtifactError::InvalidArchitectureState(msg) => {
+                Self::new("INVALID_ARCHITECTURE_STATE", msg)
+            }
+            ArtifactError::PathTraversal { path, root } => Self::with_details(
+                "PATH_TRAVERSAL_DETECTED",
+                format!("Path traversal detected: {} escapes root {}", path, root),
+                serde_json::json!({ "path": path, "root": root }),
+            ),
+            ArtifactError::UnsafeReparsePoint(msg) => Self::new("UNSAFE_REPARSE_POINT", msg),
+            ArtifactError::InvalidYaml(msg) => Self::new("INVALID_YAML", msg),
+            ArtifactError::NotFound(msg) => Self::new("ARTIFACT_NOT_FOUND", msg),
+            ArtifactError::Io(msg) => Self::new("IO_ERROR", msg),
         }
     }
 }

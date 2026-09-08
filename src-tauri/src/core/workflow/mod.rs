@@ -141,6 +141,23 @@ pub enum WorkflowError {
     Database(String),
 }
 
+/// Checks if a workflow state is a post-freeze development state.
+pub fn is_post_freeze_development_state(state: WorkflowState) -> bool {
+    matches!(
+        state,
+        WorkflowState::Frozen
+            | WorkflowState::Building
+            | WorkflowState::Validating
+            | WorkflowState::WaitingForReview
+            | WorkflowState::CorrectionsRequired
+            | WorkflowState::Blocked
+            | WorkflowState::ArchitectureConcern
+            | WorkflowState::ReviewAccepted
+            | WorkflowState::FinalValidation
+            | WorkflowState::ReadyForHumanReview
+    )
+}
+
 /// Computes the next state and resume state given the current state and action.
 /// Pure deterministic function implementing the exact Coalition transition matrix.
 pub fn compute_transition(
@@ -193,19 +210,28 @@ pub fn compute_transition(
         }
 
         // Architecture Revision Path (Permitted states)
+        (st, WorkflowAction::RequestArchitectureChange) if is_post_freeze_development_state(st) => {
+            Ok((WorkflowState::ArchitectureChange, None))
+        }
+
         (
-            WorkflowState::Frozen
-            | WorkflowState::Building
-            | WorkflowState::Validating
-            | WorkflowState::WaitingForReview
-            | WorkflowState::CorrectionsRequired
-            | WorkflowState::Blocked
-            | WorkflowState::ArchitectureConcern
-            | WorkflowState::ReviewAccepted
-            | WorkflowState::FinalValidation
-            | WorkflowState::ReadyForHumanReview,
+            WorkflowState::Paused | WorkflowState::Interrupted,
             WorkflowAction::RequestArchitectureChange,
-        ) => Ok((WorkflowState::ArchitectureChange, None)),
+        ) => {
+            let prior = current_resume_state.ok_or(WorkflowError::MissingResumeState(current))?;
+            if is_post_freeze_development_state(prior) {
+                Ok((WorkflowState::ArchitectureChange, None))
+            } else {
+                Err(WorkflowError::InvalidTransition {
+                    current,
+                    action: WorkflowAction::RequestArchitectureChange,
+                    reason: format!(
+                        "Architecture change request is not permitted when paused/interrupted from preliminary state {}",
+                        prior
+                    ),
+                })
+            }
+        }
 
         (WorkflowState::ArchitectureChange, WorkflowAction::StartArchitectingRevision) => {
             Ok((WorkflowState::ArchitectingRevision, None))
@@ -850,5 +876,111 @@ mod tests {
             .unwrap();
         assert_eq!(event_type, "WORKFLOW_TRANSITION");
         assert_eq!(actor, "HUMAN");
+    }
+
+    #[test]
+    fn test_architecture_change_from_paused_and_interrupted() {
+        // Paused from Building (post-freeze) -> allows RequestArchitectureChange
+        let (mut db, pid) = setup_test_db_with_project(WorkflowState::Draft);
+        // Fast-forward to Building
+        apply_workflow_action(
+            db.connection_mut(),
+            &pid,
+            WorkflowAction::StartArchitecting,
+            "H",
+        )
+        .unwrap();
+        apply_workflow_action(
+            db.connection_mut(),
+            &pid,
+            WorkflowAction::MarkReadyToFreeze,
+            "H",
+        )
+        .unwrap();
+        apply_workflow_action(db.connection_mut(), &pid, WorkflowAction::Freeze, "H").unwrap();
+        apply_workflow_action(db.connection_mut(), &pid, WorkflowAction::StartBuild, "H").unwrap();
+
+        // Pause from Building
+        let rec =
+            apply_workflow_action(db.connection_mut(), &pid, WorkflowAction::Pause, "H").unwrap();
+        assert_eq!(rec.state, WorkflowState::Paused);
+        assert_eq!(rec.resume_state, Some(WorkflowState::Building));
+
+        // Request architecture change while paused
+        let rec = apply_workflow_action(
+            db.connection_mut(),
+            &pid,
+            WorkflowAction::RequestArchitectureChange,
+            "H",
+        )
+        .unwrap();
+        assert_eq!(rec.state, WorkflowState::ArchitectureChange);
+        assert_eq!(rec.resume_state, None);
+
+        // Reset and test Paused from Architecting (pre-freeze) -> rejected
+        let (mut db2, pid2) = setup_test_db_with_project(WorkflowState::Draft);
+        apply_workflow_action(
+            db2.connection_mut(),
+            &pid2,
+            WorkflowAction::StartArchitecting,
+            "H",
+        )
+        .unwrap();
+        let rec =
+            apply_workflow_action(db2.connection_mut(), &pid2, WorkflowAction::Pause, "H").unwrap();
+        assert_eq!(rec.state, WorkflowState::Paused);
+        assert_eq!(rec.resume_state, Some(WorkflowState::Architecting));
+
+        let err = apply_workflow_action(
+            db2.connection_mut(),
+            &pid2,
+            WorkflowAction::RequestArchitectureChange,
+            "H",
+        )
+        .unwrap_err();
+        assert!(matches!(err, WorkflowError::InvalidTransition { .. }));
+
+        // Test Interrupted from Validating (post-freeze) -> allows RequestArchitectureChange
+        let (mut db3, pid3) = setup_test_db_with_project(WorkflowState::Draft);
+        apply_workflow_action(
+            db3.connection_mut(),
+            &pid3,
+            WorkflowAction::StartArchitecting,
+            "H",
+        )
+        .unwrap();
+        apply_workflow_action(
+            db3.connection_mut(),
+            &pid3,
+            WorkflowAction::MarkReadyToFreeze,
+            "H",
+        )
+        .unwrap();
+        apply_workflow_action(db3.connection_mut(), &pid3, WorkflowAction::Freeze, "H").unwrap();
+        apply_workflow_action(db3.connection_mut(), &pid3, WorkflowAction::StartBuild, "H")
+            .unwrap();
+        apply_workflow_action(
+            db3.connection_mut(),
+            &pid3,
+            WorkflowAction::StartValidation,
+            "H",
+        )
+        .unwrap();
+
+        let rec =
+            apply_workflow_action(db3.connection_mut(), &pid3, WorkflowAction::Interrupt, "H")
+                .unwrap();
+        assert_eq!(rec.state, WorkflowState::Interrupted);
+        assert_eq!(rec.resume_state, Some(WorkflowState::Validating));
+
+        let rec = apply_workflow_action(
+            db3.connection_mut(),
+            &pid3,
+            WorkflowAction::RequestArchitectureChange,
+            "H",
+        )
+        .unwrap();
+        assert_eq!(rec.state, WorkflowState::ArchitectureChange);
+        assert_eq!(rec.resume_state, None);
     }
 }

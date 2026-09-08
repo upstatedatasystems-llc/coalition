@@ -83,7 +83,7 @@ export interface WorkflowStateRecord {
 export interface ProjectDetails {
   project: ProjectRecord;
   workflow_state: WorkflowStateRecord;
-  artifact: ProjectYaml;
+  artifact?: ProjectYaml | null;
   git?: GitRepoInfo | null;
   is_available: boolean;
 }

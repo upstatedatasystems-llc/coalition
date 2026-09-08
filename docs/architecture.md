@@ -57,16 +57,27 @@ Authored and enforced authoritatively in Rust across 19 explicit states:
 - Correction loop:
   `WAITING_FOR_REVIEW → CORRECTIONS_REQUIRED → BUILDING`
 - Architecture revision loop:
-  Permitted from post-freeze states (`FROZEN`, `BUILDING`, `VALIDATING`, `WAITING_FOR_REVIEW`, `CORRECTIONS_REQUIRED`, `BLOCKED`, `ARCHITECTURE_CONCERN`, `REVIEW_ACCEPTED`, `FINAL_VALIDATION`, `READY_FOR_HUMAN_REVIEW`) via `RequestArchitectureChange → ARCHITECTURE_CHANGE → ARCHITECTING_REVISION → READY_TO_REFREEZE → FROZEN`.
+  Permitted from post-freeze states (`FROZEN`, `BUILDING`, `VALIDATING`, `WAITING_FOR_REVIEW`, `CORRECTIONS_REQUIRED`, `BLOCKED`, `ARCHITECTURE_CONCERN`, `REVIEW_ACCEPTED`, `FINAL_VALIDATION`, `READY_FOR_HUMAN_REVIEW`) as well as `PAUSED` and `INTERRUPTED` states when their recorded `resume_state` is a post-freeze development state, via `RequestArchitectureChange → ARCHITECTURE_CHANGE → ARCHITECTING_REVISION → READY_TO_REFREEZE → FROZEN`. Requesting architecture change from paused/interrupted clears the prior resume state.
 - Operational suspension & recovery:
   `Pause` / `Resume` (preserving `resume_state`), `Interrupt` / `Resume`, `Block` / `Unblock`, and `RaiseArchitectureConcern` / `ResolveArchitectureConcern`.
 - Invariants:
   - React cannot mutate workflow state arbitrarily.
   - Every valid transition atomically increments the workflow revision and writes a `WORKFLOW_TRANSITION` activity event.
   - Human acceptance is valid only from `READY_FOR_HUMAN_REVIEW` and is strictly terminal.
+  - Corrupted or unrecognized workflow states in SQLite are treated as errors (`CORRUPTED_STATE`) rather than silently converted to `None`.
 
 ## 6. Project Rehydration & Persistence
 
 - **Project Registration**: Canonicalizes Git repository root, creates or loads `.coalition/project.yaml`, registers or updates the operational record in SQLite, ensures workflow state exists, and records `PROJECT_REGISTERED`, `PROJECT_OPENED`, or `PROJECT_REHYDRATED`.
-- **SQLite Loss Recovery**: If SQLite is deleted, reopening a governed repository reconstructs operational records from the durable `.coalition/project.yaml` metadata, maintaining durable project identity and restoring workflow state according to durable architecture state.
-- **Unavailable Repository Handling**: If a registered repository directory is moved or deleted, SQLite retains the registration, marks it `is_available: false`, and surfaces this clearly in the UI without silent data loss.
+- **Transactional Operational Writes**: Operational state creation/updates across `projects`, `workflow_state`, `activity_events`, and `app_settings` run inside an explicit SQLite transaction. Any error rolls back all operational changes, preventing orphaned partial records.
+- **Identity Conflict & Move Reconciliation**: Deterministically handles collisions between durable `project_id`, canonical filesystem path, and existing SQLite rows:
+  - If a project folder was moved/renamed and the old path no longer exists on disk, Coalition updates the registered repository path.
+  - If distinct projects collide on ID or path, Coalition rejects registration with a typed `PROJECT_IDENTITY_CONFLICT` error.
+- **SQLite Loss Recovery**: If SQLite is deleted, reopening a governed repository reconstructs operational records from the durable `.coalition/project.yaml` metadata, maintaining durable project identity and restoring workflow state according to durable architecture state (`Frozen` or `Draft`).
+- **Unavailable Repository Handling**: If a registered repository directory is moved or deleted, SQLite retains the registration, marks it `is_available: false`, and sets `artifact: None`. Coalition never assumes or fabricates a synthetic "Draft" contract for inaccessible repositories.
+- **Selective Startup Restoration**: Startup check inspects repository availability before auto-selecting the last-opened project. If the repository is offline, the UI remains on the project list with the repository marked unavailable and no modal error dialog.
+
+## 7. Safe Contract Replacement & Filesystem Integrity
+
+- **Windows-Safe Atomic Replacement**: Modifying `project.yaml` validates invariants in memory, writes and syncs to a temporary file (`project.yaml.tmp.<uuid>`), stages the existing file as `.bak`, renames the temporary file into place, and cleans up or rolls back on failure. The valid contract file is never deleted prior to committing the replacement.
+- **Hierarchy & Layout Validation**: All standard `.coalition/` subdirectories (`design`, `implementation`, `decisions`, `architecture-versions`, `changes`, `reviews`, `evidence`) and `project.yaml` are validated against path traversal (`..`) and Windows junction / symlink reparse points escaping the repository root.

@@ -52,17 +52,40 @@ architecture_state: draft
 created_at: "2026-09-08T12:00:00Z"
 ```
 
-- `schema_version`: Explicit unsigned integer (1). Deserialization strictly rejects versions > 1.
-- `project_id`: Stable UUID v4 identifier generated on initial registration. Survives local SQLite deletion.
-- `name`: Human-readable project name, defaults to repository folder name.
-- `current_architecture_version`: Immutable version string (e.g. `"1.0"`) once frozen, or `null` while in draft.
+- `schema_version`: Explicit unsigned integer (1). Deserialization and validation strictly reject versions != 1.
+- `project_id`: Stable UUID v4 identifier generated on initial registration. Deserialization validates proper UUID syntax. Survives local SQLite deletion.
+- `name`: Human-readable project name. Cannot be empty or whitespace-only.
+- `current_architecture_version`: Immutable version string (e.g. `"1.0"`) once frozen, or `null` while in draft. Schema rules strictly mandate:
+  - If `architecture_state` is `draft`, `current_architecture_version` must be `None` / `null`.
+  - If `architecture_state` is `frozen`, `current_architecture_version` must be `Some(v)` with a non-empty trimmed version string.
 - `architecture_state`: Typed domain state (`draft` | `frozen`).
-- `created_at`: ISO-8601 UTC RFC3339 timestamp.
+- `created_at`: ISO-8601 UTC RFC3339 timestamp validated via `chrono::DateTime::parse_from_rfc3339`.
 
-### Filesystem Safety & Atomic Writes
+### Hierarchy & Layout Validation
 
-All `.coalition/` operations obey strict filesystem safety constraints:
-1. **Repository Root Canonicalization**: Every governed path is resolved through Git (`git rev-parse --show-toplevel`) and canonicalized.
-2. **Path Traversal Escape Prevention**: Any path resolving or escaping outside the canonical root via `..` is rejected.
-3. **Symlink and Reparse Point Safety**: Windows directory junctions, symlinks, or reparse points that redirect `.coalition` writes outside the repository root are strictly rejected with typed `ArtifactError::UnsafeReparsePoint`.
-4. **Atomic Updates**: Metadata writes use a temporary-file write, flush, and atomic replace sequence (`project.yaml.tmp.<uuid> -> project.yaml`) suitable for Windows and cross-platform filesystems to prevent partial corruption.
+All standard `.coalition/` subdirectories (`design`, `implementation`, `decisions`, `architecture-versions`, `changes`, `reviews`, `evidence`) and `project.yaml` are validated via `ArtifactManager::validate_coalition_layout`:
+- Ensures each subdirectory exists or is created safely.
+- Resolves each path and verifies it remains strictly inside the canonical repository root.
+- Rejects path traversal escapes (`..`) with `ArtifactError::PathTraversal`.
+- Rejects Windows directory junctions, symlinks, or reparse points that point outside the repository with `ArtifactError::UnsafeReparsePoint`.
+
+### Windows-Safe Atomic Replacement Algorithm
+
+Updating `project.yaml` via `ArtifactManager::write_project_yaml_atomic` guarantees durable contract preservation even across crashes or filesystem errors:
+1. Validates the `ProjectYaml` descriptor in memory against all schema v1 invariants before touching the disk.
+2. Writes the serialized YAML to a unique temporary file (`project.yaml.tmp.<uuid>`) in the `.coalition/` folder.
+3. Flushes and syncs the file descriptor (`sync_all()`) to ensure physical disk commitment.
+4. If a target `project.yaml` already exists:
+   - Renames `project.yaml` to `project.yaml.bak.<uuid>`.
+   - Renames `project.yaml.tmp.<uuid>` to `project.yaml`.
+   - If renaming the replacement into place fails, immediately restores the original file from `.bak`.
+   - Cleans up `.bak` upon confirmed replacement.
+5. If no target file existed initially, renames the temp file directly into place.
+6. The valid original file is never deleted prior to committing the replacement.
+
+### Unavailable Repository Contract Semantics
+
+When a project's repository is moved or unavailable on disk:
+- Coalition returns `artifact: None` in `ProjectDetails`.
+- The system never fabricates a synthetic or assumed "Draft" contract.
+- The UI visibly alerts the user that durable architecture state exists only in `.coalition/project.yaml` and is currently offline.

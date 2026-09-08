@@ -1,4 +1,4 @@
-use crate::core::activity::ActivityManager;
+use crate::core::activity::{ActivityError, ActivityManager};
 use crate::core::artifacts::{ArchitectureState, ArtifactError, ArtifactManager, ProjectYaml};
 use crate::core::git::{GitAdapter, GitError, GitRepoInfo};
 use crate::core::workflow::{self, WorkflowError, WorkflowState, WorkflowStateRecord};
@@ -33,7 +33,7 @@ pub struct ProjectSummary {
 pub struct ProjectDetails {
     pub project: ProjectRecord,
     pub workflow_state: WorkflowStateRecord,
-    pub artifact: ProjectYaml,
+    pub artifact: Option<ProjectYaml>,
     pub git: Option<GitRepoInfo>,
     pub is_available: bool,
 }
@@ -52,6 +52,10 @@ pub enum ProjectError {
     NotFound(String),
     #[error("Project repository is unavailable at {0}")]
     RepositoryUnavailable(String),
+    #[error("Project identity conflict: {0}")]
+    IdentityConflict(String),
+    #[error("Authoritative state corruption: {0}")]
+    CorruptedState(String),
     #[error("Database error: {0}")]
     Database(String),
 }
@@ -65,6 +69,12 @@ impl From<ArtifactError> for ProjectError {
 impl From<WorkflowError> for ProjectError {
     fn from(e: WorkflowError) -> Self {
         Self::Workflow(e.to_string())
+    }
+}
+
+impl From<ActivityError> for ProjectError {
+    fn from(e: ActivityError) -> Self {
+        Self::Database(e.to_string())
     }
 }
 
@@ -108,13 +118,13 @@ impl ProjectService {
 
         let now = chrono::Utc::now().to_rfc3339();
 
-        // 2. Check existing operational SQLite state by project_id or canonical path
-        let existing_project: Option<ProjectRecord> = conn
+        // 2. Identity conflict and move reconciliation against existing SQLite state
+        let record_by_id: Option<ProjectRecord> = conn
             .query_row(
                 "SELECT project_id, name, repository_path, created_at, updated_at, last_opened_at
                  FROM projects
-                 WHERE project_id = ?1 OR repository_path = ?2",
-                params![project_yaml.project_id, canonical_path_str],
+                 WHERE project_id = ?1",
+                params![project_yaml.project_id],
                 |r| {
                     Ok(ProjectRecord {
                         project_id: r.get(0)?,
@@ -128,31 +138,98 @@ impl ProjectService {
             )
             .optional()?;
 
-        let (project_record, was_rehydrated) = match existing_project {
-            Some(mut p) => {
-                // Update last_opened_at and ensure canonical path and name match durable artifact
-                p.last_opened_at = now.clone();
-                p.updated_at = now.clone();
-                p.name = project_yaml.name.clone();
-                p.repository_path = canonical_path_str.clone();
+        let record_by_path: Option<ProjectRecord> = conn
+            .query_row(
+                "SELECT project_id, name, repository_path, created_at, updated_at, last_opened_at
+                 FROM projects
+                 WHERE repository_path = ?1",
+                params![canonical_path_str],
+                |r| {
+                    Ok(ProjectRecord {
+                        project_id: r.get(0)?,
+                        name: r.get(1)?,
+                        repository_path: r.get(2)?,
+                        created_at: r.get(3)?,
+                        updated_at: r.get(4)?,
+                        last_opened_at: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
 
-                conn.execute(
+        // Perform operational state persistence in an explicit SQLite transaction
+        let tx = conn.transaction()?;
+
+        let (project_record, was_rehydrated) = match (record_by_id, record_by_path) {
+            (Some(mut by_id), Some(by_path)) => {
+                if by_id.project_id != by_path.project_id {
+                    return Err(ProjectError::IdentityConflict(format!(
+                        "Path '{}' is registered to project '{}', but durable contract has project_id '{}' which is registered at '{}'",
+                        canonical_path_str, by_path.project_id, project_yaml.project_id, by_id.repository_path
+                    )));
+                }
+                // Same project reopening at same path
+                by_id.last_opened_at = now.clone();
+                by_id.updated_at = now.clone();
+                by_id.name = project_yaml.name.clone();
+                by_id.repository_path = canonical_path_str.clone();
+
+                tx.execute(
                     "UPDATE projects
                      SET last_opened_at = ?1, updated_at = ?2, name = ?3, repository_path = ?4
                      WHERE project_id = ?5",
                     params![
-                        p.last_opened_at,
-                        p.updated_at,
-                        p.name,
-                        p.repository_path,
-                        p.project_id
+                        by_id.last_opened_at,
+                        by_id.updated_at,
+                        by_id.name,
+                        by_id.repository_path,
+                        by_id.project_id
                     ],
                 )?;
 
-                (p, false)
+                (by_id, false)
             }
-            None => {
-                // Insert new operational record
+            (None, Some(by_path)) => {
+                // The path is already registered under a different project ID
+                return Err(ProjectError::IdentityConflict(format!(
+                    "Repository path '{}' is already registered with project_id '{}', but durable contract specifies project_id '{}'",
+                    canonical_path_str, by_path.project_id, project_yaml.project_id
+                )));
+            }
+            (Some(mut by_id), None) => {
+                // The project ID was registered at an older path
+                let old_path = PathBuf::from(&by_id.repository_path);
+                if old_path.exists() {
+                    // Old directory still exists: reject collision/duplicate checkout
+                    return Err(ProjectError::IdentityConflict(format!(
+                        "Project ID '{}' is already registered at active path '{}'. Cannot register duplicate checkout at '{}'",
+                        project_yaml.project_id, by_id.repository_path, canonical_path_str
+                    )));
+                } else {
+                    // Old directory was moved or renamed; update registered path
+                    by_id.last_opened_at = now.clone();
+                    by_id.updated_at = now.clone();
+                    by_id.name = project_yaml.name.clone();
+                    by_id.repository_path = canonical_path_str.clone();
+
+                    tx.execute(
+                        "UPDATE projects
+                         SET last_opened_at = ?1, updated_at = ?2, name = ?3, repository_path = ?4
+                         WHERE project_id = ?5",
+                        params![
+                            by_id.last_opened_at,
+                            by_id.updated_at,
+                            by_id.name,
+                            by_id.repository_path,
+                            by_id.project_id
+                        ],
+                    )?;
+
+                    (by_id, false)
+                }
+            }
+            (None, None) => {
+                // New registration or rehydration into empty DB
                 let record = ProjectRecord {
                     project_id: project_yaml.project_id.clone(),
                     name: project_yaml.name.clone(),
@@ -162,7 +239,7 @@ impl ProjectService {
                     last_opened_at: now.clone(),
                 };
 
-                conn.execute(
+                tx.execute(
                     "INSERT INTO projects (project_id, name, repository_path, created_at, updated_at, last_opened_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
@@ -175,14 +252,13 @@ impl ProjectService {
                     ],
                 )?;
 
-                // Rehydration occurs if the durable artifact already existed but SQLite had no row
                 let is_rehydration = !created_new_artifact;
                 (record, is_rehydration)
             }
         };
 
         // 3. Ensure workflow_state exists
-        let wf_state_exists: bool = conn
+        let wf_state_exists: bool = tx
             .query_row(
                 "SELECT COUNT(*) FROM workflow_state WHERE project_id = ?1",
                 params![project_record.project_id],
@@ -192,15 +268,14 @@ impl ProjectService {
             .unwrap_or(false);
 
         let workflow_record = if wf_state_exists {
-            workflow::get_workflow_state(conn, &project_record.project_id)?
+            workflow::get_workflow_state(&tx, &project_record.project_id)?
         } else {
-            // Determine initial workflow state according to durable metadata
             let initial_state = match project_yaml.architecture_state {
                 ArchitectureState::Frozen => WorkflowState::Frozen,
                 ArchitectureState::Draft => WorkflowState::Draft,
             };
 
-            conn.execute(
+            tx.execute(
                 "INSERT INTO workflow_state (project_id, state, resume_state, revision, updated_at)
                  VALUES (?1, ?2, NULL, 1, ?3)",
                 params![project_record.project_id, initial_state.to_string(), now],
@@ -239,8 +314,8 @@ impl ProjectService {
             )
         };
 
-        let _ = ActivityManager::record_event(
-            conn,
+        ActivityManager::record_event(
+            &tx,
             &project_record.project_id,
             event_type,
             "HUMAN",
@@ -249,10 +324,13 @@ impl ProjectService {
                 "repository_path": project_record.repository_path,
                 "workflow_state": workflow_record.state.to_string(),
             })),
-        );
+        )?;
 
         // 5. Update last opened project in app_settings
-        let _ = Self::set_app_setting(conn, "last_opened_project_id", &project_record.project_id);
+        Self::set_app_setting(&tx, "last_opened_project_id", &project_record.project_id)?;
+
+        // Commit transaction
+        tx.commit()?;
 
         // 6. Query live Git state
         let git_info = git.inspect_repo(&repo_root).ok();
@@ -260,7 +338,7 @@ impl ProjectService {
         Ok(ProjectDetails {
             project: project_record,
             workflow_state: workflow_record,
-            artifact: project_yaml,
+            artifact: Some(project_yaml),
             git: git_info,
             is_available: true,
         })
@@ -296,7 +374,18 @@ impl ProjectService {
             let path = PathBuf::from(&path_str);
             let is_available = path.exists() && path.is_dir();
 
-            let wf_state: Option<WorkflowState> = state_str.and_then(|s| s.parse().ok());
+            let wf_state = match state_str {
+                Some(s) => match s.parse::<WorkflowState>() {
+                    Ok(st) => Some(st),
+                    Err(e) => {
+                        return Err(ProjectError::CorruptedState(format!(
+                            "Corrupted workflow state '{}' for project {}: {}",
+                            s, pid, e
+                        )));
+                    }
+                },
+                None => None,
+            };
 
             let (branch, is_clean) = if is_available {
                 if let Some(g) = git {
@@ -362,18 +451,9 @@ impl ProjectService {
             let project_yaml_path = repo_path.join(".coalition").join("project.yaml");
             let art = ArtifactManager::read_project_yaml(&project_yaml_path)?;
             let g_info = git.and_then(|g| g.inspect_repo(&repo_path).ok());
-            (art, g_info)
+            (Some(art), g_info)
         } else {
-            // Unavailable project: construct dummy or cached metadata
-            let fallback_artifact = ProjectYaml {
-                schema_version: 1,
-                project_id: project.project_id.clone(),
-                name: project.name.clone(),
-                current_architecture_version: None,
-                architecture_state: ArchitectureState::Draft,
-                created_at: project.created_at.clone(),
-            };
-            (fallback_artifact, None)
+            (None, None)
         };
 
         Ok(ProjectDetails {
@@ -458,7 +538,7 @@ mod tests {
                 .unwrap();
         assert_eq!(details.workflow_state.state, WorkflowState::Draft);
         assert!(details.is_available);
-        assert_eq!(details.artifact.schema_version, 1);
+        assert_eq!(details.artifact.as_ref().unwrap().schema_version, 1);
         assert!(!details.project.project_id.is_empty());
 
         let coalition_dir = repo_dir.path().join(".coalition");
@@ -543,10 +623,11 @@ mod tests {
         let repo_dir = tempdir().unwrap();
         init_test_git_repo(repo_dir.path());
 
-        // Create .coalition with architecture_state: frozen
+        // Create .coalition with architecture_state: frozen and non-empty version
         let (mut proj_yaml, _) =
             ArtifactManager::initialize_or_load_project(repo_dir.path(), "frozen-proj").unwrap();
         proj_yaml.architecture_state = ArchitectureState::Frozen;
+        proj_yaml.current_architecture_version = Some("1.0".to_string());
         ArtifactManager::write_project_yaml_atomic(
             repo_dir.path().join(".coalition").join("project.yaml"),
             &proj_yaml,
@@ -599,6 +680,10 @@ mod tests {
         let fetched =
             ProjectService::get_project_details(db.connection(), Some(&git), &pid).unwrap();
         assert!(!fetched.is_available);
+        assert!(
+            fetched.artifact.is_none(),
+            "Unavailable project must have artifact: None (never fabricated Draft)"
+        );
     }
 
     #[test]
@@ -611,5 +696,171 @@ mod tests {
         let res =
             ProjectService::register_or_open_project(db.connection_mut(), &git, normal_dir.path());
         assert!(matches!(res, Err(ProjectError::NotAGitRepository(_))));
+    }
+
+    #[test]
+    fn test_identity_conflict_detection() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let dir1 = tempdir().unwrap();
+        init_test_git_repo(dir1.path());
+
+        let dir2 = tempdir().unwrap();
+        init_test_git_repo(dir2.path());
+
+        // 1. Register dir1
+        let d1 = ProjectService::register_or_open_project(db.connection_mut(), &git, dir1.path())
+            .unwrap();
+
+        // 2. Conflict: dir2 has the SAME project_id as dir1 while dir1 is still active
+        fs::create_dir_all(dir2.path().join(".coalition")).unwrap();
+        let mut d2_yaml = d1.artifact.unwrap();
+        d2_yaml.name = "cloned-dir".to_string();
+        ArtifactManager::write_project_yaml_atomic(
+            dir2.path().join(".coalition").join("project.yaml"),
+            &d2_yaml,
+        )
+        .unwrap();
+
+        let err = ProjectService::register_or_open_project(db.connection_mut(), &git, dir2.path())
+            .unwrap_err();
+        assert!(
+            matches!(err, ProjectError::IdentityConflict(_)),
+            "Expected IdentityConflict when same project_id registered at distinct active path, got {:?}",
+            err
+        );
+
+        // 3. Conflict: same path registered with a different project ID
+        let new_uuid = uuid::Uuid::new_v4().to_string();
+        let mut conflicting_yaml = d2_yaml;
+        conflicting_yaml.project_id = new_uuid;
+        ArtifactManager::write_project_yaml_atomic(
+            dir1.path().join(".coalition").join("project.yaml"),
+            &conflicting_yaml,
+        )
+        .unwrap();
+
+        let err2 = ProjectService::register_or_open_project(db.connection_mut(), &git, dir1.path())
+            .unwrap_err();
+        assert!(
+            matches!(err2, ProjectError::IdentityConflict(_)),
+            "Expected IdentityConflict when path already registered under different project_id, got {:?}",
+            err2
+        );
+    }
+
+    #[test]
+    fn test_moved_project_path_update() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let base_dir = tempdir().unwrap();
+        let old_path = base_dir.path().join("old_loc");
+        fs::create_dir_all(&old_path).unwrap();
+        init_test_git_repo(&old_path);
+
+        let d1 =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, &old_path).unwrap();
+        let pid = d1.project.project_id;
+
+        // Move folder from old_path to new_path (old_path ceases to exist)
+        let new_path = base_dir.path().join("new_loc");
+        fs::rename(&old_path, &new_path).unwrap();
+        assert!(!old_path.exists());
+        assert!(new_path.exists());
+
+        // Open project from new_path
+        let reopened =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, &new_path).unwrap();
+        assert_eq!(reopened.project.project_id, pid);
+
+        // Verify SQLite record was updated to new_path
+        let canonical_new = git.resolve_repo_root(&new_path).unwrap();
+        let rec = ProjectService::get_project_details(db.connection(), Some(&git), &pid).unwrap();
+        assert_eq!(rec.project.repository_path, canonical_new.to_string_lossy());
+    }
+
+    #[test]
+    fn test_registration_operational_transaction_rollback() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let repo_dir = tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        // Install a trigger that aborts on activity_events insert
+        db.connection()
+            .execute(
+                "CREATE TRIGGER abort_activity BEFORE INSERT ON activity_events
+                 BEGIN
+                     SELECT RAISE(ABORT, 'Simulated failure during activity recording');
+                 END;",
+                [],
+            )
+            .unwrap();
+
+        // Registration should fail because activity logging fails
+        let res =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path());
+        assert!(res.is_err(), "Registration must fail on transaction error");
+
+        // Assert that projects table has 0 rows (transaction was rolled back)
+        let project_count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            project_count, 0,
+            "Projects table must have 0 rows after rollback"
+        );
+
+        // Assert workflow_state has 0 rows
+        let wf_count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM workflow_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            wf_count, 0,
+            "workflow_state table must have 0 rows after rollback"
+        );
+
+        // Assert app_settings has no last_opened_project_id
+        let last_opened =
+            ProjectService::get_app_setting(db.connection(), "last_opened_project_id").unwrap();
+        assert_eq!(last_opened, None, "App settings must not have been updated");
+    }
+
+    #[test]
+    fn test_list_projects_corrupted_workflow_state() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let repo_dir = tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        let details =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap();
+        let pid = details.project.project_id;
+
+        // Manually corrupt workflow_state
+        db.connection()
+            .execute(
+                "UPDATE workflow_state SET state = 'CORRUPTED_GARBAGE' WHERE project_id = ?1",
+                params![pid],
+            )
+            .unwrap();
+
+        let res = ProjectService::list_projects(db.connection(), Some(&git));
+        assert!(
+            matches!(res, Err(ProjectError::CorruptedState(_))),
+            "Corrupted workflow state must return Err(ProjectError::CorruptedState), got {:?}",
+            res
+        );
     }
 }

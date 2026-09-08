@@ -16,16 +16,18 @@ Coalition ensures that AI coding work remains strictly accountable to an explici
 This repository is currently at **Phase 1 — Coalition Core and Project Persistence**.
 
 Phase 1 establishes:
-- Local project registration and re-opening with Git root canonicalization.
-- Durable `.coalition/` project contract hierarchy and portable `project.yaml` metadata (schema v1, stable UUID v4, typed architecture state).
-- Operational SQLite database persistence with forward migrations for projects, workflow state, activity events, and app settings.
-- Authoritative Rust workflow state machine enforcing all 19 V1 states, explicit transition validation, pause/resume state tracking, and atomic revision increments.
+- Local project registration and re-opening with Git root canonicalization and explicit identity conflict/move reconciliation.
+- Durable `.coalition/` project contract hierarchy (`design/`, `implementation/`, `decisions/`, `architecture-versions/`, `changes/`, `reviews/`, `evidence/`) with full layout validation preventing path escape and reparse point traversal.
+- Portable, schema-v1 `project.yaml` metadata (stable UUID v4, RFC3339 timestamps, non-empty names, version constraints) with Windows-safe atomic replacement semantics.
+- Transactional operational SQLite persistence with forward migrations for projects, workflow state, activity events, and app settings with automatic rollback on failure.
+- Authoritative Rust workflow state machine enforcing all 19 V1 states, explicit transition validation, pause/resume state tracking, post-freeze architecture change requests from paused/interrupted states, and atomic revision increments.
 - SQLite-loss recovery and rehydration reconstructing operational state from durable `.coalition/project.yaml`.
+- Non-fabricated durable contract representation (`Option<ProjectYaml>`) that accurately presents unavailable repositories without assuming or fabricating Draft state.
+- Selective startup restoration keeping the UI on the project list when the last-opened repository is offline.
 - Git repository inspection surfacing branch, HEAD commit, clean vs. dirty status (staged, unstaged, untracked counts), and diff stats, handling empty repositories and detached HEAD gracefully.
 - Structured Tauri IPC error boundary (`CommandError`) with typed error codes and safe context.
 - Modular React frontend featuring the primary project dashboard (empty state, project cards, detail view, refresh, activity timeline, open repository modal) and dedicated diagnostics.
-- Unavailable repository detection preserving registrations when folders are moved or deleted.
-- Automatic restoration of last-opened project on startup.
+- Dedicated 10-step desktop lifecycle smoke test verifying registration, validation, git status, transitions, restart, offline state, rehydration, and safe replacement.
 - Full preservation of Phase 0 technical proofs and fake-`agy` test harness.
 
 ## Technology Stack

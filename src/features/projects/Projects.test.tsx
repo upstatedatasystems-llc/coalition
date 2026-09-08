@@ -251,4 +251,77 @@ describe('Phase 1 Project Dashboard Frontend', () => {
 
     expect(projTab).toHaveClass('active');
   });
+
+  it('does not auto-restore an unavailable last-opened repository on startup', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'list_projects') return sampleProjects;
+      // Last opened is p-2, which is unavailable (is_available: false)
+      if (cmd === 'get_last_opened_project_id') return 'p-2';
+      return {};
+    });
+
+    await act(async () => {
+      render(<App />);
+    });
+
+    // Should remain on the project list (not in detail view)
+    expect(screen.getByText('Sample Alpha')).toBeInTheDocument();
+    expect(screen.getByText('Missing Beta')).toBeInTheDocument();
+    // Unavailable project is marked unavailable
+    expect(screen.getByText('Repository Missing or Moved')).toBeInTheDocument();
+    // Detail contract header should NOT be present
+    expect(screen.queryByText('Durable Architecture Contract')).not.toBeInTheDocument();
+    // No error dialog or banner
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('displays unavailable contract banner when repository is offline without fabricating draft', async () => {
+    const unavailableDetails: ProjectDetails = {
+      project: {
+        project_id: 'p-2',
+        name: 'Missing Beta',
+        repository_path: '/repos/missing-beta',
+        created_at: '2026-09-07T10:00:00Z',
+        updated_at: '2026-09-07T10:00:00Z',
+        last_opened_at: '2026-09-07T10:00:00Z',
+      },
+      workflow_state: {
+        project_id: 'p-2',
+        state: 'FROZEN',
+        resume_state: null,
+        revision: 2,
+        updated_at: '2026-09-07T10:00:00Z',
+      },
+      artifact: null, // Contract unavailable on disk
+      git: null,
+      is_available: false,
+    };
+
+    mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === 'list_projects') return sampleProjects;
+      if (cmd === 'get_last_opened_project_id') return null;
+      if (cmd === 'get_project_details' && args?.projectId === 'p-2') return unavailableDetails;
+      if (cmd === 'get_project_activity') return [];
+      return {};
+    });
+
+    await act(async () => {
+      render(<App />);
+    });
+
+    // Click on Missing Beta
+    const missingCard = screen.getByText('Missing Beta');
+    await act(async () => {
+      fireEvent.click(missingCard);
+    });
+
+    // Repository unavailable banner
+    expect(screen.getByRole('alert')).toHaveTextContent('Repository Unavailable:');
+    // Durable contract unavailable message
+    expect(screen.getByRole('status')).toHaveTextContent('Durable contract unavailable:');
+    // Refresh button should be disabled
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeDisabled();
+    // Must NOT fabricate or display "draft" in the architecture contract
+    expect(screen.queryByText('DRAFT')).not.toBeInTheDocument();
+  });
 });

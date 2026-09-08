@@ -57,22 +57,44 @@ coalition/
 
 ## Running Verification Locally
 
+All code contributions must pass the complete verification suite with zero errors or warnings:
+
 ```powershell
-# Typecheck
+# 1. TypeScript typecheck
 npm run typecheck
 
-# Frontend tests
+# 2. Frontend Vitest suite (headless, non-interactive)
 npm test -- --run
 
-# Frontend build
+# 3. Frontend production build
 npm run build
 
-# Rust formatting
+# 4. Rust formatting check
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 
-# Rust Clippy
+# 5. Rust Clippy with strict warnings
 cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 
-# Rust unit tests
+# 6. Rust unit & integration test suite
 cargo test --manifest-path src-tauri/Cargo.toml
+
+# 7. Rust compilation check
+cargo build --manifest-path src-tauri/Cargo.toml
+
+# 8. Dedicated Phase 1 End-to-End Desktop Lifecycle Smoke Test
+cargo test --manifest-path src-tauri/Cargo.toml --test phase1_smoke_test
 ```
+
+### Smoke Test Verification Criteria
+
+`tests/phase1_smoke_test.rs` validates the complete desktop lifecycle across 10 deterministic steps:
+1. Starts from a clean fixture git repository.
+2. Registers the repository in Coalition.
+3. Verifies `.coalition/` layout validation passes and `project.yaml` is created.
+4. Inspects live Git status (clean repo fixture).
+5. Modifies a file in the repository and verifies live Git status updates to dirty without polling loops.
+6. Initiates transition `DRAFT -> ARCHITECTING` and verifies operational state, activity event, and SQLite persistence.
+7. Closes and reopens the application (simulating app restart against SQLite store), verifying project list recovery, last-opened tracking, and live Git state.
+8. Simulates repository path unavailable on disk, verifying project list marks it unavailable without deletion, and detail view does not report a fake Draft contract.
+9. Deletes the SQLite database file entirely, restarts, and reopens the repository path, verifying operational state successfully rehydrates from `.coalition/project.yaml` with an activity log entry `PROJECT_REHYDRATED`.
+10. Tests safe `project.yaml` replacement by updating `project.yaml` to frozen architecture state with a version and verifying both validation and rehydration preserve frozen state.

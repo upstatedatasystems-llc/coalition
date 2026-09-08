@@ -38,10 +38,13 @@ export const App: React.FC = () => {
       const list = await invoke<ProjectSummary[]>('list_projects');
       setProjects(Array.isArray(list) ? list : []);
 
-      // Attempt to restore last-opened project
+      // Attempt to restore last-opened project only if it is currently available on disk
       const lastOpenedId = await invoke<string | null>('get_last_opened_project_id');
-      if (lastOpenedId && Array.isArray(list) && list.some((p) => p.project_id === lastOpenedId)) {
-        await selectProject(lastOpenedId);
+      if (lastOpenedId && Array.isArray(list)) {
+        const found = list.find((p) => p.project_id === lastOpenedId);
+        if (found && found.is_available) {
+          await selectProject(lastOpenedId);
+        }
       }
     } catch (err: unknown) {
       handleError(err);

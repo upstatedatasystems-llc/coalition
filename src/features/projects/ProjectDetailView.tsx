@@ -57,36 +57,46 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
       <div className="detail-sections-grid">
         <section className="detail-card">
           <h3>Durable Architecture Contract</h3>
-          <div className="info-grid">
-            <div>
-              <span className="label">Project ID:</span>
-              <code>{project.project_id}</code>
-            </div>
-            <div>
-              <span className="label">Schema Version:</span>
-              <span>v{artifact.schema_version}</span>
-            </div>
-            <div>
-              <span className="label">Architecture State:</span>
-              <span className={`arch-state-badge arch-${artifact.architecture_state}`}>
-                {artifact.architecture_state.toUpperCase()}
-              </span>
-            </div>
-            <div>
-              <span className="label">Architecture Version:</span>
-              <span>{artifact.current_architecture_version || 'None (Draft)'}</span>
-            </div>
-            <div>
-              <span className="label">Workflow Revision:</span>
-              <span>#{workflow_state.revision}</span>
-            </div>
-            {workflow_state.resume_state && (
+          {artifact ? (
+            <div className="info-grid">
               <div>
-                <span className="label">Resume State:</span>
-                <span>{workflow_state.resume_state}</span>
+                <span className="label">Project ID:</span>
+                <code>{project.project_id}</code>
               </div>
-            )}
-          </div>
+              <div>
+                <span className="label">Schema Version:</span>
+                <span>v{artifact.schema_version}</span>
+              </div>
+              <div>
+                <span className="label">Architecture State:</span>
+                <span className={`arch-state-badge arch-${artifact.architecture_state}`}>
+                  {artifact.architecture_state.toUpperCase()}
+                </span>
+              </div>
+              <div>
+                <span className="label">Architecture Version:</span>
+                <span>{artifact.current_architecture_version || 'None (Draft)'}</span>
+              </div>
+              <div>
+                <span className="label">Workflow Revision:</span>
+                <span>#{workflow_state.revision}</span>
+              </div>
+              {workflow_state.resume_state && (
+                <div>
+                  <span className="label">Resume State:</span>
+                  <span>{workflow_state.resume_state}</span>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="unavailable-contract-message" role="status">
+              <p>
+                <strong>Durable contract unavailable:</strong> The repository is inaccessible on disk.
+                Durable architecture state exists only in <code>.coalition/project.yaml</code> and
+                cannot be read or assumed while the repository is offline.
+              </p>
+            </div>
+          )}
         </section>
 
         <section className="detail-card">
