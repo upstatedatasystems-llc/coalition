@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added - Stage 1 Final Durability and Identity Closure
+- Authoritative backup preservation on failed promotion: removed source deletion from low-level failed `MoveFileExW` destination-absent path so that authoritative recovery backups (`project.yaml.bak.*`) remain byte-for-byte intact if promotion fails.
+- Deferred stale-temp cleanup: artifact inspection remains strictly non-mutating through SQLite identity reconciliation, deferring stale temporary file cleanup until project open and layout validation are fully authorized and preventing identity conflicts from purging recovery evidence.
 - Genuine crash-safe platform-native atomic replacement for `project.yaml` via Windows `ReplaceFileW` with `dwReplaceFlags = 0` (Microsoft documents `REPLACEFILE_WRITE_THROUGH` as unsupported for `ReplaceFileW`), an explicit same-directory backup (`project.yaml.bak.<uuid>`), post-call destination validation, and reconciliation of documented failure states.
 - Preservation of recovery artifacts when replacement returns `RecoveryRequired`, making cleanup ownership explicit so callers never purge staged temporary files or backups during ambiguous failure states.
 - Prevention of failed existing-file `ReplaceFileW` calls from falling through into `MoveFileExW` creation path, ensuring disappearance or replacement failure is not silently reinterpreted as file creation.

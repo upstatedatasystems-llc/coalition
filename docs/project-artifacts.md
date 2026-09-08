@@ -96,6 +96,8 @@ Updating `project.yaml` via `ArtifactManager::write_project_yaml_atomic` guarant
    - **Ambiguous State**: If multiple backups or corrupted backups exist, returns `ARTIFACT_RECOVERY_REQUIRED` with zero mutation.
    - **Incomplete Writes (Temp-only)**: If canonical is missing and only temp files exist, returns `ARTIFACT_RECOVERY_REQUIRED` with zero mutation.
    - **Case D (Missing Contract)**: If SQLite path is known, but no canonical contract or valid backup exists, returns `DURABLE_CONTRACT_MISSING` with zero durable identity mutation.
+   - **Source Argument Preservation**: If promotion of an authorized backup fails, the authoritative backup file is preserved byte-for-byte intact and canonical remains absent.
+   - **Deferred Stale Cleanup**: Temporary file cleanup is strictly deferred until SQLite identity reconciliation and complete layout validation succeed.
 3. **Complete Layout Validation on Every Project Open**:
    - Every successful open validates the complete `.coalition/` hierarchy, ensuring that all standard subdirectories (`design/`, `implementation/`, `decisions/`, `architecture-versions/`, `changes/`, `reviews/`, `evidence/`) exist and resolve safely inside the repository root.
    - Missing standard directories are recreated safely.

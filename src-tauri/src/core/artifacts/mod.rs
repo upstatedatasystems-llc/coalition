@@ -324,16 +324,12 @@ impl ArtifactManager {
         })
     }
 
-    /// Authoritatively promotes an authorized backup to canonical project.yaml and cleans stale temp files.
+    /// Authoritatively promotes an authorized backup to canonical project.yaml.
     pub fn promote_backup_to_canonical(
         backup_path: &Path,
         canonical_path: &Path,
     ) -> Result<(), ArtifactError> {
-        Self::replace_file_atomically(backup_path, canonical_path)?;
-        if let Some(parent) = canonical_path.parent() {
-            Self::clean_stale_temp_files(parent);
-        }
-        Ok(())
+        Self::replace_file_atomically(backup_path, canonical_path)
     }
 
     /// Creates .coalition directory, ensures standard subdirectories, and writes a brand new project.yaml.
@@ -517,6 +513,7 @@ pub enum InjectedSeam {
     PreCallFailure,
     SimulateAmbiguousRecovery,
     SimulateReplaceFileWError(u32),
+    SimulateMoveFileExWError(u32),
 }
 
 #[cfg(test)]
@@ -674,19 +671,39 @@ fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), A
     }
 
     // Destination was genuinely absent at the start of the operation: use MoveFileExW creation path
-    let res = unsafe {
-        MoveFileExW(
-            temp_wide.as_ptr(),
-            dest_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
+    #[cfg(test)]
+    let (res, err) = match INJECTED_SEAM.with(|f| f.get()) {
+        InjectedSeam::SimulateMoveFileExWError(code) => (0, code),
+        _ => {
+            let r = unsafe {
+                MoveFileExW(
+                    temp_wide.as_ptr(),
+                    dest_wide.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            let e = if r == 0 { unsafe { GetLastError() } } else { 0 };
+            (r, e)
+        }
+    };
+
+    #[cfg(not(test))]
+    let (res, err) = {
+        let r = unsafe {
+            MoveFileExW(
+                temp_wide.as_ptr(),
+                dest_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        let e = if r == 0 { unsafe { GetLastError() } } else { 0 };
+        (r, e)
     };
 
     if res != 0 {
         Ok(())
     } else {
-        let err = unsafe { GetLastError() };
-        let _ = fs::remove_file(temp);
+        // Crucial: NEVER delete source `temp` here; callers own source argument cleanup!
         Err(ArtifactError::Io(format!(
             "MoveFileExW creation failed with OS error code {}",
             err
@@ -697,11 +714,19 @@ fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), A
 #[cfg(not(windows))]
 fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), ArtifactError> {
     #[cfg(test)]
-    if INJECTED_SEAM.with(|f| f.get()) == InjectedSeam::SimulateAmbiguousRecovery {
-        let _ = fs::remove_file(destination);
-        return Err(ArtifactError::RecoveryRequired(
-            "Simulated ambiguous recovery state on POSIX".to_string(),
-        ));
+    {
+        if INJECTED_SEAM.with(|f| f.get()) == InjectedSeam::SimulateAmbiguousRecovery {
+            let _ = fs::remove_file(destination);
+            return Err(ArtifactError::RecoveryRequired(
+                "Simulated ambiguous recovery state on POSIX".to_string(),
+            ));
+        }
+        if let InjectedSeam::SimulateMoveFileExWError(code) = INJECTED_SEAM.with(|f| f.get()) {
+            return Err(ArtifactError::Io(format!(
+                "Simulated MoveFileExW creation failure on POSIX with code {}",
+                code
+            )));
+        }
     }
 
     fs::rename(temp, destination)
@@ -1437,6 +1462,66 @@ mod tests {
         assert!(
             !coalition.join("project.yaml").exists(),
             "Must NOT create project.yaml while temp files exist"
+        );
+    }
+
+    #[test]
+    fn test_failed_backup_promotion_preserves_backup_intact() {
+        let dir = tempdir().unwrap();
+        let canonical_root = dir.path().canonicalize().unwrap();
+        let coalition = canonical_root.join(".coalition");
+        fs::create_dir_all(&coalition).unwrap();
+
+        let backup_project = ProjectYaml {
+            schema_version: 1,
+            project_id: Uuid::new_v4().to_string(),
+            name: "recovery-promotion-test".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+
+        let backup_file = coalition.join("project.yaml.bak.promotion_fail");
+        let backup_yaml = serde_yaml::to_string(&backup_project).unwrap();
+        fs::write(&backup_file, &backup_yaml).unwrap();
+        let original_bytes = fs::read(&backup_file).unwrap();
+
+        let canonical_path = coalition.join("project.yaml");
+        assert!(!canonical_path.exists());
+
+        // Inject MoveFileExW failure for destination-absent move
+        INJECTED_SEAM.with(|f| f.set(InjectedSeam::SimulateMoveFileExWError(5)));
+
+        let res = ArtifactManager::promote_backup_to_canonical(&backup_file, &canonical_path);
+        assert!(res.is_err(), "Promotion must fail when MoveFileExW fails");
+
+        // Reset injection seam
+        INJECTED_SEAM.with(|f| f.set(InjectedSeam::None));
+
+        // 1. Canonical must remain absent
+        assert!(
+            !canonical_path.exists(),
+            "Canonical project.yaml must remain absent after failed promotion"
+        );
+
+        // 2. Authoritative backup must remain byte-for-byte intact (NOT deleted)
+        assert!(
+            backup_file.exists(),
+            "Backup file must NOT be deleted when promotion fails!"
+        );
+        let current_bytes = fs::read(&backup_file).unwrap();
+        assert_eq!(
+            current_bytes, original_bytes,
+            "Backup content must remain byte-for-byte identical"
+        );
+
+        // 3. inspect_project_artifacts must still discover the same valid backup
+        let inspection = ArtifactManager::inspect_project_artifacts(dir.path()).unwrap();
+        assert!(inspection.canonical.is_none());
+        assert_eq!(inspection.valid_backups.len(), 1);
+        assert_eq!(
+            inspection.valid_backups[0].project.project_id,
+            backup_project.project_id
         );
     }
 }

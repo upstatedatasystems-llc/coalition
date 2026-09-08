@@ -166,8 +166,6 @@ impl ProjectService {
         let (project_yaml, created_new_artifact, was_rehydrated) = if let Some(canonical_yaml) =
             inspection.canonical
         {
-            // Canonical exists! Clean any stale temp files.
-            ArtifactManager::clean_stale_temp_files(&coalition_dir);
             (canonical_yaml, false, false)
         } else if inspection.valid_backups.len() == 1 {
             let candidate = &inspection.valid_backups[0];
@@ -447,6 +445,9 @@ impl ProjectService {
         // directories and rejecting symlink/junction reparse points that escape the repository.
         ArtifactManager::validate_coalition_layout(&repo_root, &coalition_dir)?;
 
+        // 7. Successful open is authorized: clean any stale temporary files.
+        ArtifactManager::clean_stale_temp_files(&coalition_dir);
+
         // Commit transaction
         tx.commit()?;
 
@@ -607,6 +608,7 @@ impl ProjectService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::artifacts::{InjectedSeam, INJECTED_SEAM};
     use crate::db::DbManager;
     use std::fs;
     use std::process::Command;
@@ -1497,5 +1499,111 @@ mod tests {
                 .arg(changes_dir.as_os_str())
                 .status();
         }
+    }
+
+    #[test]
+    fn test_failed_backup_promotion_via_project_service_preserves_backup() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let repo_dir = tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        // 1. Register project initially
+        let details =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap();
+        let pid = details.project.project_id.clone();
+        let coalition = repo_dir.path().join(".coalition");
+        let canonical_path = coalition.join("project.yaml");
+        fs::remove_file(&canonical_path).unwrap();
+
+        // 2. Plant matching backup
+        let backup_path = coalition.join("project.yaml.bak.matching");
+        let mut backup_proj = details.artifact.unwrap();
+        backup_proj.name = "backup-preserved".to_string();
+        let backup_yaml = serde_yaml::to_string(&backup_proj).unwrap();
+        fs::write(&backup_path, &backup_yaml).unwrap();
+        let original_bytes = fs::read(&backup_path).unwrap();
+
+        // 3. Inject MoveFileExW promotion failure
+        INJECTED_SEAM.with(|f| f.set(InjectedSeam::SimulateMoveFileExWError(5)));
+
+        // 4. Attempt to open project (which triggers promotion)
+        let res =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path());
+        assert!(res.is_err(), "Project open must fail when promotion fails");
+
+        // Reset injection seam
+        INJECTED_SEAM.with(|f| f.set(InjectedSeam::None));
+
+        // 5. Canonical must remain absent
+        assert!(
+            !canonical_path.exists(),
+            "Canonical project.yaml must remain absent"
+        );
+
+        // 6. Backup must remain intact byte-for-byte
+        assert!(
+            backup_path.exists(),
+            "Backup file must not be deleted on failed promotion"
+        );
+        assert_eq!(fs::read(&backup_path).unwrap(), original_bytes);
+
+        // 7. Re-inspection must still report the backup as valid
+        let inspection = ArtifactManager::inspect_project_artifacts(repo_dir.path()).unwrap();
+        assert_eq!(inspection.valid_backups.len(), 1);
+        assert_eq!(inspection.valid_backups[0].project.project_id, pid);
+    }
+
+    #[test]
+    fn test_identity_conflict_defers_temp_file_cleanup() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        let git = GitAdapter::new().unwrap();
+
+        let repo_dir = tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        // 1. Register project initially with project ID A
+        let details =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap();
+        let _pid_a = details.project.project_id;
+        let coalition = repo_dir.path().join(".coalition");
+
+        // 2. Overwrite canonical project.yaml with a conflicting project ID B
+        let pid_b = uuid::Uuid::new_v4().to_string();
+        let conflicting_proj = ProjectYaml {
+            schema_version: 1,
+            project_id: pid_b,
+            name: "conflicting-project".to_string(),
+            current_architecture_version: None,
+            architecture_state: ArchitectureState::Draft,
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+        fs::write(
+            coalition.join("project.yaml"),
+            serde_yaml::to_string(&conflicting_proj).unwrap(),
+        )
+        .unwrap();
+
+        // 3. Plant a recognized stale temp file
+        let stale_temp = coalition.join("project.yaml.tmp.evidence");
+        fs::write(&stale_temp, "stale temp recovery evidence").unwrap();
+        assert!(stale_temp.exists());
+
+        // 4. Reopening must return PROJECT_IDENTITY_CONFLICT
+        let err =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap_err();
+        assert!(matches!(err, ProjectError::IdentityConflict(_)));
+
+        // 5. Crucial: stale temp file must NOT have been cleaned up!
+        assert!(
+            stale_temp.exists(),
+            "Stale temp file must remain intact when project open aborts due to identity conflict"
+        );
     }
 }
