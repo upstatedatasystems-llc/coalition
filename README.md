@@ -11,18 +11,22 @@ It coordinates:
 
 Coalition ensures that AI coding work remains strictly accountable to an explicit, human-approved architecture, and that the human can inspect, pause, revise, and resume the implementation at any point.
 
-## Status: Phase 0 (Bootstrap & Technical Proofs)
+## Status: Phase 1 (Coalition Core and Project Persistence)
 
-This repository is currently at **Phase 0 — Repository Bootstrap and Technical Proofs**.
+This repository is currently at **Phase 1 — Coalition Core and Project Persistence**.
 
-Phase 0 establishes:
-- Tauri 2.x + React + TypeScript + Vite + Rust desktop runtime.
-- System Git detection and isolated Git adapter.
-- Isolated Antigravity CLI adapter (`agy`) supporting headless stream I/O, conversation tracking, model discovery, and process cancellation.
-- Versioned SQLite local operational state proof.
-- Bounded process runner with streaming logs and cancellation.
-- Test harness (`fake-agy`) for deterministic zero-quota automated testing.
-- Initial technical spikes for usage metrics, permissions, model switching, and process ownership.
+Phase 1 establishes:
+- Local project registration and re-opening with Git root canonicalization.
+- Durable `.coalition/` project contract hierarchy and portable `project.yaml` metadata (schema v1, stable UUID v4, typed architecture state).
+- Operational SQLite database persistence with forward migrations for projects, workflow state, activity events, and app settings.
+- Authoritative Rust workflow state machine enforcing all 19 V1 states, explicit transition validation, pause/resume state tracking, and atomic revision increments.
+- SQLite-loss recovery and rehydration reconstructing operational state from durable `.coalition/project.yaml`.
+- Git repository inspection surfacing branch, HEAD commit, clean vs. dirty status (staged, unstaged, untracked counts), and diff stats, handling empty repositories and detached HEAD gracefully.
+- Structured Tauri IPC error boundary (`CommandError`) with typed error codes and safe context.
+- Modular React frontend featuring the primary project dashboard (empty state, project cards, detail view, refresh, activity timeline, open repository modal) and dedicated diagnostics.
+- Unavailable repository detection preserving registrations when folders are moved or deleted.
+- Automatic restoration of last-opened project on startup.
+- Full preservation of Phase 0 technical proofs and fake-`agy` test harness.
 
 ## Technology Stack
 

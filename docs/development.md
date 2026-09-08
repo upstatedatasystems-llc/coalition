@@ -28,14 +28,29 @@ coalition/
 ├── .coalition/                # Project self-validation & artifacts
 ├── docs/                      # Architecture and integration docs
 │   └── spikes/                # Phase 0 technical spike findings
-├── src/                       # Frontend source (React + TS + Vite)
+├── src/                       # Frontend source (React 19 + TS + Vite)
+│   ├── app/                   # Root shell layout
+│   ├── features/              # Modular features
+│   │   ├── activity/          # Activity timeline
+│   │   ├── diagnostics/       # Phase 0 diagnostics panel
+│   │   └── projects/          # Project list, detail, empty state, open modal
+│   └── types/                 # Domain & IPC TypeScript definitions
 ├── src-tauri/                 # Rust core backend & Tauri configuration
 │   ├── Cargo.toml
 │   ├── tauri.conf.json
 │   ├── src/
-│   │   ├── commands/          # Tauri IPC command handlers
-│   │   ├── core/              # Adapters (Git, Antigravity, Process)
-│   │   └── db/                # SQLite connection and migrations
+│   │   ├── commands/          # Narrow Tauri IPC command handlers & CommandError
+│   │   ├── core/
+│   │   │   ├── activity/      # Structured activity events & queries
+│   │   │   ├── artifacts/     # Durable .coalition structure & project.yaml
+│   │   │   ├── builder/       # Antigravity CLI adapter & process runner
+│   │   │   ├── git/           # Git adapter & repository inspection
+│   │   │   ├── process/       # Bounded async process runner
+│   │   │   ├── projects/      # Project registration, rehydration, availability
+│   │   │   └── workflow/      # 19-state authoritative workflow state machine
+│   │   └── db/                # SQLite connection, migrations (001 & 002)
+│   └── tests/
+│       └── phase1_smoke_test.rs # Desktop lifecycle smoke tests
 └── tests/
     └── fake-commands/         # Zero-quota fake-agy test double
 ```

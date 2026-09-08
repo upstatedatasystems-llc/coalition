@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Coalition - Phase 0 Diagnostics",
+        "title": "Coalition",
         "width": 1024,
         "height": 768,
         "resizable": true,

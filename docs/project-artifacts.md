@@ -35,6 +35,34 @@ Unlike SQLite (which tracks transient operational activity and may be deleted or
         └── validation-*/
 ```
 
-## Phase 0 Boundary
+## Phase 1 Implementation
 
-In Phase 0, only `.coalition/implementation/validation.yaml` is utilized for Coalition's own self-validation commands. Full project artifact lifecycle management is scheduled for Phase 1.
+In Phase 1, Coalition initializes the full standard directory hierarchy and manages `project.yaml` lifecycle.
+
+### `project.yaml` Schema v1
+
+`project.yaml` is the portable root descriptor of the project contract. It must never contain machine-specific absolute filesystem paths.
+
+```yaml
+schema_version: 1
+project_id: "3e1b7c89-2df4-46b7-a021-995f3b7d1e84"
+name: "my-project"
+current_architecture_version: null
+architecture_state: draft
+created_at: "2026-09-08T12:00:00Z"
+```
+
+- `schema_version`: Explicit unsigned integer (1). Deserialization strictly rejects versions > 1.
+- `project_id`: Stable UUID v4 identifier generated on initial registration. Survives local SQLite deletion.
+- `name`: Human-readable project name, defaults to repository folder name.
+- `current_architecture_version`: Immutable version string (e.g. `"1.0"`) once frozen, or `null` while in draft.
+- `architecture_state`: Typed domain state (`draft` | `frozen`).
+- `created_at`: ISO-8601 UTC RFC3339 timestamp.
+
+### Filesystem Safety & Atomic Writes
+
+All `.coalition/` operations obey strict filesystem safety constraints:
+1. **Repository Root Canonicalization**: Every governed path is resolved through Git (`git rev-parse --show-toplevel`) and canonicalized.
+2. **Path Traversal Escape Prevention**: Any path resolving or escaping outside the canonical root via `..` is rejected.
+3. **Symlink and Reparse Point Safety**: Windows directory junctions, symlinks, or reparse points that redirect `.coalition` writes outside the repository root are strictly rejected with typed `ArtifactError::UnsafeReparsePoint`.
+4. **Atomic Updates**: Metadata writes use a temporary-file write, flush, and atomic replace sequence (`project.yaml.tmp.<uuid> -> project.yaml`) suitable for Windows and cross-platform filesystems to prevent partial corruption.

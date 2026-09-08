@@ -1,8 +1,11 @@
+use crate::core::activity::{ActivityEventRecord, ActivityManager};
 use crate::core::builder::{
     AgyEvent, AntigravityCliAdapter, BuilderTurnRequest, BuilderTurnResponse, ModelInfo,
 };
-use crate::core::git::{GitAdapter, GitRepoInfo};
-use crate::db::{DbManager, ProofResult};
+use crate::core::git::{GitAdapter, GitError, GitRepoInfo};
+use crate::core::projects::{ProjectDetails, ProjectError, ProjectService, ProjectSummary};
+use crate::core::workflow::{self, WorkflowAction, WorkflowError, WorkflowStateRecord};
+use crate::db::{DbError, DbManager, ProofResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +20,114 @@ pub struct AppState {
     pub cancel_flag: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandError {
+    pub code: String,
+    pub message: String,
+    pub details: Option<serde_json::Value>,
+}
+
+impl CommandError {
+    pub fn new<S: Into<String>, M: Into<String>>(code: S, message: M) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub fn with_details<S: Into<String>, M: Into<String>>(
+        code: S,
+        message: M,
+        details: serde_json::Value,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            details: Some(details),
+        }
+    }
+}
+
+impl From<ProjectError> for CommandError {
+    fn from(e: ProjectError) -> Self {
+        match e {
+            ProjectError::NotAGitRepository(msg) => Self::new("NOT_A_GIT_REPOSITORY", msg),
+            ProjectError::NotFound(msg) => Self::new("PROJECT_NOT_FOUND", msg),
+            ProjectError::RepositoryUnavailable(msg) => Self::new("REPOSITORY_UNAVAILABLE", msg),
+            ProjectError::Artifact(msg) => Self::new("ARTIFACT_ERROR", msg),
+            ProjectError::Workflow(msg) => Self::new("WORKFLOW_ERROR", msg),
+            ProjectError::Git(msg) => Self::new("GIT_ERROR", msg),
+            ProjectError::Database(msg) => Self::new("DATABASE_ERROR", msg),
+        }
+    }
+}
+
+impl From<WorkflowError> for CommandError {
+    fn from(e: WorkflowError) -> Self {
+        match e {
+            WorkflowError::InvalidTransition {
+                current,
+                action,
+                reason,
+            } => Self::with_details(
+                "INVALID_WORKFLOW_TRANSITION",
+                format!(
+                    "Cannot perform action {:?} while project is in state {}. {}",
+                    action, current, reason
+                ),
+                serde_json::json!({
+                    "current_state": current.to_string(),
+                    "action": format!("{:?}", action),
+                    "reason": reason,
+                }),
+            ),
+            WorkflowError::TerminalState(st) => Self::with_details(
+                "TERMINAL_WORKFLOW_STATE",
+                format!("State {} is terminal and rejects further transitions", st),
+                serde_json::json!({ "state": st.to_string() }),
+            ),
+            WorkflowError::MissingResumeState(st) => Self::with_details(
+                "MISSING_RESUME_STATE",
+                format!("State {} has no recorded resume state", st),
+                serde_json::json!({ "state": st.to_string() }),
+            ),
+            WorkflowError::InvalidStateString(s) => Self::new(
+                "INVALID_STATE_STRING",
+                format!("Unknown state string: {}", s),
+            ),
+            WorkflowError::NotFound(pid) => Self::new(
+                "WORKFLOW_STATE_NOT_FOUND",
+                format!("Workflow state for project {} not found", pid),
+            ),
+            WorkflowError::Database(msg) => Self::new("DATABASE_ERROR", msg),
+        }
+    }
+}
+
+impl From<GitError> for CommandError {
+    fn from(e: GitError) -> Self {
+        match e {
+            GitError::NotFound(msg) => Self::new("GIT_NOT_FOUND", msg),
+            GitError::NotAGitRepository(msg) => Self::new("NOT_A_GIT_REPOSITORY", msg),
+            GitError::ExecutionFailed(msg) => Self::new("GIT_EXECUTION_FAILED", msg),
+            GitError::Io(err) => Self::new("IO_ERROR", err.to_string()),
+        }
+    }
+}
+
+impl From<DbError> for CommandError {
+    fn from(e: DbError) -> Self {
+        Self::new("DATABASE_ERROR", e.to_string())
+    }
+}
+
+impl From<String> for CommandError {
+    fn from(msg: String) -> Self {
+        Self::new("GENERAL_ERROR", msg)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemDiagnosticInfo {
     pub current_dir: String,
@@ -28,10 +139,126 @@ pub struct SystemDiagnosticInfo {
     pub agy_error: Option<String>,
 }
 
+// ----------------------------------------------------------------------------
+// Phase 1 Project Commands
+// ----------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn list_projects(
+    state: State<'_, AppState>,
+) -> Result<Vec<ProjectSummary>, CommandError> {
+    let db = state.db.lock().await;
+    let mut git_lock = state.git.lock().await;
+    if git_lock.is_none() {
+        if let Ok(adapter) = GitAdapter::new() {
+            *git_lock = Some(adapter);
+        }
+    }
+
+    ProjectService::list_projects(db.connection(), git_lock.as_ref()).map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn register_or_open_project(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<ProjectDetails, CommandError> {
+    let mut git_lock = state.git.lock().await;
+    if git_lock.is_none() {
+        *git_lock = Some(GitAdapter::new().map_err(CommandError::from)?);
+    }
+    let git = git_lock.as_ref().unwrap();
+
+    let mut db = state.db.lock().await;
+    ProjectService::register_or_open_project(db.connection_mut(), git, path)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_project_details(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<ProjectDetails, CommandError> {
+    let db = state.db.lock().await;
+    let mut git_lock = state.git.lock().await;
+    if git_lock.is_none() {
+        if let Ok(adapter) = GitAdapter::new() {
+            *git_lock = Some(adapter);
+        }
+    }
+
+    ProjectService::get_project_details(db.connection(), git_lock.as_ref(), &project_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn refresh_project_git_state(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<ProjectDetails, CommandError> {
+    let mut git_lock = state.git.lock().await;
+    if git_lock.is_none() {
+        *git_lock = Some(GitAdapter::new().map_err(CommandError::from)?);
+    }
+    let git = git_lock.as_ref().unwrap();
+
+    let mut db = state.db.lock().await;
+    let details = ProjectService::get_project_details(db.connection(), Some(git), &project_id)?;
+
+    if details.is_available {
+        let _ = ActivityManager::record_event(
+            db.connection_mut(),
+            &project_id,
+            "GIT_STATE_REFRESHED",
+            "COALITION",
+            "Git repository state refreshed",
+            None,
+        );
+    }
+
+    ProjectService::get_project_details(db.connection(), Some(git), &project_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_project_activity(
+    state: State<'_, AppState>,
+    project_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<ActivityEventRecord>, CommandError> {
+    let db = state.db.lock().await;
+    ActivityManager::get_project_activity(db.connection(), &project_id, limit)
+        .map_err(|e| CommandError::new("DATABASE_ERROR", e.to_string()))
+}
+
+#[tauri::command]
+pub async fn apply_workflow_action(
+    state: State<'_, AppState>,
+    project_id: String,
+    action: WorkflowAction,
+) -> Result<WorkflowStateRecord, CommandError> {
+    let mut db = state.db.lock().await;
+    workflow::apply_workflow_action(db.connection_mut(), &project_id, action, "HUMAN")
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_last_opened_project_id(
+    state: State<'_, AppState>,
+) -> Result<Option<String>, CommandError> {
+    let db = state.db.lock().await;
+    ProjectService::get_app_setting(db.connection(), "last_opened_project_id")
+        .map_err(CommandError::from)
+}
+
+// ----------------------------------------------------------------------------
+// Phase 0 Diagnostic Commands (Preserved with structured CommandError)
+// ----------------------------------------------------------------------------
+
 #[tauri::command]
 pub async fn get_system_diagnostics(
     state: State<'_, AppState>,
-) -> Result<SystemDiagnosticInfo, String> {
+) -> Result<SystemDiagnosticInfo, CommandError> {
     let current_dir = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .to_string_lossy()
@@ -96,9 +323,9 @@ pub async fn get_system_diagnostics(
 }
 
 #[tauri::command]
-pub async fn run_sqlite_proof(state: State<'_, AppState>) -> Result<ProofResult, String> {
+pub async fn run_sqlite_proof(state: State<'_, AppState>) -> Result<ProofResult, CommandError> {
     let mut db = state.db.lock().await;
-    db.run_proof().map_err(|e| e.to_string())
+    db.run_proof().map_err(CommandError::from)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,7 +343,7 @@ pub async fn start_builder_turn(
     app: AppHandle,
     state: State<'_, AppState>,
     payload: StartBuilderTurnPayload,
-) -> Result<BuilderTurnResponse, String> {
+) -> Result<BuilderTurnResponse, CommandError> {
     state.cancel_flag.store(false, Ordering::Relaxed);
 
     let adapter = if payload.use_fake_agy {
@@ -132,7 +359,10 @@ pub async fn start_builder_turn(
             });
 
         if !fake_path.exists() {
-            return Err(format!("fake-agy executable not found at {:?}", fake_path));
+            return Err(CommandError::new(
+                "FAKE_AGY_NOT_FOUND",
+                format!("fake-agy executable not found at {:?}", fake_path),
+            ));
         }
         AntigravityCliAdapter::with_path(fake_path)
     } else {
@@ -140,7 +370,8 @@ pub async fn start_builder_turn(
         if let Some(ref a) = *lock {
             AntigravityCliAdapter::with_path(a.binary_path())
         } else {
-            AntigravityCliAdapter::discover().map_err(|e| e.to_string())?
+            AntigravityCliAdapter::discover()
+                .map_err(|e| CommandError::new("AGY_DISCOVERY_ERROR", e.to_string()))?
         }
     };
 
@@ -169,34 +400,43 @@ pub async fn start_builder_turn(
     let result = adapter
         .run_turn(request, state.cancel_flag.clone(), Some(tx))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| CommandError::new("BUILDER_TURN_FAILED", e.to_string()))?;
 
     Ok(result)
 }
 
 #[tauri::command]
-pub async fn cancel_builder_turn(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn cancel_builder_turn(state: State<'_, AppState>) -> Result<(), CommandError> {
     state.cancel_flag.store(true, Ordering::Relaxed);
     Ok(())
 }
 
 #[tauri::command]
-pub async fn desktop_clipboard_write(text: String) -> Result<(), String> {
-    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
-    clipboard.set_text(text).map_err(|e| e.to_string())?;
+pub async fn desktop_clipboard_write(text: String) -> Result<(), CommandError> {
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|e| CommandError::new("CLIPBOARD_ERROR", e.to_string()))?;
+    clipboard
+        .set_text(text)
+        .map_err(|e| CommandError::new("CLIPBOARD_ERROR", e.to_string()))?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn desktop_clipboard_read() -> Result<String, String> {
-    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
-    clipboard.get_text().map_err(|e| e.to_string())
+pub async fn desktop_clipboard_read() -> Result<String, CommandError> {
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|e| CommandError::new("CLIPBOARD_ERROR", e.to_string()))?;
+    clipboard
+        .get_text()
+        .map_err(|e| CommandError::new("CLIPBOARD_ERROR", e.to_string()))
 }
 
 #[tauri::command]
-pub async fn desktop_open_url(url: String) -> Result<(), String> {
+pub async fn desktop_open_url(url: String) -> Result<(), CommandError> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err("Only HTTP and HTTPS URLs are allowed".to_string());
+        return Err(CommandError::new(
+            "INVALID_URL",
+            "Only HTTP and HTTPS URLs are allowed",
+        ));
     }
 
     #[cfg(target_os = "windows")]
@@ -204,21 +444,21 @@ pub async fn desktop_open_url(url: String) -> Result<(), String> {
         std::process::Command::new("rundll32")
             .args(["url.dll,FileProtocolHandler", &url])
             .spawn()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| CommandError::new("URL_OPEN_ERROR", e.to_string()))?;
     }
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
             .arg(&url)
             .spawn()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| CommandError::new("URL_OPEN_ERROR", e.to_string()))?;
     }
     #[cfg(target_os = "linux")]
     {
         std::process::Command::new("xdg-open")
             .arg(&url)
             .spawn()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| CommandError::new("URL_OPEN_ERROR", e.to_string()))?;
     }
 
     Ok(())

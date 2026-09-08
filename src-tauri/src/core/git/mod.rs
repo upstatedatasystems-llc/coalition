@@ -7,6 +7,8 @@ use thiserror::Error;
 pub enum GitError {
     #[error("Git executable not found: {0}")]
     NotFound(String),
+    #[error("Path is not a Git repository: {0}")]
+    NotAGitRepository(String),
     #[error("Git command failed: {0}")]
     ExecutionFailed(String),
     #[error("IO error: {0}")]
@@ -18,6 +20,7 @@ pub struct GitStatusCounts {
     pub staged: usize,
     pub unstaged: usize,
     pub untracked: usize,
+    pub is_clean: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +29,7 @@ pub struct GitRepoInfo {
     pub is_repo: bool,
     pub root_dir: Option<String>,
     pub current_branch: Option<String>,
+    pub is_detached: bool,
     pub head_commit: Option<String>,
     pub status: GitStatusCounts,
     pub diff_summary: String,
@@ -62,6 +66,34 @@ impl GitAdapter {
         }
     }
 
+    /// Resolves the canonical repository root for a given directory.
+    /// Returns GitError::NotAGitRepository if the directory is not inside a git repository.
+    pub fn resolve_repo_root<P: AsRef<Path>>(&self, working_dir: P) -> Result<PathBuf, GitError> {
+        let dir = working_dir.as_ref();
+        if !dir.exists() {
+            return Err(GitError::NotAGitRepository(format!(
+                "Directory does not exist: {:?}",
+                dir
+            )));
+        }
+
+        let output = Command::new(&self.git_bin)
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(dir)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::NotAGitRepository(format!(
+                "Directory {:?} is not a Git repository",
+                dir
+            )));
+        }
+
+        let raw_root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let canonical_root = PathBuf::from(raw_root).canonicalize()?;
+        Ok(canonical_root)
+    }
+
     pub fn inspect_repo<P: AsRef<Path>>(&self, working_dir: P) -> Result<GitRepoInfo, GitError> {
         let version = self.get_version()?;
         let dir = working_dir.as_ref();
@@ -84,11 +116,13 @@ impl GitAdapter {
                 is_repo: false,
                 root_dir: None,
                 current_branch: None,
+                is_detached: false,
                 head_commit: None,
                 status: GitStatusCounts {
                     staged: 0,
                     unstaged: 0,
                     untracked: 0,
+                    is_clean: true,
                 },
                 diff_summary: String::new(),
             });
@@ -101,30 +135,36 @@ impl GitAdapter {
             .ok()
             .and_then(|out| {
                 if out.status.success() {
-                    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    PathBuf::from(s)
+                        .canonicalize()
+                        .ok()
+                        .map(|p| p.to_string_lossy().to_string())
                 } else {
                     None
                 }
             });
 
-        let current_branch = Command::new(&self.git_bin)
+        let branch_output = Command::new(&self.git_bin)
             .args(["branch", "--show-current"])
             .current_dir(dir)
             .output()
-            .ok()
-            .and_then(|out| {
-                if out.status.success() {
-                    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if b.is_empty() {
-                        None
-                    } else {
-                        Some(b)
-                    }
-                } else {
-                    None
-                }
-            });
+            .ok();
 
+        let current_branch = branch_output.and_then(|out| {
+            if out.status.success() {
+                let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if b.is_empty() {
+                    None
+                } else {
+                    Some(b)
+                }
+            } else {
+                None
+            }
+        });
+
+        // Safely inspect HEAD: in an empty repository with 0 commits, rev-parse HEAD exits non-zero
         let head_commit = Command::new(&self.git_bin)
             .args(["rev-parse", "HEAD"])
             .current_dir(dir)
@@ -132,11 +172,18 @@ impl GitAdapter {
             .ok()
             .and_then(|out| {
                 if out.status.success() {
-                    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                    let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if commit.is_empty() {
+                        None
+                    } else {
+                        Some(commit)
+                    }
                 } else {
                     None
                 }
             });
+
+        let is_detached = current_branch.is_none() && head_commit.is_some();
 
         let status_output = Command::new(&self.git_bin)
             .args(["status", "--porcelain"])
@@ -159,6 +206,7 @@ impl GitAdapter {
             is_repo: true,
             root_dir,
             current_branch,
+            is_detached,
             head_commit,
             status: status_counts,
             diff_summary,
@@ -189,10 +237,13 @@ impl GitAdapter {
             }
         }
 
+        let is_clean = staged == 0 && unstaged == 0 && untracked == 0;
+
         GitStatusCounts {
             staged,
             unstaged,
             untracked,
+            is_clean,
         }
     }
 }
@@ -200,6 +251,8 @@ impl GitAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn test_parse_porcelain_status() {
@@ -208,6 +261,10 @@ mod tests {
         assert_eq!(counts.staged, 2); // 'M ' and 'A '
         assert_eq!(counts.unstaged, 1); // ' M'
         assert_eq!(counts.untracked, 1); // '??'
+        assert!(!counts.is_clean);
+
+        let clean_counts = GitAdapter::parse_porcelain_status("");
+        assert!(clean_counts.is_clean);
     }
 
     #[test]
@@ -219,5 +276,91 @@ mod tests {
         );
         let version = adapter.unwrap().get_version().unwrap();
         assert!(version.contains("git version"));
+    }
+
+    #[test]
+    fn test_git_adapter_repo_operations() {
+        let adapter = GitAdapter::new().unwrap();
+        let dir = tempdir().unwrap();
+        let repo_path = dir.path();
+
+        // 1. Non-git directory
+        let err = adapter.resolve_repo_root(repo_path).unwrap_err();
+        assert!(matches!(err, GitError::NotAGitRepository(_)));
+
+        // Initialize git repository with local config (no global dependency)
+        Command::new("git")
+            .args(["init"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        // 2. Empty repository (0 commits)
+        let resolved = adapter.resolve_repo_root(repo_path).unwrap();
+        assert_eq!(resolved, repo_path.canonicalize().unwrap());
+
+        let info = adapter.inspect_repo(repo_path).unwrap();
+        assert!(info.is_repo);
+        assert!(
+            info.head_commit.is_none(),
+            "Empty repo should have no HEAD commit"
+        );
+        assert!(info.status.is_clean);
+
+        // 3. Untracked file
+        fs::write(repo_path.join("file1.txt"), "hello").unwrap();
+        let info = adapter.inspect_repo(repo_path).unwrap();
+        assert_eq!(info.status.untracked, 1);
+        assert!(!info.status.is_clean);
+
+        // 4. Staged and committed file
+        Command::new("git")
+            .args(["add", "file1.txt"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        let info = adapter.inspect_repo(repo_path).unwrap();
+        assert_eq!(info.status.staged, 1);
+
+        Command::new("git")
+            .args(["commit", "-m", "initial commit"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        let info = adapter.inspect_repo(repo_path).unwrap();
+        assert!(info.head_commit.is_some());
+        assert!(info.status.is_clean);
+        assert!(
+            info.current_branch == Some("main".to_string())
+                || info.current_branch == Some("master".to_string())
+        );
+
+        // 5. Modified tracked file
+        fs::write(repo_path.join("file1.txt"), "hello modified").unwrap();
+        let info = adapter.inspect_repo(repo_path).unwrap();
+        assert_eq!(info.status.unstaged, 1);
+        assert!(!info.status.is_clean);
+
+        // 6. Path with spaces
+        let space_dir = tempdir().unwrap();
+        let space_repo = space_dir.path().join("path with spaces");
+        fs::create_dir_all(&space_repo).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&space_repo)
+            .output()
+            .unwrap();
+        let space_resolved = adapter.resolve_repo_root(&space_repo).unwrap();
+        assert_eq!(space_resolved, space_repo.canonicalize().unwrap());
     }
 }
