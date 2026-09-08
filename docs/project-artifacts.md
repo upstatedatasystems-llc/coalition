@@ -109,42 +109,55 @@ Updating `project.yaml` via `ArtifactManager::write_project_yaml_atomic` guarant
 
 ## Stage 2A: Architecture Workspace & Canonical Artifacts
 
-In Stage 2A, Coalition introduces the Architect relay workspace and governs the authoring of 9 canonical architecture and design artifacts.
+In Stage 2A, Coalition introduces the Architect relay workspace and governs the authoring of canonical architecture and design artifacts.
 
 ### Canonical Artifacts Allowlist
 
-Only files within this allowlist may be drafted or modified through the Architect relay:
+Only files within this allowlist may be drafted, imported, or manually edited through the Architect workspace:
 
-1. `design/product-vision.md` — Product Vision & Strategic Goals
-2. `design/requirements.md` — Functional & Non-Functional Requirements
-3. `design/architecture.md` — System Architecture & Component Design
-4. `design/constraints.md` — Technical & Operational Constraints
-5. `design/interfaces.md` — Interfaces, IPC Protocols & Typed Contracts
-6. `design/security.md` — Security Model, Invariants & Boundaries
-7. `implementation/validation.yaml` — Deterministic Validation Commands
-8. `implementation/acceptance-criteria.yaml` — Measurable Acceptance Criteria
-9. `implementation/test-plan.md` — Testing Strategy & Verification Plan
+1. `design/product-vision.md` — Product Vision & Strategic Goals (Required)
+2. `design/requirements.md` — Functional & Non-Functional Requirements (Required)
+3. `design/architecture.md` — System Architecture & Component Design (Required)
+4. `design/constraints.md` — Technical & Operational Constraints (Required)
+5. `design/interfaces.md` — Interfaces, IPC Protocols & Typed Contracts (Required)
+6. `design/security.md` — Security Model, Invariants & Boundaries (Required)
+7. `implementation/implementation-plan.md` — Phased Delivery & Testing Milestones (Required)
+8. `implementation/acceptance-criteria.yaml` — Measurable Acceptance Criteria (Required)
+9. `implementation/test-plan.md` — Testing Strategy & Verification Plan (Required)
+10. `design/open-questions.md` — Architectural Open Questions & Decisions (Optional)
 
-Any relay proposal targeting a path outside this allowlist is rejected with `INVALID_ARTIFACT_PATH`. Any path containing relative path traversals (`..`), drive letters, or absolute paths is rejected with `PATH_TRAVERSAL_DETECTED`.
+Any relay proposal or manual save targeting a path outside this allowlist is rejected with `INVALID_ARTIFACT_PATH`. Any path containing relative path traversals (`..`), drive letters, or absolute paths is rejected with `PATH_TRAVERSAL_DETECTED`.
 
-### Readiness Evaluation Rules
+### Versioned Readiness Policy (v1)
 
-Coalition evaluates artifact readiness directly from the disk:
+Readiness rules are explicit, versioned (`policy_version: 1`), and evaluate substantive artifact content rather than arbitrary length thresholds:
 
-- **MISSING**: The file does not exist on disk.
-- **INCOMPLETE**: The file exists on disk, but contains fewer than 50 characters of substantive content.
-- **READY**: The file exists on disk and contains 50 or more characters of substantive content.
+- **Applicability**:
+  - `REQUIRED`: The 9 core specification artifacts must all reach `READY` status before the project can transition to `READY_TO_FREEZE`.
+  - `OPTIONAL`: Supporting artifacts (e.g. `design/open-questions.md`) do not block `READY_TO_FREEZE`, but unresolved open questions are highlighted prominently in the UI.
+- **Substantive Markdown Evaluation**:
+  - Strips Markdown headings (`#`), HTML comments (`<!-- ... -->`), and horizontal rules (`---`).
+  - Detects template and placeholder tokens (`TODO`, `TBD`, `[placeholder]`, `lorem`, `wip`, `draft`).
+  - Requires meaningful non-placeholder words and characters.
+- **Structured YAML Evaluation**:
+  - Parses `implementation/acceptance-criteria.yaml` using a structured YAML parser.
+  - Verifies that the document contains a valid YAML mapping or sequence with substantive criteria rather than placeholder scalars.
+- **Status Codes**:
+  - `MISSING`: The file does not exist in `.coalition/`.
+  - `INCOMPLETE`: The file exists but contains only headings, empty boilerplate, or placeholder tokens.
+  - `READY`: The file contains substantive, validated architecture content.
 
-Overall project readiness is evaluated as:
-- `READY_TO_FREEZE`: All 9 canonical artifacts have status `READY`.
-- `INCOMPLETE`: Any artifact is `MISSING` or `INCOMPLETE`.
+Overall project readiness:
+- `READY_TO_FREEZE`: All required artifacts have status `READY`.
+- `INCOMPLETE`: One or more required artifacts are `MISSING` or `INCOMPLETE`.
 
-### Atomic File Operations
+### Crash-Safe Batch Import Protocol & Recovery
 
-Architecture artifacts are written using `ArtifactManager::write_artifact_atomic`:
-1. Strict path containment and canonical allowlist validation before touching the filesystem.
-2. Staging in `<path>.tmp.<uuid>` with explicit descriptor flush (`sync_all()`).
-3. Safe platform-native atomic replacement:
-   - **Windows**: `ReplaceFileW` with `<path>.bak.<uuid>` backup reconciliation.
-   - **POSIX**: Directory synchronization and atomic file rename.
-4. Backup cleanup only after successful post-replacement validation.
+Importing multi-file architect proposals follows a durable journal protocol:
+1. **Durable Journaling**: Operation steps and baseline fingerprints are recorded in SQLite table `relay_import_batch_journal` (`phase: 'STAGING'`).
+2. **Staged Writes**: Content is written to temporary files (`staged.<path>.tmp.<uuid>`) with `sync_all()`.
+3. **Deterministic Commit**: Files are committed in alphabetical order. For `MODIFY` and `DELETE`, same-directory `.bak.<uuid>` backups are created and recorded before atomic file replacement.
+4. **Recovery Reconciliation**: If interrupted mid-commit, `reconcile_interrupted_batches` runs at startup:
+   - If interrupted in `COMMITTING`, rolls back to pre-import state using the `.bak.<uuid>` files.
+   - If interrupted in `COMMITTED`, cleans up backups and updates operational database state.
+5. **Governed Manual Editing**: Saves verify expected SHA-256 fingerprints to guard against external disk modifications and prevent concurrency conflicts.

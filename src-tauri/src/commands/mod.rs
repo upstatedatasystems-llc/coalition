@@ -1,5 +1,5 @@
 use crate::core::activity::{ActivityEventRecord, ActivityManager};
-use crate::core::artifacts::{ArtifactError, ArtifactManager};
+use crate::core::artifacts::ArtifactError;
 use crate::core::builder::{
     AgyEvent, AntigravityCliAdapter, BuilderTurnRequest, BuilderTurnResponse, ModelInfo,
 };
@@ -7,7 +7,8 @@ use crate::core::git::{GitAdapter, GitError, GitRepoInfo};
 use crate::core::projects::{ProjectDetails, ProjectError, ProjectService, ProjectSummary};
 use crate::core::relay::readiness::ReadinessReport;
 use crate::core::relay::{
-    ImportPreview, RelayError, RelayHistoryItem, RelayPacket, RelayService, WorkspaceState,
+    ArtifactContentDetails, ImportPreview, RelayError, RelayHistoryItem, RelayPacket, RelayService,
+    WorkspaceState,
 };
 use crate::core::workflow::{self, WorkflowAction, WorkflowError, WorkflowStateRecord};
 use crate::db::{DbError, DbManager, ProofResult};
@@ -178,6 +179,36 @@ impl From<RelayError> for CommandError {
             RelayError::Database(msg) => Self::new("DATABASE_ERROR", msg),
             RelayError::Artifact(msg) => Self::new("ARTIFACT_ERROR", msg),
             RelayError::Workflow(msg) => Self::new("WORKFLOW_ERROR", msg),
+            RelayError::IllegalWorkflowState { current, operation } => Self::with_details(
+                "ILLEGAL_WORKFLOW_STATE",
+                format!(
+                    "Cannot perform operation '{}' while project is in workflow state {}",
+                    operation, current
+                ),
+                serde_json::json!({ "current": current, "operation": operation }),
+            ),
+            RelayError::NoPendingPacket(p) => Self::new(
+                "NO_PENDING_PACKET",
+                format!("No pending relay packet for project {}", p),
+            ),
+            RelayError::PacketAlreadyImported(p) => Self::new(
+                "PACKET_ALREADY_IMPORTED",
+                format!("Packet {} has already been imported", p),
+            ),
+            RelayError::PacketSuperseded(p) => Self::new(
+                "PACKET_SUPERSEDED",
+                format!("Packet {} has been superseded", p),
+            ),
+            RelayError::ImportAlreadyPending(id) => Self::with_details(
+                "IMPORT_ALREADY_PENDING",
+                format!("An import is already pending review: {}", id),
+                serde_json::json!({ "import_id": id }),
+            ),
+            RelayError::ImportAlreadyAccepted(id) => Self::new(
+                "IMPORT_ALREADY_ACCEPTED",
+                format!("Import {} has already been accepted", id),
+            ),
+            RelayError::DuplicateImport(msg) => Self::new("DUPLICATE_IMPORT", msg),
             RelayError::UnrelatedContent(msg) => Self::new("UNRELATED_CLIPBOARD_CONTENT", msg),
             RelayError::ParseError(msg) => Self::new("RELAY_PARSE_ERROR", msg),
             RelayError::SchemaError(msg) => Self::new("RELAY_SCHEMA_ERROR", msg),
@@ -205,6 +236,33 @@ impl From<RelayError> for CommandError {
                 ),
                 serde_json::json!({ "path": p }),
             ),
+            RelayError::StaleImportPreview { path, details } => Self::with_details(
+                "STALE_IMPORT_PREVIEW",
+                format!(
+                    "Target '{}' changed on disk since preview was generated: {}",
+                    path, details
+                ),
+                serde_json::json!({ "path": path, "details": details }),
+            ),
+            RelayError::StaleArtifactContent { path, details } => Self::with_details(
+                "STALE_ARTIFACT_CONTENT",
+                format!(
+                    "Artifact '{}' was modified since last read: {}",
+                    path, details
+                ),
+                serde_json::json!({ "path": path, "details": details }),
+            ),
+            RelayError::ActionSemanticConflict { path, details } => Self::with_details(
+                "ACTION_SEMANTIC_CONFLICT",
+                format!("Action semantic conflict for '{}': {}", path, details),
+                serde_json::json!({ "path": path, "details": details }),
+            ),
+            RelayError::InvalidYamlContent { path, error } => Self::with_details(
+                "INVALID_YAML_CONTENT",
+                format!("Invalid YAML syntax in '{}': {}", path, error),
+                serde_json::json!({ "path": path, "error": error }),
+            ),
+            RelayError::BatchRecoveryRequired(msg) => Self::new("BATCH_RECOVERY_REQUIRED", msg),
             RelayError::ParseFailure {
                 import_id,
                 raw_content,
@@ -220,6 +278,8 @@ impl From<RelayError> for CommandError {
             RelayError::AlreadyDecided(s) => {
                 Self::new("IMPORT_ALREADY_DECIDED", format!("Import already {}", s))
             }
+            #[cfg(test)]
+            RelayError::InjectedFailure(msg) => Self::new("INJECTED_FAILURE", msg),
         }
     }
 }
@@ -272,8 +332,19 @@ pub async fn register_or_open_project(
     let git = git_lock.as_ref().unwrap();
 
     let mut db = state.db.lock().await;
-    ProjectService::register_or_open_project(db.connection_mut(), git, path)
-        .map_err(CommandError::from)
+    let details = ProjectService::register_or_open_project(db.connection_mut(), git, path)
+        .map_err(CommandError::from)?;
+
+    if details.is_available {
+        let repo_path = PathBuf::from(&details.project.repository_path);
+        let _ = RelayService::reconcile_interrupted_batches(
+            db.connection(),
+            &repo_path,
+            &details.project.project_id,
+        );
+    }
+
+    Ok(details)
 }
 
 #[tauri::command]
@@ -289,8 +360,20 @@ pub async fn get_project_details(
         }
     }
 
-    ProjectService::get_project_details(db.connection(), git_lock.as_ref(), &project_id)
-        .map_err(CommandError::from)
+    let details =
+        ProjectService::get_project_details(db.connection(), git_lock.as_ref(), &project_id)
+            .map_err(CommandError::from)?;
+
+    if details.is_available {
+        let repo_path = PathBuf::from(&details.project.repository_path);
+        let _ = RelayService::reconcile_interrupted_batches(
+            db.connection(),
+            &repo_path,
+            &details.project.project_id,
+        );
+    }
+
+    Ok(details)
 }
 
 #[tauri::command]
@@ -566,6 +649,35 @@ pub async fn desktop_open_url(url: String) -> Result<(), CommandError> {
     Ok(())
 }
 
+/// Narrows opening to strictly ChatGPT without arbitrary URL-opening capability.
+#[tauri::command]
+pub async fn open_chatgpt() -> Result<(), CommandError> {
+    let url = "https://chatgpt.com";
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn()
+            .map_err(|e| CommandError::new("URL_OPEN_ERROR", e.to_string()))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| CommandError::new("URL_OPEN_ERROR", e.to_string()))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| CommandError::new("URL_OPEN_ERROR", e.to_string()))?;
+    }
+
+    Ok(())
+}
+
 // ----------------------------------------------------------------------------
 // Stage 2A ChatGPT Relay & Architecture Commands
 // ----------------------------------------------------------------------------
@@ -723,8 +835,29 @@ pub async fn get_artifact_content(
     state: State<'_, AppState>,
     project_id: String,
     artifact_path: String,
-) -> Result<Option<String>, CommandError> {
+) -> Result<ArtifactContentDetails, CommandError> {
     let db = state.db.lock().await;
     let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
-    ArtifactManager::read_artifact(&repo_path, &artifact_path).map_err(CommandError::from)
+    RelayService::get_artifact_content(&repo_path, &artifact_path).map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn save_artifact_content(
+    state: State<'_, AppState>,
+    project_id: String,
+    artifact_path: String,
+    content: String,
+    expected_fingerprint: Option<String>,
+) -> Result<ReadinessReport, CommandError> {
+    let db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    RelayService::save_artifact_content(
+        db.connection(),
+        &repo_path,
+        &project_id,
+        &artifact_path,
+        &content,
+        expected_fingerprint.as_deref(),
+    )
+    .map_err(CommandError::from)
 }

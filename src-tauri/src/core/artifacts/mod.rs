@@ -668,6 +668,41 @@ impl ArtifactManager {
 
         Ok(true)
     }
+
+    /// Computes SHA-256 fingerprint hex of an architecture artifact, or returns None if file does not exist.
+    pub fn compute_file_fingerprint<P: AsRef<Path>>(
+        repo_root: P,
+        relative_path: &str,
+    ) -> Result<Option<String>, ArtifactError> {
+        let normalized = relative_path.replace('\\', "/");
+        if !Self::is_valid_architecture_artifact_path(&normalized) {
+            return Err(ArtifactError::PathTraversal {
+                path: relative_path.to_string(),
+                root: repo_root.as_ref().to_string_lossy().to_string(),
+            });
+        }
+
+        let coalition_dir = Self::resolve_coalition_dir(repo_root.as_ref())?;
+        let target_path = coalition_dir.join(&normalized);
+
+        if !target_path.exists() {
+            return Ok(None);
+        }
+
+        Self::validate_safe_path(repo_root.as_ref(), &target_path)?;
+        let bytes = fs::read(&target_path).map_err(|e| {
+            ArtifactError::Io(format!(
+                "Failed to read artifact {:?} for fingerprint: {}",
+                target_path, e
+            ))
+        })?;
+
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let hash = format!("{:x}", hasher.finalize());
+        Ok(Some(hash))
+    }
 }
 
 #[cfg(test)]

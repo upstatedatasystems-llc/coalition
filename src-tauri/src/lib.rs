@@ -38,8 +38,39 @@ pub fn run() {
             };
 
             app.manage(state);
+
+            #[cfg(desktop)]
+            {
+                use std::str::FromStr;
+                use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
+                if let Ok(shortcut_r) = Shortcut::from_str("CommandOrControl+Shift+R") {
+                    let _ = app.global_shortcut().register(shortcut_r);
+                }
+                if let Ok(shortcut_i) = Shortcut::from_str("CommandOrControl+Shift+I") {
+                    let _ = app.global_shortcut().register(shortcut_i);
+                }
+            }
+
             Ok(())
         })
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    use tauri::Emitter;
+                    use tauri_plugin_global_shortcut::ShortcutState;
+                    if event.state() == ShortcutState::Pressed {
+                        let shortcut_str = shortcut.to_string();
+                        if shortcut_str.contains("Shift+KeyR") || shortcut_str.contains("Shift+R") {
+                            let _ = app.emit("coalition:shortcut-copy-relay", ());
+                        } else if shortcut_str.contains("Shift+KeyI")
+                            || shortcut_str.contains("Shift+I")
+                        {
+                            let _ = app.emit("coalition:shortcut-import-clipboard", ());
+                        }
+                    }
+                })
+                .build(),
+        )
         .invoke_handler(tauri::generate_handler![
             commands::list_projects,
             commands::register_or_open_project,
@@ -55,6 +86,7 @@ pub fn run() {
             commands::desktop_clipboard_write,
             commands::desktop_clipboard_read,
             commands::desktop_open_url,
+            commands::open_chatgpt,
             commands::prepare_architect_relay_packet,
             commands::get_pending_relay_packet,
             commands::get_relay_history,
@@ -65,6 +97,7 @@ pub fn run() {
             commands::reject_relay_import,
             commands::get_architecture_workspace_state,
             commands::get_artifact_content,
+            commands::save_artifact_content,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

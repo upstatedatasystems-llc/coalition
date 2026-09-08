@@ -6,6 +6,7 @@ import {
   ImportPreview,
   ReadinessReport,
   ArtifactReadinessItem,
+  ArtifactContentDetails,
   CommandError,
 } from '../../types';
 
@@ -36,11 +37,15 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
   } | null>(null);
   const [editedRecoveryText, setEditedRecoveryText] = useState('');
 
-  // Selected artifact content viewer
+  // Selected artifact content viewer and editor
   const [viewingArtifact, setViewingArtifact] = useState<{
     path: string;
     title: string;
     content: string;
+    fingerprint?: string | null;
+    isEditing: boolean;
+    editedContent: string;
+    saveError: string | null;
   } | null>(null);
 
   const loadWorkspaceState = useCallback(async () => {
@@ -95,7 +100,7 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
 
   const handleOpenChatGPT = async () => {
     try {
-      await invoke('desktop_open_url', { url: 'https://chatgpt.com' });
+      await invoke('open_chatgpt');
     } catch (err: unknown) {
       setErrorMessage(formatError(err));
     }
@@ -196,21 +201,58 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
 
   const handleViewArtifactContent = async (item: ArtifactReadinessItem) => {
     try {
-      const content = await invoke<string | null>('get_artifact_content', {
+      const result = await invoke<ArtifactContentDetails | string | null>('get_artifact_content', {
         projectId,
         artifactPath: item.path,
       });
+      const content = typeof result === 'string' ? result : (result?.content || '');
+      const fingerprint = typeof result === 'object' && result !== null ? result.fingerprint : null;
       setViewingArtifact({
         path: item.path,
         title: item.title,
         content: content || '(File is currently empty)',
+        fingerprint,
+        isEditing: false,
+        editedContent: content,
+        saveError: null,
       });
     } catch (err: unknown) {
       setErrorMessage(formatError(err));
     }
   };
 
-  // Keyboard shortcuts: Ctrl+Shift+R to copy, Ctrl+Shift+I to import
+  const handleSaveArtifactContent = async () => {
+    if (!viewingArtifact) return;
+    setIsLoading(true);
+    setViewingArtifact((prev) => (prev ? { ...prev, saveError: null } : null));
+    try {
+      await invoke<ReadinessReport>('save_artifact_content', {
+        projectId,
+        path: viewingArtifact.path,
+        content: viewingArtifact.editedContent,
+        expectedFingerprint: viewingArtifact.fingerprint,
+      });
+      setViewingArtifact((prev) =>
+        prev
+          ? {
+              ...prev,
+              content: prev.editedContent,
+              isEditing: false,
+              saveError: null,
+            }
+          : null
+      );
+      await loadWorkspaceState();
+      await onRefreshProject();
+    } catch (err: unknown) {
+      const formatted = formatError(err);
+      setViewingArtifact((prev) => (prev ? { ...prev, saveError: formatted } : null));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Keyboard shortcuts: in-window Ctrl+Shift+R and Ctrl+Shift+I, and Tauri global shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.shiftKey) {
@@ -224,7 +266,29 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
       }
     };
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+
+    let unlistenCopy: (() => void) | undefined;
+    let unlistenImport: (() => void) | undefined;
+    const registerGlobalShortcuts = async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+        unlistenCopy = await listen('coalition:shortcut-copy-relay', () => {
+          handleCopyPacket();
+        });
+        unlistenImport = await listen('coalition:shortcut-import-clipboard', () => {
+          handleImportClipboard();
+        });
+      } catch (_e) {
+        // Ignored in non-Tauri / test environments
+      }
+    };
+    registerGlobalShortcuts();
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      if (unlistenCopy) unlistenCopy();
+      if (unlistenImport) unlistenImport();
+    };
   }, [handleCopyPacket, handleImportClipboard]);
 
   const formatError = (err: unknown): string => {
@@ -430,16 +494,23 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
                 className={`readiness-badge readiness-${workspace.readiness.overall_readiness.toLowerCase()}`}
               >
                 {workspace.readiness.overall_readiness === 'READY_TO_FREEZE'
-                  ? 'READY TO FREEZE (9/9)'
-                  : `INCOMPLETE (${workspace.readiness.ready_count}/${workspace.readiness.total_required})`}
+                  ? `READY TO FREEZE (${workspace.readiness.ready_required_count ?? workspace.readiness.ready_count ?? 0}/${workspace.readiness.total_required_count ?? workspace.readiness.total_required ?? 0})`
+                  : `INCOMPLETE (${workspace.readiness.ready_required_count ?? workspace.readiness.ready_count ?? 0}/${workspace.readiness.total_required_count ?? workspace.readiness.total_required ?? 0})`}
               </span>
             )}
           </div>
 
           <p className="readiness-guidance">
-            Architecture contracts are drafted and reviewed in this workspace. All 9 required design
-            artifacts must reach substantive readiness before the human can authorize freeze.
+            Architecture contracts are drafted and reviewed in this workspace. All required architecture
+            artifacts ({workspace?.readiness?.ready_required_count ?? workspace?.readiness?.ready_count ?? 0}/{workspace?.readiness?.total_required_count ?? workspace?.readiness?.total_required ?? 0})
+            must reach substantive readiness (Readiness Policy v{workspace?.readiness?.policy_version ?? 1}) before the human can authorize freeze.
           </p>
+
+          {Boolean(workspace?.readiness?.unresolved_open_questions_count && workspace.readiness.unresolved_open_questions_count > 0) && (
+            <div className="open-questions-warning-banner" role="alert">
+              <strong>⚠️ Open Questions ({workspace?.readiness?.unresolved_open_questions_count} unresolved):</strong> Unresolved architectural questions remain in <code>design/open-questions.md</code>.
+            </div>
+          )}
 
           <div className="artifacts-readiness-list">
             {workspace?.readiness?.artifacts?.map((art) => {
@@ -469,14 +540,18 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
                     </span>
                     <div className="card-titles">
                       <span className="artifact-title">{art.title}</span>
+                      <span className={`applicability-badge badge-${(art.applicability || 'REQUIRED').toLowerCase()}`}>
+                        {art.applicability || 'REQUIRED'}
+                      </span>
                       <code className="artifact-path">{art.path}</code>
+                      {art.details && <span className="artifact-details-hint">{art.details}</span>}
                     </div>
                   </div>
                   <div className="card-right">
                     <span className="char-count">
                       {isMissing ? 'Missing' : `${art.character_count} chars`}
                     </span>
-                    <span className="view-link">View ↗</span>
+                    <span className="view-link">View / Edit ↗</span>
                   </div>
                 </div>
               );
@@ -485,7 +560,7 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
         </section>
       </div>
 
-      {/* Artifact Content Viewer Modal */}
+      {/* Artifact Content Viewer / Editor Modal */}
       {viewingArtifact && (
         <div className="modal-overlay" onClick={() => setViewingArtifact(null)}>
           <div
@@ -496,17 +571,80 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
           >
             <div className="modal-header">
               <h2 id="modal-artifact-title">{viewingArtifact.title}</h2>
-              <button
-                className="modal-close-btn"
-                onClick={() => setViewingArtifact(null)}
-                aria-label="Close"
-              >
-                ✕
-              </button>
+              <div className="modal-header-actions">
+                {!viewingArtifact.isEditing ? (
+                  <button
+                    className="secondary-btn edit-artifact-btn"
+                    onClick={() =>
+                      setViewingArtifact({
+                        ...viewingArtifact,
+                        isEditing: true,
+                        editedContent: viewingArtifact.content === '(File is currently empty)' ? '' : viewingArtifact.content,
+                        saveError: null,
+                      })
+                    }
+                  >
+                    Edit
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      className="primary-btn save-artifact-btn"
+                      onClick={handleSaveArtifactContent}
+                      disabled={isLoading}
+                    >
+                      Save
+                    </button>
+                    <button
+                      className="secondary-btn cancel-edit-btn"
+                      onClick={() =>
+                        setViewingArtifact({
+                          ...viewingArtifact,
+                          isEditing: false,
+                          editedContent: viewingArtifact.content,
+                          saveError: null,
+                        })
+                      }
+                      disabled={isLoading}
+                    >
+                      Cancel
+                    </button>
+                  </>
+                )}
+                <button
+                  className="modal-close-btn"
+                  onClick={() => setViewingArtifact(null)}
+                  aria-label="Close"
+                >
+                  ✕
+                </button>
+              </div>
             </div>
+
+            {viewingArtifact.saveError && (
+              <div className="artifact-edit-error-banner" role="alert">
+                {viewingArtifact.saveError}
+              </div>
+            )}
+
             <div className="modal-body">
               <p className="artifact-modal-path"><code>{viewingArtifact.path}</code></p>
-              <pre className="artifact-modal-content">{viewingArtifact.content}</pre>
+              {viewingArtifact.isEditing ? (
+                <textarea
+                  className="artifact-content-editor"
+                  aria-label="Artifact Content Editor"
+                  rows={18}
+                  value={viewingArtifact.editedContent}
+                  onChange={(e) =>
+                    setViewingArtifact({
+                      ...viewingArtifact,
+                      editedContent: e.target.value,
+                    })
+                  }
+                />
+              ) : (
+                <pre className="artifact-modal-content">{viewingArtifact.content}</pre>
+              )}
             </div>
           </div>
         </div>

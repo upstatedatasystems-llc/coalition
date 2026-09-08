@@ -178,6 +178,8 @@ export interface ArtifactPreviewItem {
   status: ArtifactDiffStatus;
   current_content?: string | null;
   proposed_content: string;
+  baseline_fingerprint?: string | null;
+  baseline_exists?: boolean;
 }
 
 export type OpenQuestionStatus = 'OPEN' | 'RESOLVED';
@@ -201,20 +203,36 @@ export interface ImportPreview {
 
 export type ArtifactReadinessStatus = 'MISSING' | 'INCOMPLETE' | 'READY';
 export type OverallReadiness = 'INCOMPLETE' | 'READY_TO_FREEZE';
+export type ArtifactApplicability = 'REQUIRED' | 'OPTIONAL';
 
 export interface ArtifactReadinessItem {
   path: string;
   title: string;
+  applicability?: ArtifactApplicability;
   status: ArtifactReadinessStatus;
   character_count: number;
+  details?: string | null;
 }
 
 export interface ReadinessReport {
+  policy_version?: number;
   overall_readiness: OverallReadiness;
-  ready_count: number;
-  total_required: number;
+  ready_required_count?: number;
+  total_required_count?: number;
+  total_artifacts_count?: number;
   artifacts: ArtifactReadinessItem[];
   has_open_questions: boolean;
+  unresolved_open_questions_count?: number;
+  // Deprecated / backwards compatibility aliases
+  ready_count?: number;
+  total_required?: number;
+}
+
+export interface ArtifactContentDetails {
+  path: string;
+  content: string;
+  fingerprint?: string | null;
+  exists: boolean;
 }
 
 export interface RelayHistoryItem {

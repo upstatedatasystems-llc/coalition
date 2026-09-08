@@ -363,7 +363,17 @@ pub fn apply_workflow_action_tx(
     action: WorkflowAction,
     actor: &str,
 ) -> Result<WorkflowStateRecord, WorkflowError> {
-    let row: Option<(String, Option<String>, i64)> = tx
+    apply_workflow_action_conn(tx, project_id, action, actor)
+}
+
+/// Applies a workflow action against any &Connection (or &Transaction via Deref).
+pub fn apply_workflow_action_conn(
+    conn: &Connection,
+    project_id: &str,
+    action: WorkflowAction,
+    actor: &str,
+) -> Result<WorkflowStateRecord, WorkflowError> {
+    let row: Option<(String, Option<String>, i64)> = conn
         .query_row(
             "SELECT state, resume_state, revision FROM workflow_state WHERE project_id = ?1",
             params![project_id],
@@ -388,7 +398,7 @@ pub fn apply_workflow_action_tx(
     let now = chrono::Utc::now().to_rfc3339();
     let new_resume_str = new_resume_state.map(|s| s.to_string());
 
-    tx.execute(
+    conn.execute(
         "UPDATE workflow_state SET state = ?1, resume_state = ?2, revision = ?3, updated_at = ?4 WHERE project_id = ?5",
         params![new_state.to_string(), new_resume_str, new_revision, now, project_id],
     )
@@ -405,7 +415,7 @@ pub fn apply_workflow_action_tx(
         "revision": new_revision,
     });
 
-    tx.execute(
+    conn.execute(
         "INSERT INTO activity_events (project_id, timestamp, event_type, actor, summary, metadata_json)
          VALUES (?1, ?2, 'WORKFLOW_TRANSITION', ?3, ?4, ?5)",
         params![project_id, now, actor, summary, metadata.to_string()],

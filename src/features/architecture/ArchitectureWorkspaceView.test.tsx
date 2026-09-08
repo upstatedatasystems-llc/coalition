@@ -209,9 +209,7 @@ describe('ArchitectureWorkspaceView', () => {
       fireEvent.click(openBtn);
     });
 
-    expect(mockInvoke).toHaveBeenCalledWith('desktop_open_url', {
-      url: 'https://chatgpt.com',
-    });
+    expect(mockInvoke).toHaveBeenCalledWith('open_chatgpt');
   });
 
   it('imports clipboard response and allows accepting proposed changes', async () => {
@@ -473,5 +471,160 @@ describe('ArchitectureWorkspaceView', () => {
     expect(mockInvoke).toHaveBeenCalledWith('import_from_clipboard', {
       projectId: 'test-proj-1',
     });
+  });
+
+  it('allows manual editing and saving artifact with expected fingerprint', async () => {
+    mockInvoke.mockImplementation(async (cmd: string, _args: Record<string, unknown>) => {
+      if (cmd === 'get_architecture_workspace_state') return mockInitialWorkspace;
+      if (cmd === 'get_artifact_content') {
+        return {
+          path: 'design/product-vision.md',
+          content: '# Vision\nExisting content',
+          fingerprint: 'fp-12345',
+          exists: true,
+        };
+      }
+      if (cmd === 'save_artifact_content') {
+        return {
+          overall_readiness: 'INCOMPLETE',
+          ready_required_count: 1,
+          total_required_count: 9,
+          artifacts: [],
+          has_open_questions: false,
+        };
+      }
+      return {};
+    });
+
+    await act(async () => {
+      render(
+        <ArchitectureWorkspaceView
+          projectId="test-proj-1"
+          projectName="Alpha Project"
+          workflowState="ARCHITECTING"
+          onRefreshProject={onRefreshMock}
+        />
+      );
+    });
+
+    // Open modal
+    const visionCard = screen.getByText('Product Vision');
+    await act(async () => {
+      fireEvent.click(visionCard);
+    });
+
+    expect(screen.getByText(/Existing content/)).toBeInTheDocument();
+
+    // Click Edit
+    const editBtn = screen.getByRole('button', { name: 'Edit' });
+    await act(async () => {
+      fireEvent.click(editBtn);
+    });
+
+    const editor = screen.getByLabelText('Artifact Content Editor');
+    expect(editor).toBeInTheDocument();
+
+    // Update content
+    await act(async () => {
+      fireEvent.change(editor, {
+        target: { value: '# Vision\nManually updated substantive content.' },
+      });
+    });
+
+    // Save
+    const saveBtn = screen.getByRole('button', { name: 'Save' });
+    await act(async () => {
+      fireEvent.click(saveBtn);
+    });
+
+    expect(mockInvoke).toHaveBeenCalledWith('save_artifact_content', {
+      projectId: 'test-proj-1',
+      path: 'design/product-vision.md',
+      content: '# Vision\nManually updated substantive content.',
+      expectedFingerprint: 'fp-12345',
+    });
+    expect(onRefreshMock).toHaveBeenCalled();
+  });
+
+  it('displays conflict error when saving stale artifact content', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_architecture_workspace_state') return mockInitialWorkspace;
+      if (cmd === 'get_artifact_content') {
+        return {
+          path: 'design/product-vision.md',
+          content: '# Vision\nInitial',
+          fingerprint: 'fp-stale',
+          exists: true,
+        };
+      }
+      if (cmd === 'save_artifact_content') {
+        throw {
+          code: 'STALE_ARTIFACT_CONTENT',
+          message: 'Artifact has been modified on disk by an external process',
+        };
+      }
+      return {};
+    });
+
+    await act(async () => {
+      render(
+        <ArchitectureWorkspaceView
+          projectId="test-proj-1"
+          projectName="Alpha Project"
+          workflowState="ARCHITECTING"
+          onRefreshProject={onRefreshMock}
+        />
+      );
+    });
+
+    const visionCard = screen.getByText('Product Vision');
+    await act(async () => {
+      fireEvent.click(visionCard);
+    });
+
+    const editBtn = screen.getByRole('button', { name: 'Edit' });
+    await act(async () => {
+      fireEvent.click(editBtn);
+    });
+
+    const saveBtn = screen.getByRole('button', { name: 'Save' });
+    await act(async () => {
+      fireEvent.click(saveBtn);
+    });
+
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      '[STALE_ARTIFACT_CONTENT] Artifact has been modified on disk by an external process'
+    );
+  });
+
+  it('displays open questions warning banner when unresolved questions exist', async () => {
+    const workspaceWithOpenQuestions: WorkspaceState = {
+      ...mockInitialWorkspace,
+      readiness: {
+        ...mockReadinessInitial,
+        has_open_questions: true,
+        unresolved_open_questions_count: 2,
+      },
+    };
+
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_architecture_workspace_state') return workspaceWithOpenQuestions;
+      return {};
+    });
+
+    await act(async () => {
+      render(
+        <ArchitectureWorkspaceView
+          projectId="test-proj-1"
+          projectName="Alpha Project"
+          workflowState="ARCHITECTING"
+          onRefreshProject={onRefreshMock}
+        />
+      );
+    });
+
+    expect(
+      screen.getByText(/Open Questions \(2 unresolved\):/)
+    ).toBeInTheDocument();
   });
 });
