@@ -136,3 +136,101 @@ export interface BuilderTurnResponse {
   duration_ms: number;
   events: AgyEvent[];
 }
+
+// Stage 2A ChatGPT Relay & Architecture Workspace Types
+export type RelayRole = 'ARCHITECT' | 'REVIEWER';
+
+export type RelayPacketType =
+  | 'ARCHITECT_INITIAL'
+  | 'ARCHITECT_UPDATE'
+  | 'ARCHITECTURE_REVISION'
+  | 'REVIEW_REQUEST'
+  | 'REVIEW_VERDICT'
+  | 'ARCHITECTURE_CONCERN_ANALYSIS';
+
+export type RelayExpectedResponse = 'ARCHITECT_UPDATE' | 'REVIEW_VERDICT';
+
+export interface RelayPacketMetadata {
+  schema: number;
+  project_id: string;
+  packet_id: string;
+  role: RelayRole;
+  packet_type: RelayPacketType;
+  architecture_version: string;
+  expected_response: RelayExpectedResponse;
+  created_at: string;
+}
+
+export interface RelayPacket {
+  metadata: RelayPacketMetadata;
+  prompt: string;
+  human_instructions: string;
+  project_context_summary: string;
+}
+
+export type ArtifactAction = 'CREATE' | 'MODIFY' | 'DELETE';
+export type ArtifactDiffStatus = 'NEW' | 'MODIFIED' | 'UNCHANGED' | 'DELETED';
+
+export interface ArtifactPreviewItem {
+  path: string;
+  title: string;
+  action: ArtifactAction;
+  status: ArtifactDiffStatus;
+  current_content?: string | null;
+  proposed_content: string;
+}
+
+export type OpenQuestionStatus = 'OPEN' | 'RESOLVED';
+
+export interface ProposedOpenQuestion {
+  id: string;
+  question: string;
+  status: OpenQuestionStatus;
+  resolution?: string | null;
+}
+
+export interface ImportPreview {
+  import_id: string;
+  packet_id: string;
+  project_id: string;
+  summary: string;
+  artifacts: ArtifactPreviewItem[];
+  open_questions: ProposedOpenQuestion[];
+  raw_response: string;
+}
+
+export type ArtifactReadinessStatus = 'MISSING' | 'INCOMPLETE' | 'READY';
+export type OverallReadiness = 'INCOMPLETE' | 'READY_TO_FREEZE';
+
+export interface ArtifactReadinessItem {
+  path: string;
+  title: string;
+  status: ArtifactReadinessStatus;
+  character_count: number;
+}
+
+export interface ReadinessReport {
+  overall_readiness: OverallReadiness;
+  ready_count: number;
+  total_required: number;
+  artifacts: ArtifactReadinessItem[];
+  has_open_questions: boolean;
+}
+
+export interface RelayHistoryItem {
+  id: string;
+  packet_id?: string | null;
+  project_id: string;
+  item_type: string;
+  summary: string;
+  status: string;
+  created_at: string;
+  error_message?: string | null;
+}
+
+export interface WorkspaceState {
+  pending_packet?: RelayPacket | null;
+  pending_preview?: ImportPreview | null;
+  readiness: ReadinessReport;
+  history: RelayHistoryItem[];
+}

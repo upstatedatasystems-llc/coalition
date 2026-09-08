@@ -111,6 +111,33 @@ impl DbManager {
                     value TEXT NOT NULL
                 );",
             ),
+            (
+                3,
+                "003_phase2a_relay_persistence",
+                "CREATE TABLE IF NOT EXISTS relay_packets (
+                    packet_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    packet_type TEXT NOT NULL,
+                    architecture_version TEXT NOT NULL,
+                    expected_response TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS relay_imports (
+                    import_id TEXT PRIMARY KEY,
+                    packet_id TEXT REFERENCES relay_packets(packet_id) ON DELETE SET NULL,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    raw_content TEXT NOT NULL,
+                    parsed_payload_json TEXT,
+                    parse_status TEXT NOT NULL,
+                    error_message TEXT,
+                    decision TEXT,
+                    imported_at TEXT NOT NULL,
+                    decided_at TEXT
+                );",
+            ),
         ];
 
         let mut applied = Vec::new();
@@ -178,9 +205,10 @@ mod tests {
     fn test_sqlite_in_memory_migrations_and_proof() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let result = db.run_proof().expect("run proof");
-        assert_eq!(result.applied_migrations.len(), 2);
+        assert_eq!(result.applied_migrations.len(), 3);
         assert_eq!(result.applied_migrations[0].version, 1);
         assert_eq!(result.applied_migrations[1].version, 2);
+        assert_eq!(result.applied_migrations[2].version, 3);
         assert_eq!(result.test_record_id, 1);
         assert_eq!(result.total_records, 1);
 
@@ -238,8 +266,9 @@ mod tests {
 
         let mut db = DbManager { conn };
         let applied = db.run_migrations().expect("run forward migrations");
-        assert_eq!(applied.len(), 1);
+        assert_eq!(applied.len(), 2);
         assert_eq!(applied[0].version, 2);
+        assert_eq!(applied[1].version, 3);
 
         // Verify Phase 0 data preserved
         let count: i64 = db
@@ -260,13 +289,22 @@ mod tests {
                 [],
             )
             .unwrap();
+
+        // Verify Phase 2A tables exist and are usable
+        db.connection()
+            .execute(
+                "INSERT INTO relay_packets (packet_id, project_id, role, packet_type, architecture_version, expected_response, prompt, created_at, status)
+                 VALUES ('pkt1', 'p1', 'ARCHITECT', 'ARCHITECT_INITIAL', 'draft', 'ARCHITECT_UPDATE', 'Test prompt', '2026-09-08T00:00:00Z', 'PENDING')",
+                [],
+            )
+            .unwrap();
     }
 
     #[test]
     fn test_migrations_already_migrated_is_idempotent() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let applied1 = db.run_migrations().expect("first migration run");
-        assert_eq!(applied1.len(), 2);
+        assert_eq!(applied1.len(), 3);
 
         let applied2 = db.run_migrations().expect("second migration run");
         assert_eq!(applied2.len(), 0);

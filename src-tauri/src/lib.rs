@@ -55,6 +55,16 @@ pub fn run() {
             commands::desktop_clipboard_write,
             commands::desktop_clipboard_read,
             commands::desktop_open_url,
+            commands::prepare_architect_relay_packet,
+            commands::get_pending_relay_packet,
+            commands::get_relay_history,
+            commands::copy_relay_packet_to_clipboard,
+            commands::import_from_clipboard,
+            commands::retry_parse_import,
+            commands::accept_relay_import,
+            commands::reject_relay_import,
+            commands::get_architecture_workspace_state,
+            commands::get_artifact_content,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

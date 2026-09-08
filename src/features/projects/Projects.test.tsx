@@ -152,7 +152,12 @@ describe('Phase 1 Project Dashboard Frontend', () => {
       fireEvent.click(card);
     });
 
-    // Detail view rendered
+    // Detail view rendered - switch to Overview & Activity subtab
+    const overviewTab = screen.getByRole('button', { name: 'Overview & Activity' });
+    await act(async () => {
+      fireEvent.click(overviewTab);
+    });
+
     expect(screen.getByText('Durable Architecture Contract')).toBeInTheDocument();
     expect(screen.getByText('Git Repository State')).toBeInTheDocument();
     expect(screen.getByText('Recent Activity')).toBeInTheDocument();
@@ -211,7 +216,12 @@ describe('Phase 1 Project Dashboard Frontend', () => {
       render(<App />);
     });
 
-    // Sample Alpha should be directly opened on startup
+    // Sample Alpha should be directly opened on startup - switch to Overview tab to verify contract
+    const overviewTab = screen.getByRole('button', { name: 'Overview & Activity' });
+    await act(async () => {
+      fireEvent.click(overviewTab);
+    });
+
     expect(screen.getByText('Durable Architecture Contract')).toBeInTheDocument();
     expect(screen.getByText('p-1')).toBeInTheDocument();
 

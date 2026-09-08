@@ -106,3 +106,45 @@ Updating `project.yaml` via `ArtifactManager::write_project_yaml_atomic` guarant
    - Coalition returns `artifact: None` in `ProjectDetails`.
    - The system never fabricates a synthetic or assumed "Draft" contract.
    - The UI visibly alerts the user that durable architecture state exists only in `.coalition/project.yaml` and is currently offline.
+
+## Stage 2A: Architecture Workspace & Canonical Artifacts
+
+In Stage 2A, Coalition introduces the Architect relay workspace and governs the authoring of 9 canonical architecture and design artifacts.
+
+### Canonical Artifacts Allowlist
+
+Only files within this allowlist may be drafted or modified through the Architect relay:
+
+1. `design/product-vision.md` — Product Vision & Strategic Goals
+2. `design/requirements.md` — Functional & Non-Functional Requirements
+3. `design/architecture.md` — System Architecture & Component Design
+4. `design/constraints.md` — Technical & Operational Constraints
+5. `design/interfaces.md` — Interfaces, IPC Protocols & Typed Contracts
+6. `design/security.md` — Security Model, Invariants & Boundaries
+7. `implementation/validation.yaml` — Deterministic Validation Commands
+8. `implementation/acceptance-criteria.yaml` — Measurable Acceptance Criteria
+9. `implementation/test-plan.md` — Testing Strategy & Verification Plan
+
+Any relay proposal targeting a path outside this allowlist is rejected with `INVALID_ARTIFACT_PATH`. Any path containing relative path traversals (`..`), drive letters, or absolute paths is rejected with `PATH_TRAVERSAL_DETECTED`.
+
+### Readiness Evaluation Rules
+
+Coalition evaluates artifact readiness directly from the disk:
+
+- **MISSING**: The file does not exist on disk.
+- **INCOMPLETE**: The file exists on disk, but contains fewer than 50 characters of substantive content.
+- **READY**: The file exists on disk and contains 50 or more characters of substantive content.
+
+Overall project readiness is evaluated as:
+- `READY_TO_FREEZE`: All 9 canonical artifacts have status `READY`.
+- `INCOMPLETE`: Any artifact is `MISSING` or `INCOMPLETE`.
+
+### Atomic File Operations
+
+Architecture artifacts are written using `ArtifactManager::write_artifact_atomic`:
+1. Strict path containment and canonical allowlist validation before touching the filesystem.
+2. Staging in `<path>.tmp.<uuid>` with explicit descriptor flush (`sync_all()`).
+3. Safe platform-native atomic replacement:
+   - **Windows**: `ReplaceFileW` with `<path>.bak.<uuid>` backup reconciliation.
+   - **POSIX**: Directory synchronization and atomic file rename.
+4. Backup cleanup only after successful post-replacement validation.

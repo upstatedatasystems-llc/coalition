@@ -1,6 +1,7 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { ProjectDetails, ActivityEventRecord } from '../../types';
 import { ActivityLogView } from '../activity/ActivityLogView';
+import { ArchitectureWorkspaceView } from '../architecture/ArchitectureWorkspaceView';
 
 interface ProjectDetailViewProps {
   details: ProjectDetails;
@@ -18,6 +19,7 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
   isRefreshing,
 }) => {
   const { project, workflow_state, artifact, git, is_available } = details;
+  const [activeSubTab, setActiveSubTab] = useState<'workspace' | 'overview'>('workspace');
 
   return (
     <div className="project-detail-container">
@@ -25,6 +27,21 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
         <button className="secondary-btn back-btn" onClick={onBack}>
           ← All Projects
         </button>
+        <div className="subtab-buttons">
+          <button
+            className={`subtab-btn ${activeSubTab === 'workspace' ? 'active' : ''}`}
+            onClick={() => setActiveSubTab('workspace')}
+            disabled={!is_available}
+          >
+            Architecture Workspace
+          </button>
+          <button
+            className={`subtab-btn ${activeSubTab === 'overview' ? 'active' : ''}`}
+            onClick={() => setActiveSubTab('overview')}
+          >
+            Overview & Activity
+          </button>
+        </div>
         <button
           className="primary-btn refresh-btn"
           onClick={onRefresh}
@@ -54,10 +71,19 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
         </p>
       </header>
 
-      <div className="detail-sections-grid">
-        <section className="detail-card">
-          <h3>Durable Architecture Contract</h3>
-          {artifact ? (
+      {is_available && activeSubTab === 'workspace' ? (
+        <ArchitectureWorkspaceView
+          projectId={project.project_id}
+          projectName={project.name}
+          workflowState={workflow_state.state}
+          onRefreshProject={onRefresh}
+        />
+      ) : (
+        <>
+          <div className="detail-sections-grid">
+            <section className="detail-card">
+              <h3>Durable Architecture Contract</h3>
+              {artifact ? (
             <div className="info-grid">
               <div>
                 <span className="label">Project ID:</span>
@@ -142,6 +168,8 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
         <h3>Recent Activity</h3>
         <ActivityLogView events={activity} />
       </section>
+      </>
+      )}
     </div>
   );
 };

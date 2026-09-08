@@ -676,3 +676,493 @@ body {
   background-color: #1e293b;
   color: #f8fafc;
 }
+
+/* -------------------------------------------------------------------------
+   Stage 2A: Architecture Workspace & Relay Styles
+-------------------------------------------------------------------------- */
+
+.subtab-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.subtab-btn {
+  background: #f3f4f6;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: #4b5563;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.subtab-btn:hover:not(:disabled) {
+  background: #e5e7eb;
+}
+
+.subtab-btn.active {
+  background: #2563eb;
+  color: #ffffff;
+  border-color: #1d4ed8;
+}
+
+.subtab-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.architecture-workspace {
+  margin-top: 16px;
+}
+
+.workspace-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+}
+
+@media (max-width: 900px) {
+  .workspace-columns {
+    grid-template-columns: 1fr;
+  }
+}
+
+.workspace-column {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.column-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid #f3f4f6;
+  padding-bottom: 10px;
+  margin-bottom: 12px;
+}
+
+.column-header h2 {
+  font-size: 1.15rem;
+  margin: 0;
+  color: #1f2937;
+}
+
+.relay-state-tag {
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 12px;
+  background: #e0e7ff;
+  color: #3730a3;
+  text-transform: uppercase;
+}
+
+.governance-note, .readiness-guidance {
+  font-size: 0.8rem;
+  color: #6b7280;
+  margin-bottom: 14px;
+}
+
+.relay-actions-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.relay-action-row {
+  display: flex;
+  gap: 10px;
+}
+
+.relay-action-row button {
+  flex: 1;
+}
+
+.prepare-btn {
+  background-color: #2563eb;
+  color: white;
+  padding: 10px;
+  font-weight: 600;
+}
+
+.copy-prompt-btn, .open-chatgpt-btn {
+  padding: 8px;
+  font-size: 0.82rem;
+}
+
+.import-btn {
+  background-color: #059669;
+  color: white;
+  padding: 10px;
+  font-weight: 600;
+}
+
+.workspace-error-banner {
+  background-color: #fee2e2;
+  border: 1px solid #f87171;
+  color: #991b1b;
+  padding: 10px 14px;
+  border-radius: 6px;
+  margin-bottom: 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.875rem;
+}
+
+.workspace-success-banner {
+  background-color: #d1fae5;
+  border: 1px solid #34d399;
+  color: #065f46;
+  padding: 10px 14px;
+  border-radius: 6px;
+  margin-bottom: 12px;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.pending-packet-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #f8fafc;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+}
+
+.card-header-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 0.82rem;
+}
+
+.toggle-indicator {
+  margin-left: auto;
+  color: #3b82f6;
+  font-weight: 500;
+}
+
+.prompt-text-box {
+  margin-top: 8px;
+  padding: 8px;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  max-height: 250px;
+  overflow-y: auto;
+  font-size: 0.75rem;
+  font-family: monospace;
+}
+
+/* Import Preview Card */
+.import-preview-card {
+  background: #f0fdf4;
+  border: 2px solid #86efac;
+  border-radius: 8px;
+  padding: 14px;
+  margin-bottom: 16px;
+}
+
+.preview-header h3 {
+  margin: 0 0 4px 0;
+  font-size: 1rem;
+  color: #166534;
+}
+
+.preview-summary-text {
+  font-size: 0.82rem;
+  color: #374151;
+}
+
+.preview-artifacts-list {
+  margin: 10px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.preview-artifact-item {
+  background: #ffffff;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+.preview-item-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+}
+
+.diff-badge {
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+}
+
+.badge-new {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.badge-modified {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.badge-unchanged {
+  background: #f3f4f6;
+  color: #4b5563;
+}
+
+.badge-deleted {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.art-title {
+  font-weight: 600;
+}
+
+.art-path {
+  color: #6b7280;
+  font-size: 0.78rem;
+}
+
+.preview-questions {
+  margin-top: 10px;
+  font-size: 0.82rem;
+}
+
+.preview-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.accept-import-btn {
+  background: #16a34a;
+  color: white;
+  flex: 2;
+  padding: 8px 14px;
+  font-weight: 600;
+}
+
+.reject-import-btn {
+  background: #dc2626;
+  color: white;
+  flex: 1;
+  padding: 8px 14px;
+}
+
+/* Manual Recovery Panel */
+.recovery-panel {
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 8px;
+  padding: 14px;
+  margin-bottom: 16px;
+}
+
+.recovery-panel h3 {
+  margin: 0 0 6px 0;
+  color: #92400e;
+  font-size: 0.95rem;
+}
+
+.error-hint {
+  font-size: 0.8rem;
+  color: #b45309;
+  margin-bottom: 8px;
+}
+
+.recovery-editor {
+  width: 100%;
+  font-family: monospace;
+  font-size: 0.78rem;
+  padding: 8px;
+  border: 1px solid #d97706;
+  border-radius: 6px;
+  background: #ffffff;
+  box-sizing: border-box;
+}
+
+.recovery-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.retry-parse-btn {
+  background: #d97706;
+  color: white;
+}
+
+/* Relay History */
+.relay-history-section {
+  margin-top: 16px;
+  border-top: 1px solid #f3f4f6;
+  padding-top: 12px;
+}
+
+.relay-history-section h3 {
+  font-size: 0.9rem;
+  color: #4b5563;
+  margin: 0 0 8px 0;
+}
+
+.history-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.history-item {
+  font-size: 0.75rem;
+  padding: 6px 10px;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.history-status {
+  font-weight: 700;
+}
+
+/* Artifacts Readiness List */
+.readiness-badge {
+  font-size: 0.78rem;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 12px;
+}
+
+.readiness-ready_to_freeze {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.readiness-incomplete {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.artifacts-readiness-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.artifact-readiness-card {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid #e5e7eb;
+  background: #ffffff;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.artifact-readiness-card:hover {
+  border-color: #3b82f6;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+.card-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.status-indicator {
+  font-size: 1.1rem;
+  font-weight: 800;
+  width: 24px;
+  text-align: center;
+}
+
+.card-ready .status-indicator {
+  color: #16a34a;
+}
+
+.card-incomplete .status-indicator {
+  color: #d97706;
+}
+
+.card-missing .status-indicator {
+  color: #9ca3af;
+}
+
+.card-titles {
+  display: flex;
+  flex-direction: column;
+}
+
+.artifact-title {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: #1f2937;
+}
+
+.artifact-path {
+  font-size: 0.72rem;
+  color: #6b7280;
+}
+
+.card-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.char-count {
+  font-size: 0.75rem;
+  color: #6b7280;
+}
+
+.view-link {
+  font-size: 0.75rem;
+  color: #2563eb;
+  font-weight: 500;
+}
+
+/* Artifact Modal */
+.artifact-modal {
+  max-width: 750px;
+  max-height: 80vh;
+}
+
+.artifact-modal-path {
+  margin: 0 0 10px 0;
+}
+
+.artifact-modal-content {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 12px;
+  max-height: 55vh;
+  overflow-y: auto;
+  font-family: monospace;
+  font-size: 0.82rem;
+  white-space: pre-wrap;
+}

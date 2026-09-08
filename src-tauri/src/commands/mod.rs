@@ -1,10 +1,14 @@
 use crate::core::activity::{ActivityEventRecord, ActivityManager};
-use crate::core::artifacts::ArtifactError;
+use crate::core::artifacts::{ArtifactError, ArtifactManager};
 use crate::core::builder::{
     AgyEvent, AntigravityCliAdapter, BuilderTurnRequest, BuilderTurnResponse, ModelInfo,
 };
 use crate::core::git::{GitAdapter, GitError, GitRepoInfo};
 use crate::core::projects::{ProjectDetails, ProjectError, ProjectService, ProjectSummary};
+use crate::core::relay::readiness::ReadinessReport;
+use crate::core::relay::{
+    ImportPreview, RelayError, RelayHistoryItem, RelayPacket, RelayService, WorkspaceState,
+};
 use crate::core::workflow::{self, WorkflowAction, WorkflowError, WorkflowStateRecord};
 use crate::db::{DbError, DbManager, ProofResult};
 use serde::{Deserialize, Serialize};
@@ -164,6 +168,59 @@ impl From<GitError> for CommandError {
 impl From<DbError> for CommandError {
     fn from(e: DbError) -> Self {
         Self::new("DATABASE_ERROR", e.to_string())
+    }
+}
+
+impl From<RelayError> for CommandError {
+    fn from(e: RelayError) -> Self {
+        match e {
+            RelayError::ProjectNotFound(msg) => Self::new("PROJECT_NOT_FOUND", msg),
+            RelayError::Database(msg) => Self::new("DATABASE_ERROR", msg),
+            RelayError::Artifact(msg) => Self::new("ARTIFACT_ERROR", msg),
+            RelayError::Workflow(msg) => Self::new("WORKFLOW_ERROR", msg),
+            RelayError::UnrelatedContent(msg) => Self::new("UNRELATED_CLIPBOARD_CONTENT", msg),
+            RelayError::ParseError(msg) => Self::new("RELAY_PARSE_ERROR", msg),
+            RelayError::SchemaError(msg) => Self::new("RELAY_SCHEMA_ERROR", msg),
+            RelayError::ProjectIdMismatch { expected, actual } => Self::with_details(
+                "PROJECT_ID_MISMATCH",
+                format!(
+                    "Import project ID mismatch: expected {}, got {}",
+                    expected, actual
+                ),
+                serde_json::json!({ "expected": expected, "actual": actual }),
+            ),
+            RelayError::PacketIdMismatch { expected, actual } => Self::with_details(
+                "PACKET_ID_MISMATCH",
+                format!(
+                    "Import packet ID mismatch: expected {}, got {}",
+                    expected, actual
+                ),
+                serde_json::json!({ "expected": expected, "actual": actual }),
+            ),
+            RelayError::DisallowedArtifactPath(p) => Self::with_details(
+                "DISALLOWED_ARTIFACT_PATH",
+                format!(
+                    "Proposed artifact path is outside the allowed architecture package: {}",
+                    p
+                ),
+                serde_json::json!({ "path": p }),
+            ),
+            RelayError::ParseFailure {
+                import_id,
+                raw_content,
+                message,
+            } => Self::with_details(
+                "RELAY_PARSE_FAILURE",
+                format!("Failed to parse response: {}", message),
+                serde_json::json!({ "import_id": import_id, "raw_content": raw_content, "message": message }),
+            ),
+            RelayError::ImportNotFound(id) => {
+                Self::new("IMPORT_NOT_FOUND", format!("Import {} not found", id))
+            }
+            RelayError::AlreadyDecided(s) => {
+                Self::new("IMPORT_ALREADY_DECIDED", format!("Import already {}", s))
+            }
+        }
     }
 }
 
@@ -507,4 +564,167 @@ pub async fn desktop_open_url(url: String) -> Result<(), CommandError> {
     }
 
     Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// Stage 2A ChatGPT Relay & Architecture Commands
+// ----------------------------------------------------------------------------
+
+fn get_repo_path_for_project_sync(
+    db: &DbManager,
+    project_id: &str,
+) -> Result<PathBuf, CommandError> {
+    let path_str: String = db
+        .connection()
+        .query_row(
+            "SELECT repository_path FROM projects WHERE project_id = ?1",
+            rusqlite::params![project_id],
+            |r| r.get(0),
+        )
+        .map_err(|_| {
+            CommandError::new(
+                "PROJECT_NOT_FOUND",
+                format!("Project {} not found", project_id),
+            )
+        })?;
+
+    Ok(PathBuf::from(path_str))
+}
+
+#[tauri::command]
+pub async fn prepare_architect_relay_packet(
+    state: State<'_, AppState>,
+    project_id: String,
+    custom_notes: Option<String>,
+) -> Result<RelayPacket, CommandError> {
+    let mut db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    RelayService::prepare_architect_packet(
+        db.connection_mut(),
+        &repo_path,
+        &project_id,
+        custom_notes.as_deref(),
+    )
+    .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_pending_relay_packet(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Option<RelayPacket>, CommandError> {
+    let db = state.db.lock().await;
+    RelayService::get_pending_packet(db.connection(), &project_id).map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_relay_history(
+    state: State<'_, AppState>,
+    project_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<RelayHistoryItem>, CommandError> {
+    let db = state.db.lock().await;
+    RelayService::get_relay_history(db.connection(), &project_id, limit.unwrap_or(20))
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn copy_relay_packet_to_clipboard(
+    state: State<'_, AppState>,
+    packet_id: String,
+) -> Result<(), CommandError> {
+    let db = state.db.lock().await;
+    let prompt: String = db
+        .connection()
+        .query_row(
+            "SELECT prompt FROM relay_packets WHERE packet_id = ?1",
+            rusqlite::params![packet_id],
+            |r| r.get(0),
+        )
+        .map_err(|_| {
+            CommandError::new(
+                "PACKET_NOT_FOUND",
+                format!("Packet {} not found", packet_id),
+            )
+        })?;
+
+    drop(db);
+
+    desktop_clipboard_write(prompt).await
+}
+
+#[tauri::command]
+pub async fn import_from_clipboard(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<ImportPreview, CommandError> {
+    let clipboard_text = desktop_clipboard_read().await?;
+    let db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    RelayService::process_import(db.connection(), &repo_path, &project_id, &clipboard_text)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn retry_parse_import(
+    state: State<'_, AppState>,
+    project_id: String,
+    import_id: String,
+    edited_raw_text: String,
+) -> Result<ImportPreview, CommandError> {
+    let db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    RelayService::retry_parse_import(
+        db.connection(),
+        &repo_path,
+        &project_id,
+        &import_id,
+        &edited_raw_text,
+    )
+    .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn accept_relay_import(
+    state: State<'_, AppState>,
+    project_id: String,
+    import_id: String,
+) -> Result<ReadinessReport, CommandError> {
+    let db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    RelayService::accept_import(db.connection(), &repo_path, &project_id, &import_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn reject_relay_import(
+    state: State<'_, AppState>,
+    project_id: String,
+    import_id: String,
+) -> Result<(), CommandError> {
+    let db = state.db.lock().await;
+    RelayService::reject_import(db.connection(), &project_id, &import_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_architecture_workspace_state(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<WorkspaceState, CommandError> {
+    let db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    RelayService::get_workspace_state(db.connection(), &repo_path, &project_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_artifact_content(
+    state: State<'_, AppState>,
+    project_id: String,
+    artifact_path: String,
+) -> Result<Option<String>, CommandError> {
+    let db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    ArtifactManager::read_artifact(&repo_path, &artifact_path).map_err(CommandError::from)
 }

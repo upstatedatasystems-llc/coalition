@@ -4,4 +4,5 @@ pub mod builder;
 pub mod git;
 pub mod process;
 pub mod projects;
+pub mod relay;
 pub mod workflow;

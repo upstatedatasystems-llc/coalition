@@ -17,6 +17,20 @@ pub const STANDARD_SUBDIRECTORIES: &[&str] = &[
     "evidence",
 ];
 
+pub const CANONICAL_ARCHITECTURE_ARTIFACTS: &[&str] = &[
+    "design/product-vision.md",
+    "design/requirements.md",
+    "design/architecture.md",
+    "design/constraints.md",
+    "design/interfaces.md",
+    "design/security.md",
+    "design/open-questions.md",
+    "implementation/implementation-plan.md",
+    "implementation/acceptance-criteria.yaml",
+    "implementation/validation.yaml",
+    "implementation/test-plan.md",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ArchitectureState {
@@ -504,6 +518,156 @@ impl ArtifactManager {
 
         Ok(())
     }
+
+    /// Checks if a relative artifact path belongs to the allowed architecture package.
+    pub fn is_valid_architecture_artifact_path(relative_path: &str) -> bool {
+        let normalized = relative_path.replace('\\', "/");
+        if normalized.starts_with('/') || normalized.contains("..") {
+            return false;
+        }
+
+        if CANONICAL_ARCHITECTURE_ARTIFACTS.contains(&normalized.as_str()) {
+            return true;
+        }
+
+        if normalized.starts_with("decisions/ADR-") && normalized.ends_with(".md") {
+            return true;
+        }
+
+        false
+    }
+
+    /// Writes an architecture artifact atomically to `.coalition/<relative_path>`.
+    /// Enforces strict path allowlist and repository boundary checks.
+    pub fn write_artifact_atomic<P: AsRef<Path>>(
+        repo_root: P,
+        relative_path: &str,
+        content: &str,
+    ) -> Result<(), ArtifactError> {
+        let normalized = relative_path.replace('\\', "/");
+        if !Self::is_valid_architecture_artifact_path(&normalized) {
+            return Err(ArtifactError::PathTraversal {
+                path: relative_path.to_string(),
+                root: repo_root.as_ref().to_string_lossy().to_string(),
+            });
+        }
+
+        let coalition_dir = Self::resolve_coalition_dir(repo_root.as_ref())?;
+        let target_path = coalition_dir.join(&normalized);
+
+        let parent = target_path.parent().ok_or_else(|| {
+            ArtifactError::Io("Target artifact path has no parent directory".to_string())
+        })?;
+
+        if !parent.exists() {
+            fs::create_dir_all(parent).map_err(|e| {
+                ArtifactError::Io(format!("Failed to create directory {:?}: {}", parent, e))
+            })?;
+        }
+
+        Self::validate_safe_path(repo_root.as_ref(), parent)?;
+
+        let file_name = target_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("artifact");
+        let temp_file_name = format!("{}.tmp.{}", file_name, Uuid::new_v4());
+        let temp_path = parent.join(&temp_file_name);
+
+        {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+                .map_err(|e| {
+                    ArtifactError::Io(format!("Failed to create temp file {:?}: {}", temp_path, e))
+                })?;
+
+            file.write_all(content.as_bytes()).map_err(|e| {
+                let _ = fs::remove_file(&temp_path);
+                ArtifactError::Io(format!("Failed to write to temp file: {}", e))
+            })?;
+
+            file.sync_all().map_err(|e| {
+                let _ = fs::remove_file(&temp_path);
+                ArtifactError::Io(format!("Failed to sync temp file: {}", e))
+            })?;
+        }
+
+        if let Err(e) = Self::replace_file_atomically(&temp_path, &target_path) {
+            match &e {
+                ArtifactError::RecoveryRequired(_) => {}
+                _ => {
+                    let _ = fs::remove_file(&temp_path);
+                }
+            }
+            return Err(e);
+        }
+
+        Self::validate_safe_path(repo_root.as_ref(), &target_path)?;
+
+        Ok(())
+    }
+
+    /// Reads an architecture artifact from `.coalition/<relative_path>` if it exists.
+    pub fn read_artifact<P: AsRef<Path>>(
+        repo_root: P,
+        relative_path: &str,
+    ) -> Result<Option<String>, ArtifactError> {
+        let normalized = relative_path.replace('\\', "/");
+        if !Self::is_valid_architecture_artifact_path(&normalized) {
+            return Err(ArtifactError::PathTraversal {
+                path: relative_path.to_string(),
+                root: repo_root.as_ref().to_string_lossy().to_string(),
+            });
+        }
+
+        let coalition_dir = Self::resolve_coalition_dir(repo_root.as_ref())?;
+        let target_path = coalition_dir.join(&normalized);
+
+        if !target_path.exists() {
+            return Ok(None);
+        }
+
+        Self::validate_safe_path(repo_root.as_ref(), &target_path)?;
+
+        let content = fs::read_to_string(&target_path).map_err(|e| {
+            ArtifactError::Io(format!("Failed to read artifact {:?}: {}", target_path, e))
+        })?;
+
+        Ok(Some(content))
+    }
+
+    /// Deletes an architecture artifact from `.coalition/<relative_path>` if it exists.
+    pub fn delete_artifact<P: AsRef<Path>>(
+        repo_root: P,
+        relative_path: &str,
+    ) -> Result<bool, ArtifactError> {
+        let normalized = relative_path.replace('\\', "/");
+        if !Self::is_valid_architecture_artifact_path(&normalized) {
+            return Err(ArtifactError::PathTraversal {
+                path: relative_path.to_string(),
+                root: repo_root.as_ref().to_string_lossy().to_string(),
+            });
+        }
+
+        let coalition_dir = Self::resolve_coalition_dir(repo_root.as_ref())?;
+        let target_path = coalition_dir.join(&normalized);
+
+        if !target_path.exists() {
+            return Ok(false);
+        }
+
+        Self::validate_safe_path(repo_root.as_ref(), &target_path)?;
+        fs::remove_file(&target_path).map_err(|e| {
+            ArtifactError::Io(format!(
+                "Failed to delete artifact {:?}: {}",
+                target_path, e
+            ))
+        })?;
+
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -547,7 +711,15 @@ fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), A
         let parent = destination.parent().ok_or_else(|| {
             ArtifactError::Io("Destination path has no parent directory".to_string())
         })?;
-        let backup_path = parent.join(format!("project.yaml.bak.{}", Uuid::new_v4()));
+        let is_project_yaml = destination
+            .file_name()
+            .map(|n| n == "project.yaml")
+            .unwrap_or(false);
+        let dest_name = destination
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+        let backup_path = parent.join(format!("{}.bak.{}", dest_name, Uuid::new_v4()));
         let backup_wide: Vec<u16> = backup_path
             .as_os_str()
             .encode_wide()
@@ -597,28 +769,41 @@ fn replace_file_atomically_impl(temp: &Path, destination: &Path) -> Result<(), A
 
         if res != 0 {
             // ReplaceFileW succeeded from the OS perspective.
-            // Validate that the destination contains a valid project descriptor before cleaning backup.
-            match ArtifactManager::read_project_yaml(destination) {
-                Ok(_) => {
-                    // Valid! Safely remove the generated backup.
+            // If destination is project.yaml, validate that the destination contains a valid project descriptor before cleaning backup.
+            if is_project_yaml {
+                match ArtifactManager::read_project_yaml(destination) {
+                    Ok(_) => {
+                        // Valid! Safely remove the generated backup.
+                        let _ = fs::remove_file(&backup_path);
+                        return Ok(());
+                    }
+                    Err(read_err) => {
+                        // Canonical file validation failed after ReplaceFileW.
+                        // If backup exists, attempt to restore it before reporting error.
+                        if backup_path.exists() {
+                            let _ = unsafe {
+                                MoveFileExW(
+                                    backup_wide.as_ptr(),
+                                    dest_wide.as_ptr(),
+                                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                                )
+                            };
+                        }
+                        return Err(ArtifactError::RecoveryRequired(format!(
+                            "ReplaceFileW succeeded but destination validation failed: {}. Preserved recovery artifacts.",
+                            read_err
+                        )));
+                    }
+                }
+            } else {
+                // For non-project.yaml artifacts, verify destination exists before removing backup.
+                if destination.exists() {
                     let _ = fs::remove_file(&backup_path);
                     return Ok(());
-                }
-                Err(read_err) => {
-                    // Canonical file validation failed after ReplaceFileW.
-                    // If backup exists, attempt to restore it before reporting error.
-                    if backup_path.exists() {
-                        let _ = unsafe {
-                            MoveFileExW(
-                                backup_wide.as_ptr(),
-                                dest_wide.as_ptr(),
-                                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                            )
-                        };
-                    }
-                    return Err(ArtifactError::RecoveryRequired(format!(
-                        "ReplaceFileW succeeded but destination validation failed: {}. Preserved recovery artifacts.",
-                        read_err
+                } else {
+                    return Err(ArtifactError::Io(format!(
+                        "ReplaceFileW reported success but destination {:?} does not exist",
+                        destination
                     )));
                 }
             }
@@ -1523,5 +1708,71 @@ mod tests {
             inspection.valid_backups[0].project.project_id,
             backup_project.project_id
         );
+    }
+
+    #[test]
+    fn test_architecture_artifact_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        ArtifactManager::initialize_new_project(dir.path(), "test-arch").unwrap();
+
+        let path = "design/product-vision.md";
+        let content = "# Product Vision\nBuilding a governed AI desktop control plane.\n";
+
+        // 1. Initially does not exist
+        let initial = ArtifactManager::read_artifact(dir.path(), path).unwrap();
+        assert!(initial.is_none());
+
+        // 2. Write atomically
+        ArtifactManager::write_artifact_atomic(dir.path(), path, content).unwrap();
+
+        // 3. Read back
+        let read_back = ArtifactManager::read_artifact(dir.path(), path).unwrap();
+        assert_eq!(read_back, Some(content.to_string()));
+
+        // 4. Update
+        let updated = "# Product Vision\nUpdated version 2.\n";
+        ArtifactManager::write_artifact_atomic(dir.path(), path, updated).unwrap();
+        assert_eq!(
+            ArtifactManager::read_artifact(dir.path(), path).unwrap(),
+            Some(updated.to_string())
+        );
+
+        // 5. Delete
+        let deleted = ArtifactManager::delete_artifact(dir.path(), path).unwrap();
+        assert!(deleted);
+        assert!(ArtifactManager::read_artifact(dir.path(), path)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_architecture_artifact_path_traversal_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        ArtifactManager::initialize_new_project(dir.path(), "test-traversal").unwrap();
+
+        let evil_paths = &[
+            "../secret.txt",
+            "..\\evil.txt",
+            "/etc/passwd",
+            "C:\\windows\\system32\\evil.dll",
+            "project.yaml",
+            ".git/config",
+            "src/main.rs",
+            "design/../../escape.txt",
+        ];
+
+        for &bad in evil_paths {
+            assert!(
+                !ArtifactManager::is_valid_architecture_artifact_path(bad),
+                "Should reject invalid path: {}",
+                bad
+            );
+
+            let res = ArtifactManager::write_artifact_atomic(dir.path(), bad, "evil");
+            assert!(res.is_err(), "write_artifact_atomic must reject: {}", bad);
+
+            let read_res = ArtifactManager::read_artifact(dir.path(), bad);
+            assert!(read_res.is_err(), "read_artifact must reject: {}", bad);
+        }
     }
 }
