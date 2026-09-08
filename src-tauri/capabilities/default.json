@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability for Coalition Phase 0 diagnostic window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}

@@ -1,0 +1,2128 @@
+# Coalition — Master Implementation Plan
+
+**Status:** Implementation-ready master plan  
+**Product:** Coalition  
+**Plan Version:** 1.0  
+**Design Baseline:** Coalition Product & Technical Design Draft v0.2  
+**Date:** September 7, 2026  
+**Target Repository:** `upstatedatasystems-llc/coalition`  
+**Repository Visibility:** Public  
+**Primary Implementation Environment:** Windows 10/11  
+**Secondary Target:** macOS  
+**Future Target:** Linux  
+
+---
+
+# 1. Purpose and Authority
+
+This document is the master implementation plan for Coalition V1.
+
+It is intended to be handed directly to Google Antigravity as the authoritative implementation package for the initial public repository.
+
+The Coalition v0.2 design remains the product and architecture reference. Where this master plan adds detail or changes decisions made after v0.2, **this master plan takes precedence**.
+
+The most important post-v0.2 decisions incorporated here are:
+
+1. Coalition remains a native Tauri desktop application using React/TypeScript and Rust.
+2. ChatGPT Plus remains an explicit human-relay Architect and Reviewer.
+3. Antigravity remains the external Builder through Google's official CLI.
+4. Coalition must expose Antigravity model selection and reasoning effort where supported by the CLI.
+5. Coalition must display Antigravity usage/quota/context information where supported.
+6. Coalition must provide an approximate ChatGPT usage indicator, clearly labeled as an estimate rather than provider-reported truth.
+7. Builder permissions must support:
+   - deny;
+   - allow once;
+   - allow and remember;
+   - Icarus mode, which auto-approves everything for the active project/run.
+8. Coalition-owned validation is configurable and may be disabled entirely.
+9. When enabled, Coalition validation must be independently runnable from Builder activity, visible in real time, stoppable, restartable, and fully logged.
+10. Validation results are primarily diagnostic evidence for the Builder, Architect, Reviewer, and human. A project may configure which checks, if any, are required gates.
+11. The repository will be public under Upstate Data Systems LLC.
+12. Licensing is intentionally not decided by this plan. Do not add a permissive open-source license without explicit human approval.
+
+Do not reinterpret these decisions during implementation merely because an alternative is easier.
+
+If implementation reveals a genuine contradiction or requirement that cannot be fulfilled with supported third-party interfaces, stop that affected work and report an **Architecture Concern** rather than silently changing product behavior.
+
+---
+
+# 2. Product Definition
+
+Coalition is a local-first desktop control plane for governed AI-assisted software development.
+
+It coordinates:
+
+- a human;
+- ChatGPT subscription conversations;
+- Google Antigravity;
+- local Git repositories;
+- local project artifacts;
+- project-defined validation;
+- architecture versioning;
+- independent review;
+- usage awareness;
+- permissions;
+- interruption/recovery.
+
+Coalition is **not** a coding agent in V1.
+
+Coalition is **not** an IDE in V1.
+
+Coalition is **not** an AI API gateway in V1.
+
+Coalition is **not** a hosted SaaS product in V1.
+
+Its differentiated responsibility is to ensure that AI coding work remains accountable to an explicit, human-approved architecture and that the human can see, stop, inspect, revise, and resume the process.
+
+The core authority hierarchy is:
+
+```text
+Human
+  ↓
+Frozen Architecture Contract
+  ↓
+Configured Validation / Evidence
+  ↓
+Builder + Independent Reviewer
+  ↓
+Human Final Acceptance
+```
+
+Only the human may:
+
+- freeze an architecture;
+- re-freeze a revised architecture;
+- authorize architecture change;
+- decide sensitive Builder permissions;
+- enable Icarus mode;
+- accept the finished product.
+
+---
+
+# 3. Core V1 User Journey
+
+The V1 implementation must support this complete path:
+
+```text
+Install Coalition
+      ↓
+Open/Create Local Project
+      ↓
+Prepare Architect packet
+      ↓
+Human sends packet to ChatGPT
+      ↓
+Human copies ChatGPT response
+      ↓
+Coalition imports structured result
+      ↓
+Architecture artifacts evolve
+      ↓
+Human freezes Architecture v1.0
+      ↓
+Coalition starts Antigravity Builder
+      ↓
+Builder works against frozen contract
+      ↓
+Coalition shows progress / model / quota / permissions
+      ↓
+Optional Coalition validation runs
+      ↓
+Coalition generates Reviewer packet
+      ↓
+Human sends packet to separate ChatGPT Reviewer
+      ↓
+Human copies Reviewer result
+      ↓
+Coalition imports findings
+      ↓
+Corrections automatically routed to Antigravity
+      ↓
+Repeat
+      ↓
+Human may invoke Change Architecture at any time
+      ↓
+Architecture revised and re-frozen
+      ↓
+Eventually READY FOR HUMAN REVIEW
+      ↓
+Human accepts or changes architecture again
+```
+
+No critical project state may exist only inside an LLM conversation.
+
+---
+
+# 4. Fixed Technology Stack
+
+## 4.1 Desktop Application
+
+Use:
+
+- Tauri 2.x
+- React
+- TypeScript
+- Vite
+- Rust
+
+Do not introduce Electron.
+
+Do not introduce Python/FastAPI for application runtime.
+
+Do not require a localhost server.
+
+Do not require end users to install Python, Node, or Rust to run packaged Coalition binaries.
+
+Development dependencies are allowed.
+
+## 4.2 Persistence
+
+Use:
+
+- repository-local `.coalition/` artifacts for durable project meaning;
+- SQLite for local operational/application state.
+
+Principle:
+
+```text
+.coalition/
+= what the project IS
+
+SQLite
+= what Coalition is DOING
+```
+
+## 4.3 Source Control
+
+Use the system Git CLI.
+
+Do not build a custom source-control implementation.
+
+## 4.4 Builder
+
+Use the official Antigravity CLI (`agy`).
+
+Preferred Builder transport:
+
+```text
+--input-format stream-json
+--output-format stream-json
+```
+
+Use supported conversation IDs/resume behavior.
+
+## 4.5 ChatGPT
+
+ChatGPT interaction is explicit human relay only.
+
+Coalition may:
+
+- prepare prompts;
+- copy user-requested prompts to clipboard;
+- open/focus the user's browser/app surface;
+- import clipboard contents only after explicit user action;
+- parse the copied response.
+
+Coalition must not:
+
+- scrape ChatGPT DOM;
+- inspect accessibility output to harvest responses;
+- OCR ChatGPT;
+- robot-click Copy;
+- call undocumented consumer endpoints;
+- reuse hidden authentication.
+
+## 4.6 App Identifier
+
+Use this default unless a platform conflict requires adjustment:
+
+```text
+com.upstatedatasystems.coalition
+```
+
+Product display name:
+
+```text
+Coalition
+```
+
+---
+
+# 5. Public Repository Baseline
+
+Target repository:
+
+```text
+GitHub organization:
+upstatedatasystems-llc
+
+repository:
+coalition
+
+visibility:
+public
+```
+
+The repository should be suitable for outside inspection from the first pushed baseline.
+
+Do not commit:
+
+- tokens;
+- cookies;
+- OAuth material;
+- Antigravity credentials;
+- personal email addresses in fixtures;
+- local filesystem paths that identify a developer;
+- test repositories containing private code;
+- captured ChatGPT conversations containing private content.
+
+## 5.1 Initial Root Files
+
+Create:
+
+```text
+README.md
+CONTRIBUTING.md
+SECURITY.md
+CODE_OF_CONDUCT.md
+CHANGELOG.md
+AGENTS.md
+.gitignore
+.editorconfig
+package.json
+tsconfig.json
+vite.config.ts
+src/
+src-tauri/
+docs/
+tests/
+.github/
+```
+
+A `LICENSE` file must **not** be added until the owner explicitly chooses a license.
+
+The README may state:
+
+```text
+Copyright © 2026 Upstate Data Systems LLC.
+Licensing terms have not yet been selected.
+```
+
+Do not describe the repository as "open source" until a license is deliberately selected.
+
+## 5.2 AGENTS.md
+
+Because Antigravity will implement and maintain Coalition, root `AGENTS.md` must state the project's non-negotiable architecture rules, including:
+
+- no ChatGPT scraping;
+- no AI API dependency in V1;
+- no silent architecture changes;
+- `.coalition/` is durable project truth;
+- SQLite is operational only;
+- Rust owns authoritative state transitions;
+- React must not bypass Rust state checks;
+- all external commands must go through a common process-management layer;
+- all high-risk operations must be permission-aware;
+- Icarus must always be visibly indicated;
+- no secrets in logs;
+- external-tool schemas must be adapter-isolated.
+
+---
+
+# 6. Proposed Repository Structure
+
+Use a structure close to:
+
+```text
+coalition/
+├── README.md
+├── CONTRIBUTING.md
+├── SECURITY.md
+├── CODE_OF_CONDUCT.md
+├── CHANGELOG.md
+├── AGENTS.md
+├── package.json
+├── tsconfig.json
+├── vite.config.ts
+├── src/
+│   ├── app/
+│   ├── components/
+│   ├── features/
+│   │   ├── projects/
+│   │   ├── architecture/
+│   │   ├── relay/
+│   │   ├── builder/
+│   │   ├── permissions/
+│   │   ├── usage/
+│   │   ├── validation/
+│   │   ├── reviews/
+│   │   ├── activity/
+│   │   └── settings/
+│   ├── hooks/
+│   ├── lib/
+│   ├── routes/
+│   ├── types/
+│   └── test/
+├── src-tauri/
+│   ├── Cargo.toml
+│   ├── tauri.conf.json
+│   ├── capabilities/
+│   ├── src/
+│   │   ├── lib.rs
+│   │   ├── commands/
+│   │   ├── core/
+│   │   │   ├── workflow/
+│   │   │   ├── projects/
+│   │   │   ├── artifacts/
+│   │   │   ├── relay/
+│   │   │   ├── builder/
+│   │   │   ├── permissions/
+│   │   │   ├── usage/
+│   │   │   ├── validation/
+│   │   │   ├── git/
+│   │   │   ├── process/
+│   │   │   ├── logging/
+│   │   │   └── recovery/
+│   │   └── db/
+│   └── migrations/
+├── docs/
+│   ├── architecture.md
+│   ├── development.md
+│   ├── project-artifacts.md
+│   ├── chatgpt-relay.md
+│   ├── antigravity-integration.md
+│   ├── permissions.md
+│   ├── validation.md
+│   ├── usage.md
+│   └── security-model.md
+├── tests/
+│   ├── fixtures/
+│   ├── fake-commands/
+│   └── integration/
+└── .github/
+    ├── workflows/
+    │   └── ci.yml
+    └── ISSUE_TEMPLATE/
+```
+
+Minor changes are allowed if they improve idiomatic Tauri/Rust/React organization without changing boundaries.
+
+---
+
+# 7. Durable Project Artifact Model
+
+Each governed project contains:
+
+```text
+project-root/
+└── .coalition/
+    ├── project.yaml
+    ├── design/
+    │   ├── product-vision.md
+    │   ├── requirements.md
+    │   ├── architecture.md
+    │   ├── constraints.md
+    │   ├── interfaces.md
+    │   └── security.md
+    ├── implementation/
+    │   ├── implementation-plan.md
+    │   ├── acceptance-criteria.yaml
+    │   ├── validation.yaml
+    │   └── test-plan.md
+    ├── decisions/
+    │   └── ADR-*.md
+    ├── architecture-versions/
+    │   └── vX.Y/
+    ├── changes/
+    │   └── ACR-*.md
+    ├── reviews/
+    │   └── cycle-*/
+    └── evidence/
+        └── validation-*/
+```
+
+## 7.1 project.yaml
+
+Keep this small and portable.
+
+Example:
+
+```yaml
+schema_version: 1
+project_id: coalition
+name: Coalition
+current_architecture_version: "1.0"
+architecture_state: frozen
+created_at: "..."
+```
+
+Do not place local absolute paths in Git-versioned project artifacts unless unavoidable.
+
+## 7.2 validation.yaml
+
+Example:
+
+```yaml
+schema_version: 1
+
+enabled: true
+
+policy:
+  gate_review_on_required_failure: true
+  allow_manual_runs: true
+  allow_builder_requested_runs: true
+
+commands:
+  - id: frontend-tests
+    name: Frontend unit tests
+    command: npm test -- --run
+    required: true
+    timeout_seconds: 600
+
+  - id: rust-tests
+    name: Rust unit tests
+    command: cargo test
+    working_directory: src-tauri
+    required: true
+    timeout_seconds: 900
+
+  - id: frontend-build
+    name: Frontend build
+    command: npm run build
+    required: true
+    timeout_seconds: 600
+```
+
+Validation can also be completely disabled:
+
+```yaml
+enabled: false
+```
+
+No workflow should imply that Coalition validation is mandatory for every project.
+
+---
+
+# 8. SQLite Operational State
+
+SQLite stores local runtime state such as:
+
+```text
+projects
+active_project_sessions
+workflow_state
+builder_epochs
+builder_sessions
+builder_events
+permission_rules_local
+permission_decisions
+validation_runs
+validation_processes
+relay_packets
+relay_imports
+review_cycles
+usage_samples
+chatgpt_usage_estimates
+activity_events
+recovery_checkpoints
+ui_preferences
+```
+
+Requirements:
+
+- migrations must be versioned;
+- DB writes affecting workflow state must be transactional;
+- project artifacts must remain usable if SQLite is deleted;
+- recovery should reconstruct as much as possible from `.coalition/` and Git;
+- SQLite may cache artifact metadata but must not become the only copy of architecture or reviews.
+
+---
+
+# 9. Workflow State Machine
+
+Implement authoritative transitions in Rust.
+
+Minimum states:
+
+```text
+DRAFT
+ARCHITECTING
+READY_TO_FREEZE
+FROZEN
+BUILDING
+VALIDATING
+WAITING_FOR_REVIEW
+CORRECTIONS_REQUIRED
+BLOCKED
+ARCHITECTURE_CONCERN
+REVIEW_ACCEPTED
+FINAL_VALIDATION
+READY_FOR_HUMAN_REVIEW
+HUMAN_ACCEPTED
+ARCHITECTURE_CHANGE
+ARCHITECTING_REVISION
+READY_TO_REFREEZE
+PAUSED
+INTERRUPTED
+```
+
+Requirements:
+
+- UI cannot directly assign arbitrary states.
+- Every transition is validated.
+- Every accepted transition is logged.
+- Illegal transitions return typed errors.
+- app restart does not lose authoritative state.
+- active processes are reconciled on startup.
+- architecture change can be invoked from any development state.
+- human acceptance can only occur from `READY_FOR_HUMAN_REVIEW`.
+
+Add unit tests for legal and illegal transitions.
+
+---
+
+# 10. ChatGPT Relay Subsystem
+
+## 10.1 Outbound
+
+Coalition creates a versioned relay packet and offers:
+
+```text
+Copy for ChatGPT
+Open ChatGPT
+```
+
+Clipboard write occurs only after explicit user action.
+
+## 10.2 Inbound
+
+The user copies a ChatGPT response and presses:
+
+```text
+Import from Clipboard
+```
+
+or a configured global hotkey.
+
+Coalition reads clipboard only at that moment.
+
+No passive clipboard monitoring by default.
+
+## 10.3 Relay Types
+
+V1 requires at least:
+
+```text
+ARCHITECT_INITIAL
+ARCHITECT_UPDATE
+ARCHITECTURE_REVISION
+REVIEW_REQUEST
+REVIEW_VERDICT
+ARCHITECTURE_CONCERN_ANALYSIS
+```
+
+Every packet has:
+
+- schema version;
+- project ID;
+- packet ID;
+- role;
+- architecture version;
+- related milestone/review cycle;
+- expected response type.
+
+## 10.4 Parsing
+
+The prompt should request a structured YAML or JSON result block.
+
+The parser must:
+
+- prefer the structured block;
+- tolerate surrounding prose;
+- reject obviously unrelated clipboard data;
+- provide a manual fallback when parsing fails;
+- show a preview before substantive project-state changes;
+- never execute commands merely because imported text contains them.
+
+## 10.5 Reviewer Isolation
+
+Encourage separate ChatGPT conversations:
+
+```text
+Project Architect
+Implementation Reviewer
+Architecture Revision
+```
+
+Coalition cannot enforce model independence at the subscription layer, but it can enforce different prompts and different evidence packages.
+
+---
+
+# 11. Antigravity Builder Adapter
+
+Implement an isolated `AntigravityCliAdapter`.
+
+Do not spread `agy` schema assumptions across the app.
+
+Adapter responsibilities:
+
+- detect CLI installation/version;
+- validate authentication;
+- enumerate available models;
+- launch Builder process;
+- send prompts over stdin;
+- read NDJSON events;
+- extract conversation ID;
+- stream progress;
+- capture usage metadata;
+- capture stderr;
+- detect permission denials;
+- cancel/interrupt safely;
+- resume supported conversations;
+- switch model at safe boundaries;
+- expose typed errors.
+
+Preferred process mode:
+
+```text
+agy
+  --input-format stream-json
+  --output-format stream-json
+```
+
+Each architecture freeze/re-freeze creates a new **Builder epoch**.
+
+A Builder epoch may contain multiple turns.
+
+Persist:
+
+- conversation ID;
+- model;
+- effort;
+- epoch architecture version;
+- start/end timestamps;
+- terminal status;
+- cumulative usage metadata.
+
+---
+
+# 12. Antigravity Model Selection
+
+Coalition must expose Builder model selection.
+
+Requirements:
+
+1. Discover available models through the supported CLI (`agy models` or equivalent documented mechanism).
+2. Store the user's selected model locally.
+3. Allow reasoning effort selection when supported:
+   - low;
+   - medium;
+   - high.
+4. Show the active model in the project header/Builder card.
+5. Do not silently fall back to another model if a pinned model becomes unavailable.
+6. Surface model-unavailable errors clearly.
+7. Allow model changes between Builder turns.
+8. If model change requires process restart:
+   - safely finish/stop the current turn;
+   - retain conversation ID;
+   - start a new CLI process with the new model;
+   - resume the supported conversation;
+   - log the model transition.
+9. Never mutate the frozen architecture merely because the model changes.
+
+UI concept:
+
+```text
+Builder
+
+Model
+Gemini ...                 [ Change ]
+
+Reasoning
+High                       [ Change ]
+```
+
+Do not build a Coalition-maintained model benchmark database in V1.
+
+The CLI is the authoritative model-availability source.
+
+---
+
+# 13. Subscription Usage and Session Capacity
+
+Coalition must provide a compact, always-accessible usage view.
+
+This replaces v0.2's earlier "No AI Cost Accounting" concept.
+
+Coalition still does **not** calculate dollar cost.
+
+## 13.1 Antigravity Usage
+
+Where supported by documented CLI metadata, display:
+
+- active model;
+- context-window used percentage;
+- context-window remaining percentage;
+- quota buckets;
+- quota remaining fraction;
+- reset time/countdown;
+- AI credits if provided;
+- cumulative token usage for the active Builder session.
+
+Treat Antigravity-reported values as provider-reported.
+
+The adapter must tolerate fields being absent or changing.
+
+Do not make one optional quota field a crash dependency.
+
+## 13.2 ChatGPT Usage Estimate
+
+There is no assumption of an official machine-readable Plus quota interface.
+
+Coalition therefore provides an **estimate**.
+
+Display must use language such as:
+
+```text
+ChatGPT Usage — Estimated
+~42% used
+```
+
+An information icon must explain:
+
+> ChatGPT does not provide Coalition with authoritative subscription usage data. This value is estimated from the ChatGPT work relayed through Coalition and may differ significantly from the usage shown by ChatGPT.
+
+Never label an estimated value as provider-reported.
+
+## 13.3 Estimator Inputs
+
+Track locally:
+
+- outbound relay timestamp;
+- inbound relay timestamp;
+- Architect vs Reviewer role;
+- approximate outbound text tokens;
+- approximate inbound text tokens;
+- turn count;
+- user-selected ChatGPT model label if configured;
+- rolling 5-hour window;
+- rolling weekly window.
+
+Use a versioned heuristic implementation behind an interface:
+
+```text
+ChatGptUsageEstimator
+```
+
+Initial approximate token calculation may use a documented characters-to-token heuristic.
+
+The exact weighting is not a product contract and may be tuned later.
+
+## 13.4 Calibration
+
+Provide:
+
+```text
+Reset Estimate
+Calibrate Estimate
+```
+
+so a user can realign Coalition after ChatGPT visibly resets or if the estimate drifts.
+
+Store heuristic version with samples so future changes are explainable.
+
+---
+
+# 14. Permission System
+
+Coalition owns the human-facing permission workflow while respecting Antigravity's supported permission engine.
+
+Routine known-safe project activity should be able to proceed automatically.
+
+Unknown, out-of-scope, or dangerous activity should pause for a human decision.
+
+## 14.1 Permission Decisions
+
+Present:
+
+```text
+Deny
+Allow Once
+Always Allow This
+Enable Icarus
+```
+
+For appropriate events also permit:
+
+```text
+Always Deny This
+```
+
+## 14.2 Scope
+
+Remembered approvals default to **project-local user state**, not global machine state and not Git-versioned project artifacts.
+
+One developer's approvals must not silently become another developer's approvals merely because the repo was cloned.
+
+## 14.3 Rule Matching
+
+Represent actions with narrow patterns.
+
+Examples:
+
+```text
+command(git status)
+command(git diff*)
+command(npm test*)
+command(npm run build)
+```
+
+Avoid overly broad approvals such as:
+
+```text
+command(npm *)
+command(git *)
+```
+
+unless the human explicitly chooses that breadth.
+
+## 14.4 Risk Defaults
+
+Likely routine:
+
+- reads/writes inside project workspace;
+- Git status/diff/log;
+- configured project validation;
+- ordinary build/test commands already declared by project policy.
+
+Prompt by default:
+
+- new package installation;
+- new network access;
+- commands outside repository;
+- unconfigured shell commands;
+- access to credentials;
+- file access outside project;
+- deployment;
+- push to remote;
+- destructive Git operations;
+- system configuration.
+
+Strong deny candidates:
+
+- attempts to read SSH/private-key stores;
+- password/credential stores;
+- destructive commands outside project;
+- commands matching explicit user deny rules.
+
+## 14.5 Headless Antigravity Integration Spike
+
+Phase 0 must determine the cleanest supported mechanism for applying Coalition decisions to project-scoped Antigravity permissions in headless mode.
+
+Do not make final architecture depend on unsafe global configuration mutation.
+
+Acceptable final implementation must:
+
+- preserve project scoping;
+- avoid leaking approvals between projects;
+- log every policy mutation;
+- remove temporary "allow once" rules after their intended scope;
+- survive interrupted processes without leaving accidental broad permissions behind.
+
+If the CLI cannot support dynamic one-time approval cleanly, report an Architecture Concern before designing an undocumented workaround.
+
+---
+
+# 15. Icarus Mode
+
+**Icarus** is Coalition's explicit maximum-autonomy mode.
+
+Semantics:
+
+```text
+Icarus ON
+= automatically approve all Builder tool actions
+  for the active project/run
+```
+
+Implementation may map to Antigravity's documented always-proceed / skip-permission mechanism where appropriate.
+
+Requirements:
+
+- never enabled by default;
+- human must explicitly enable it;
+- display a high-visibility persistent banner whenever active;
+- indicate project/run scope;
+- log activation and deactivation;
+- do not automatically carry it to unrelated projects;
+- do not silently restore it after application restart without an obvious visible state;
+- offer one-click disable;
+- final UI wording must clearly state that commands and file writes will be auto-approved.
+
+Suggested banner:
+
+```text
+ICARUS MODE ACTIVE
+All Builder actions for this project are being automatically approved.
+[ Disable Icarus ]
+```
+
+The internal name and user-facing name are both **Icarus**.
+
+---
+
+# 16. Validation Subsystem
+
+Validation is a first-class subsystem but is **optional and configurable**.
+
+Its purposes are:
+
+- give the Builder independent diagnostics;
+- give the Architect evidence during architecture changes;
+- give the Reviewer evidence;
+- give the human visibility;
+- optionally act as a workflow gate when the project chooses.
+
+Coalition must not assume every project needs automated tests.
+
+## 16.1 Two Test Layers
+
+### Builder-run testing
+
+Antigravity may run tests during development.
+
+This is development feedback.
+
+### Coalition-run validation
+
+Coalition independently executes configured commands.
+
+This is Coalition-owned diagnostic evidence.
+
+These must be distinguishable in logs and UI.
+
+## 16.2 Configurability
+
+Project configuration supports:
+
+```text
+Validation entirely off
+
+Validation on, diagnostic only
+
+Validation on, required commands gate review
+
+Validation on, mix of required and optional commands
+```
+
+## 16.3 Trigger Sources
+
+Validation may be started by:
+
+- workflow automation after Builder completion;
+- human manually;
+- Builder request routed through Coalition;
+- pre-review gate;
+- final-validation gate.
+
+Each run records its trigger source.
+
+## 16.4 Runtime Monitoring
+
+While validation is running, the UI must show:
+
+- run ID;
+- overall state;
+- current command;
+- elapsed time;
+- stdout/stderr stream or tail;
+- completed commands;
+- pass/fail;
+- queued commands;
+- progress when determinable.
+
+Example:
+
+```text
+Validation
+
+RUNNING                        02:14
+
+1 / 4 complete
+
+✓ Frontend tests       38 sec
+▶ Rust tests           01:12
+○ Typecheck
+○ Build
+
+[ View Log ] [ Stop ]
+```
+
+## 16.5 Stop Behavior
+
+User can stop:
+
+- current command;
+- entire validation run.
+
+Stopping must:
+
+- send graceful termination first;
+- escalate termination after timeout;
+- record `CANCELED`;
+- preserve partial logs;
+- never report a canceled check as PASS.
+
+## 16.6 Logging
+
+Record for every command:
+
+- run ID;
+- command ID/name;
+- exact command;
+- working directory;
+- start/end;
+- duration;
+- exit code;
+- terminal state;
+- stdout/stderr file location;
+- trigger source;
+- architecture version;
+- Git commit/working-tree fingerprint;
+- whether required/optional.
+
+Logs containing potential secrets must be redacted before inclusion in ChatGPT relay packets.
+
+## 16.7 Diagnostic Routing
+
+On failure, Coalition should be able to generate a bounded diagnostic packet for Antigravity containing:
+
+- failed command;
+- exit code;
+- relevant output tail;
+- associated requirement/milestone;
+- current Git state.
+
+Architect packets during architecture-change analysis may include summarized validation history.
+
+Reviewer packets may include validation summaries and relevant failure logs.
+
+Raw megabyte-scale logs should not be blindly copied to ChatGPT.
+
+---
+
+# 17. Validation Command Safety
+
+Configured validation commands are not exempt from process safety.
+
+Requirements:
+
+- command execution uses the common Coalition process layer;
+- timeouts are enforced;
+- process trees are tracked;
+- cancellation works;
+- output size is bounded in memory and streamed to disk;
+- UI reads/tails logs rather than retaining unlimited output;
+- commands run from explicit working directories;
+- environment overrides are explicit;
+- secrets are not written to `.coalition/` evidence by default.
+
+Do not execute arbitrary ChatGPT-imported commands as validation merely because they appear in a response.
+
+Validation configuration must be human-approved project state.
+
+---
+
+# 18. Git Integration
+
+Use Git CLI through a typed adapter.
+
+V1 requirements:
+
+- repository detection;
+- branch detection;
+- dirty-tree detection;
+- status;
+- diff;
+- log;
+- commit hash;
+- create Coalition branch;
+- architecture freeze boundary;
+- milestone boundary support;
+- review correction boundary support.
+
+Recommended working model:
+
+```text
+baseline branch
+      ↓
+coalition/<feature-or-project>
+      ↓
+architecture freeze
+      ↓
+milestone commits
+      ↓
+correction commits
+```
+
+Do not automatically:
+
+- force push;
+- hard reset;
+- clean untracked files;
+- delete branches;
+- rewrite user history.
+
+These require explicit human action/permission.
+
+Before autonomous build begins, ambiguous dirty-state conditions must be surfaced.
+
+---
+
+# 19. Architecture Freeze
+
+Freeze is a human-only action.
+
+Freeze must:
+
+1. validate required project artifacts exist;
+2. snapshot the current contract under `architecture-versions/vX.Y/`;
+3. record the architecture version;
+4. record Git state/commit;
+5. protect frozen artifacts logically;
+6. create a Builder epoch;
+7. generate the bounded Builder packet.
+
+Coalition should detect external modifications to frozen contract files.
+
+V1 behavior:
+
+- do not rely on OS read-only flags;
+- detect drift;
+- block affected workflow progression;
+- offer:
+  - restore frozen artifact;
+  - inspect diff;
+  - enter Architecture Change.
+
+---
+
+# 20. Human-Only Architecture Change
+
+Always expose:
+
+```text
+Change Architecture
+```
+
+from development states.
+
+Invoking it:
+
+- stops new Builder prompts;
+- requests safe Builder pause/cancel if active;
+- captures Git state;
+- captures current Builder epoch/conversation ID;
+- captures validation state;
+- preserves open findings;
+- records the initiating human event;
+- transitions to `ARCHITECTURE_CHANGE`.
+
+Coalition then prepares an Architect revision packet.
+
+A new architecture version is not active until the human re-freezes.
+
+Re-freeze creates a new Builder epoch so stale assumptions do not silently carry over.
+
+---
+
+# 21. Review and Correction Loop
+
+Reviewer packet includes bounded evidence:
+
+- relevant frozen architecture;
+- relevant requirements;
+- acceptance criteria;
+- milestone;
+- Git diff;
+- selected source excerpts when necessary;
+- validation summary;
+- Builder completion report;
+- prior open findings.
+
+Reviewer verdicts:
+
+```text
+ACCEPT
+CORRECTIONS_REQUIRED
+BLOCKED
+ARCHITECTURE_CONCERN
+```
+
+Imported findings are previewed before acceptance.
+
+Accepted corrections are not passed as raw ChatGPT prose directly to Antigravity.
+
+Coalition generates a normalized correction packet.
+
+Normal loop:
+
+```text
+Builder
+  ↓
+optional validation
+  ↓
+Reviewer relay
+  ↓
+import findings
+  ↓
+Builder correction
+  ↓
+optional validation
+  ↓
+Reviewer
+```
+
+If validation is disabled, the loop still works.
+
+If required validation is enabled and configured as a review gate, failures prevent automatic transition to `WAITING_FOR_REVIEW` until the user overrides or the checks pass.
+
+---
+
+# 22. Activity and Audit Logging
+
+Coalition should produce understandable activity history without requiring raw terminal reading.
+
+Event categories:
+
+- workflow transition;
+- architecture freeze/change;
+- Builder session start/stop;
+- model change;
+- usage sample;
+- permission request;
+- permission decision;
+- Icarus toggle;
+- Git operation;
+- validation start/stop/result;
+- relay packet generation/import;
+- review verdict;
+- recovery event;
+- error.
+
+Every event should have:
+
+- timestamp;
+- project;
+- event type;
+- actor/source;
+- summary;
+- relevant IDs;
+- safe structured metadata.
+
+Logs must avoid secrets.
+
+---
+
+# 23. Recovery
+
+Treat interruption as normal.
+
+On startup:
+
+1. inspect persisted active workflow state;
+2. check for stale process records;
+3. inspect repository state;
+4. reconcile pending validation;
+5. inspect pending Builder epoch/session;
+6. report last durable event.
+
+Example:
+
+```text
+Interrupted project detected
+
+Coalition
+Architecture v1.1
+Builder Epoch 3
+
+Last durable event:
+Builder completed correction REV-014.
+
+Validation:
+Canceled during Rust tests.
+
+[ Resume ]
+[ Inspect ]
+```
+
+Do not pretend a dead process is still running.
+
+---
+
+# 24. Security Requirements
+
+V1 must implement:
+
+- project-scoped filesystem behavior;
+- explicit non-project access permission;
+- no stored AI passwords/tokens;
+- no hidden OAuth handling;
+- command argument sanitization;
+- process lifecycle ownership;
+- no automatic deployment;
+- no automatic remote push without policy;
+- imported AI text treated as untrusted;
+- path traversal protections;
+- relay schema validation;
+- SQL migrations;
+- log redaction helpers;
+- architecture drift detection;
+- Icarus visibility.
+
+Tauri capabilities should be narrowly scoped.
+
+Do not expose broad shell/filesystem capability directly to arbitrary frontend JavaScript when Rust commands can provide a narrower API.
+
+---
+
+# 25. UI Baseline
+
+Coalition should look like a project-control application, not an IDE.
+
+Primary areas:
+
+```text
+Projects
+Project Overview
+Architecture
+Builder
+Usage
+Validation
+Review
+Activity
+Settings
+```
+
+## 25.1 Project Dashboard
+
+At a glance:
+
+```text
+COALITION
+
+Herald
+BUILDING
+Architecture v1.2
+Builder: Gemini ...
+Antigravity quota: 71% remaining
+ChatGPT: ~34% estimated 5h usage
+Validation: running
+
+LiTerra3D
+WAITING FOR REVIEW
+Architecture v2.0
+```
+
+## 25.2 Project View
+
+Show:
+
+- state;
+- architecture version;
+- Builder model/effort;
+- Builder activity;
+- usage;
+- validation;
+- open review findings;
+- pause;
+- Change Architecture.
+
+## 25.3 Global Human-Decision Queue
+
+A user should be able to immediately see when Coalition needs them.
+
+Examples:
+
+```text
+Permission required
+Review relay ready
+Architecture concern
+Validation failed
+Architecture ready to freeze
+Final human review ready
+```
+
+---
+
+# 26. Testing Strategy for Coalition Itself
+
+Coalition must have its own automated test suite.
+
+## 26.1 Rust Unit Tests
+
+Required areas:
+
+- workflow transition rules;
+- artifact versioning;
+- relay parser;
+- permission rule matching;
+- Icarus state;
+- Git adapter result parsing;
+- Antigravity NDJSON parsing;
+- process termination;
+- validation orchestration;
+- usage/quota parsing;
+- ChatGPT estimator windows;
+- recovery reconciliation;
+- log redaction.
+
+## 26.2 Frontend Tests
+
+Use Vitest + React Testing Library or equivalent.
+
+Cover:
+
+- key project-state views;
+- permission modal;
+- Icarus warning;
+- usage estimate disclaimer;
+- validation monitor;
+- review import preview;
+- architecture freeze confirmation;
+- interrupted-project recovery view.
+
+## 26.3 Integration Tests
+
+Use fixtures/fake executables rather than consuming AI quota in CI.
+
+Create fake command binaries/scripts for:
+
+```text
+agy
+git
+validation command
+```
+
+The fake `agy` must be able to emit:
+
+- init event;
+- tool events;
+- text deltas;
+- result;
+- usage metadata;
+- permission denial on stderr;
+- malformed JSON;
+- process hang;
+- canceled status;
+- unavailable model.
+
+Real Antigravity smoke tests are opt-in/manual and must not run in normal public CI.
+
+## 26.4 CI
+
+Initial GitHub Actions should run at least:
+
+```text
+npm install / lockfile install
+frontend typecheck
+frontend tests
+frontend build
+cargo fmt --check
+cargo clippy -- -D warnings
+cargo test
+```
+
+Add Tauri packaging smoke build when practical on Windows.
+
+macOS CI is added when Phase 10 begins.
+
+---
+
+# 27. Coding and Quality Rules
+
+- TypeScript strict mode.
+- Rust errors should use typed error categories rather than string-only flow control.
+- No unchecked `unwrap()` in production paths where recoverable errors are possible.
+- External process protocols must be adapter-isolated.
+- State-changing Tauri commands return structured results/errors.
+- UI should never parse raw Antigravity NDJSON itself.
+- UI should never invoke arbitrary shell commands directly.
+- Prefer narrow components and modules over broad "manager" classes that mix concerns.
+- All persistent schemas have explicit versions.
+- Backward-compatible migrations are required after public releases begin.
+- No generated binaries committed to Git.
+- No private diagnostic captures committed.
+
+---
+
+# 28. Phase 0 — Repository Bootstrap and Technical Proofs
+
+**Goal:** Prove all external/desktop assumptions before building product workflow.
+
+Implement:
+
+- public repo skeleton;
+- Tauri + React + TypeScript + Rust boot;
+- SQLite connection/migration proof;
+- system Git detection;
+- Antigravity CLI detection/version;
+- launch `agy` in structured headless mode;
+- read NDJSON incrementally;
+- capture conversation ID;
+- cancel process;
+- enumerate models;
+- select a model and effort;
+- investigate quota/status integration;
+- clipboard explicit read/write;
+- global hotkey;
+- native opener;
+- process logging.
+
+Technical spikes:
+
+### Spike A — Antigravity usage
+
+Determine the most stable documented method for Coalition to obtain:
+
+- model;
+- context-window remaining;
+- quota remaining/reset data;
+- plan tier when exposed.
+
+Do not scrape the Antigravity GUI.
+
+### Spike B — project-scoped permissions
+
+Determine the supported mechanism for:
+
+- project-scoped allow/deny/ask rules;
+- temporary allow-once behavior;
+- persistent project-local user approval;
+- Icarus mapping;
+- cleanup after temporary approval.
+
+Do not ship a solution that modifies broad global permissions as an undocumented shortcut.
+
+### Spike C — model switching with conversation continuity
+
+Verify:
+
+- discover models;
+- start conversation with model A;
+- persist conversation ID;
+- restart process with model B;
+- resume conversation safely.
+
+### Phase 0 exit criteria
+
+- clean build;
+- Tauri window launches;
+- all spikes documented in `docs/`;
+- real `agy` smoke test succeeds;
+- fake-`agy` harness exists;
+- no product UX beyond minimal diagnostics is required.
+
+Do not begin large workflow implementation until Phase 0 findings are committed.
+
+---
+
+# 29. Phase 1 — Coalition Core and Project Persistence
+
+**Goal:** Establish authoritative local project state.
+
+Implement:
+
+- SQLite migrations;
+- project registration;
+- open existing repository;
+- create `.coalition/`;
+- project.yaml;
+- artifact filesystem service;
+- Rust workflow state machine;
+- activity log;
+- project dashboard shell;
+- Git repository adapter;
+- dirty-state detection;
+- basic settings.
+
+Acceptance:
+
+- reopen app and recover project list;
+- project artifacts survive SQLite deletion;
+- illegal workflow transition unit tests pass;
+- no frontend path can bypass Rust workflow validation;
+- Git state visible.
+
+---
+
+# 30. Phase 2 — ChatGPT Relay and Architecture Workspace
+
+**Goal:** Support real Architect work without API access.
+
+Implement:
+
+- relay packet builder;
+- clipboard copy;
+- browser opener;
+- explicit clipboard import;
+- relay schema;
+- Architect update parser;
+- manual parse fallback;
+- architecture artifact views;
+- imported change preview;
+- required-artifact readiness evaluation;
+- global relay/import hotkeys.
+
+Acceptance:
+
+- user can take an idea through at least one Architect relay round trip;
+- unrelated clipboard content is rejected;
+- imported AI text cannot trigger command execution;
+- relay history persists;
+- no passive clipboard surveillance.
+
+---
+
+# 31. Phase 3 — Architecture Freeze and Git Boundaries
+
+**Goal:** Create a reliable human-approved implementation contract.
+
+Implement:
+
+- readiness checks;
+- freeze confirmation;
+- architecture version snapshots;
+- Git boundary recording;
+- frozen artifact drift detection;
+- restore/inspect/change-architecture options;
+- Builder packet generation.
+
+Acceptance:
+
+- only explicit human action freezes;
+- frozen snapshots are immutable historical records;
+- external edit to frozen active artifact is detected;
+- workflow cannot silently continue on drift.
+
+---
+
+# 32. Phase 4 — Antigravity Builder Integration
+
+**Goal:** Run one bounded Builder milestone end to end.
+
+Implement:
+
+- Builder epoch;
+- persistent stream-json process where validated;
+- progress event mapping;
+- model selector;
+- effort selector;
+- cancellation;
+- retry/recovery;
+- conversation resume;
+- Builder completion report;
+- fake-`agy` integration tests.
+
+Acceptance:
+
+- Antigravity implements a fixture milestone;
+- UI shows meaningful progress;
+- process can be stopped;
+- conversation ID persists;
+- unavailable model fails visibly;
+- app restart does not falsely mark Builder alive.
+
+---
+
+# 33. Phase 5 — Permissions and Icarus
+
+**Goal:** Make autonomous Builder operation safe and usable.
+
+Implement based on Phase 0 permission findings:
+
+- policy evaluator;
+- routine auto-allow patterns;
+- permission decision modal;
+- Deny;
+- Allow Once;
+- Always Allow This;
+- Always Deny This;
+- project-local remembered rules;
+- permission history;
+- Icarus enable/disable;
+- persistent Icarus banner;
+- restart reconciliation.
+
+Acceptance:
+
+- unknown shell command prompts;
+- allow once does not persist after intended scope;
+- remembered project rule works next time;
+- unrelated project does not inherit it;
+- Icarus bypasses prompts within its scope;
+- Icarus state is impossible to miss in UI;
+- all decisions logged.
+
+---
+
+# 34. Phase 6 — Usage and Capacity
+
+**Goal:** Give user useful "how much juice is left" visibility.
+
+Implement:
+
+- Antigravity provider usage samples;
+- active-model display;
+- context remaining;
+- quota buckets/reset timers when available;
+- graceful missing-field behavior;
+- ChatGPT relay telemetry;
+- approximate token estimator;
+- rolling 5-hour estimate;
+- rolling weekly estimate;
+- estimate info/disclaimer;
+- calibration/reset controls.
+
+Acceptance:
+
+- Antigravity values identify themselves as provider-reported;
+- ChatGPT values identify themselves as estimated;
+- estimate tooltip explains limitation;
+- no dollar cost shown;
+- usage history survives restart;
+- model selector uses current CLI model list rather than hardcoded catalog.
+
+---
+
+# 35. Phase 7 — Validation Engine
+
+**Goal:** Add optional Coalition-owned diagnostics.
+
+Implement:
+
+- validation.yaml parser/schema;
+- enable/disable;
+- diagnostic-only vs required gates;
+- queue;
+- process runner;
+- parallelism initially default to sequential;
+- timeout;
+- live stdout/stderr;
+- log files;
+- stop current;
+- stop all;
+- result state;
+- manual run;
+- workflow-triggered run;
+- Builder diagnostic packet;
+- Reviewer summary generation.
+
+V1 may keep validation sequential unless concurrency is clearly required.
+
+Acceptance:
+
+- project with validation disabled completes workflow without tests;
+- project with validation enabled runs configured commands;
+- user can monitor;
+- user can cancel;
+- canceled logs remain available;
+- failed required check blocks review only when project policy says it should;
+- failed optional check is diagnostic only;
+- Builder receives bounded failure diagnostics.
+
+---
+
+# 36. Phase 8 — Reviewer and Correction Loop
+
+**Goal:** Complete the primary Coalition thesis.
+
+Implement:
+
+- Reviewer packet generation;
+- review import parser;
+- finding IDs/severity;
+- finding preview;
+- accept/reject import;
+- normalized correction packet;
+- route corrections to active Builder;
+- resolved/open finding tracking;
+- repeated cycles;
+- ACCEPT transition.
+
+Acceptance:
+
+- one intentional defect is found through Reviewer relay;
+- imported correction reaches Antigravity;
+- Builder fixes it;
+- validation may rerun according to policy;
+- Reviewer accepts;
+- finding history remains visible.
+
+---
+
+# 37. Phase 9 — Architecture Change
+
+**Goal:** Implement the human-only "Oh Shit" cycle.
+
+Implement:
+
+- Change Architecture action;
+- safe Builder pause;
+- validation pause/cancel handling;
+- checkpoint;
+- ACR creation;
+- Architect revision relay;
+- impact summary;
+- ready-to-refreeze;
+- vNext snapshot;
+- new Builder epoch;
+- old epoch retained historically.
+
+Acceptance:
+
+- human can interrupt BUILDING;
+- no agent can self-authorize architecture revision;
+- open work is preserved;
+- prior architecture remains inspectable;
+- re-freeze resumes against new contract;
+- stale old Builder process cannot continue writing unnoticed.
+
+---
+
+# 38. Phase 10 — Recovery, Product UX, and Windows Packaging
+
+**Goal:** Make the Windows application usable outside the development environment.
+
+Implement:
+
+- startup reconciliation;
+- interrupted-state UX;
+- notifications;
+- human-decision queue;
+- configurable hotkeys;
+- polished project dashboard;
+- logs/activity views;
+- validation monitor;
+- usage card;
+- tray behavior if valuable;
+- NSIS or MSI installer;
+- Windows code-signing plan/documentation;
+- release artifact workflow;
+- README user installation instructions.
+
+Acceptance:
+
+- fresh Windows machine can install packaged app without dev runtimes;
+- interrupted Builder and validation states recover truthfully;
+- no critical decision requires raw terminal usage;
+- GitHub CI passes;
+- release candidate can be installed/uninstalled cleanly.
+
+Code signing may remain a release prerequisite if certificate procurement is not yet complete; do not fake signing.
+
+---
+
+# 39. Phase 11 — macOS Support
+
+Begin only after complete Windows vertical slice is stable.
+
+Validate:
+
+- DMG/app packaging;
+- code signing/notarization requirements;
+- global hotkeys;
+- clipboard;
+- browser opener;
+- process signaling;
+- Antigravity CLI discovery;
+- Git discovery;
+- permission scoping;
+- paths;
+- validation process-tree cancellation.
+
+Do not fork architecture into a separate macOS implementation.
+
+Use platform adapters only where behavior genuinely differs.
+
+---
+
+# 40. Definition of Done for V1
+
+Coalition V1 is complete when a user can:
+
+1. Install Coalition as a normal Windows desktop application.
+2. Create/open a local Git project.
+3. Use ChatGPT Plus as Architect through explicit human relay.
+4. Import structured design changes.
+5. Freeze architecture.
+6. Start Antigravity Builder without AI API keys.
+7. Select an available Antigravity model and reasoning effort.
+8. See Builder activity.
+9. See Antigravity context/quota data when available.
+10. See a clearly labeled rough ChatGPT usage estimate.
+11. Respond to out-of-policy Builder commands using deny/allow-once/always-allow.
+12. Enable/disable Icarus mode.
+13. Configure Coalition validation or disable it entirely.
+14. Watch validation progress and logs.
+15. Stop validation safely.
+16. Use validation failures as diagnostics for Builder/Architect/Reviewer.
+17. Generate a Reviewer packet.
+18. Use ChatGPT Plus as Reviewer.
+19. Import structured findings.
+20. Route accepted corrections to Antigravity.
+21. Repeat until accepted.
+22. Pause at any point.
+23. Invoke human-only Architecture Change.
+24. Re-freeze a revised contract.
+25. Recover after interruption.
+26. Reach Ready for Human Review.
+27. Require explicit human final acceptance.
+28. Do all of the above without OpenRouter, OpenAI API, Gemini API keys, Coalition cloud accounts, or Coalition AI billing.
+
+---
+
+# 41. Explicit V1 Non-Goals
+
+Do not implement unless this plan is formally revised:
+
+- OpenRouter;
+- OpenAI API;
+- Gemini API;
+- direct AI provider billing;
+- Coalition model marketplace;
+- public benchmark aggregation;
+- Coalition-native coding agent;
+- embedded IDE;
+- ChatGPT scraping;
+- Antigravity GUI automation;
+- automatic production deployment;
+- cloud Coalition backend;
+- Coalition accounts;
+- multi-user collaboration;
+- organizations/RBAC;
+- SaaS billing;
+- remote Builder fleet;
+- mobile app;
+- GitHub App;
+- plugin marketplace;
+- enterprise policy server.
+
+---
+
+# 42. Implementation Sequencing Rules for Antigravity
+
+When implementing this plan:
+
+1. Work phase by phase.
+2. Do not implement later-phase abstractions prematurely.
+3. At each phase:
+   - update docs;
+   - add/adjust tests;
+   - run project validation;
+   - produce a concise completion report;
+   - commit a recoverable boundary.
+4. Do not mark a phase complete because code exists; verify its acceptance criteria.
+5. Do not silently remove requirements that prove difficult.
+6. Do not introduce a new framework/runtime unless required.
+7. Prefer supported third-party interfaces over UI automation.
+8. When external documentation contradicts this plan, stop the affected integration and report the contradiction.
+9. Preserve cross-platform seams even while developing Windows first.
+10. Keep the public repository free of private data and credentials.
+
+---
+
+# 43. Initial Coalition Self-Validation
+
+Once the repo is bootstrapped, define Coalition's own validation configuration approximately as:
+
+```yaml
+schema_version: 1
+
+enabled: true
+
+policy:
+  gate_review_on_required_failure: true
+
+commands:
+  - id: frontend-typecheck
+    name: Frontend TypeScript check
+    command: npm run typecheck
+    required: true
+    timeout_seconds: 600
+
+  - id: frontend-tests
+    name: Frontend tests
+    command: npm test -- --run
+    required: true
+    timeout_seconds: 900
+
+  - id: frontend-build
+    name: Frontend build
+    command: npm run build
+    required: true
+    timeout_seconds: 600
+
+  - id: rust-format
+    name: Rust formatting
+    command: cargo fmt --check
+    working_directory: src-tauri
+    required: true
+    timeout_seconds: 300
+
+  - id: rust-clippy
+    name: Rust Clippy
+    command: cargo clippy -- -D warnings
+    working_directory: src-tauri
+    required: true
+    timeout_seconds: 900
+
+  - id: rust-tests
+    name: Rust tests
+    command: cargo test
+    working_directory: src-tauri
+    required: true
+    timeout_seconds: 1200
+```
+
+Packaging builds may initially be a separate/manual release check if they materially slow every development cycle.
+
+Later add a Windows Tauri package smoke test in CI.
+
+---
+
+# 44. First Antigravity Assignment
+
+The first implementation session should execute **Phase 0 only**.
+
+Do not ask Antigravity to implement the entire product in a single autonomous run.
+
+Initial assignment:
+
+> Bootstrap the public Coalition repository and complete Phase 0 — Repository Bootstrap and Technical Proofs from the Master Implementation Plan. Do not proceed into Phase 1 until every Phase 0 exit criterion has been demonstrated. Record external-interface findings in the corresponding docs, especially Antigravity structured headless I/O, model selection, quota/status access, project-scoped permissions, one-time approval feasibility, Icarus mapping, conversation resume across model changes, and process cancellation. Add fake-`agy` fixtures so normal automated tests do not consume subscription quota. Run the new repository's validation suite and provide the exact results and remaining concerns.
+
+This bounded start is intentional.
+
+Phase 0 exists to prove the third-party integration assumptions before the project accumulates architecture around guesses.
+
+---
+
+# 45. Master Product Principle
+
+Coalition is successful when it becomes difficult for an AI implementation to drift silently away from what the human actually approved.
+
+The human defines the product.
+
+The architecture records the product.
+
+Antigravity attempts the implementation.
+
+Coalition observes and governs the work.
+
+Configured validation supplies diagnostics.
+
+ChatGPT independently challenges the implementation.
+
+Coalition records the evidence and decisions.
+
+Only the human decides when the product is finished.

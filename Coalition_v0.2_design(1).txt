@@ -1,0 +1,2444 @@
+# Coalition — Product & Technical Design Draft
+
+**Status:** Early Product / Architecture Draft  
+**Working Name:** Coalition  
+**Version:** 0.2  
+**Date:** September 7, 2026  
+**Supersedes:** Coalition v0.1 Project Draft  
+
+---
+
+# 1. Executive Summary
+
+Coalition is a local-first desktop orchestration and governance application for AI-assisted software development.
+
+Version 0.2 deliberately narrows Coalition's role.
+
+Coalition is **not** intended to become another coding agent, another IDE, another AI model gateway, or another source-code execution environment in V1.
+
+Instead, Coalition coordinates tools the user already has and already pays for:
+
+- **ChatGPT Plus** provides human-relayed Architect and Reviewer conversations.
+- **Google Antigravity / Google AI Pro** provides the Builder through Google's official Antigravity CLI.
+- **Git, local files, and project-defined validation commands** provide deterministic evidence.
+- **Coalition** provides the architecture contract, workflow state, review protocol, human approval gates, history, and orchestration.
+
+The central product thesis remains unchanged:
+
+> No AI agent should be allowed to define, implement, and approve the same software system without independent challenge and explicit human authority.
+
+The key change is where Coalition draws its boundary.
+
+Coalition v0.1 proposed building a native AI execution environment with its own model gateway, model selection system, Builder runtime, tool harness, context management, and usage billing support.
+
+Coalition v0.2 instead becomes the **local control plane** between human-approved architecture, ChatGPT, Antigravity, Git, and deterministic validation.
+
+The authority hierarchy remains:
+
+```text
+Human
+  ↓
+Frozen Architecture Contract
+  ↓
+Deterministic Evidence
+  ↓
+Independent AI Roles
+```
+
+Only the human may:
+
+- freeze an architecture;
+- approve an architecture revision;
+- abandon or supersede an architecture;
+- authorize resumed implementation after architectural change;
+- accept the finished product.
+
+Coalition should make sophisticated AI development feel less like manually copying information between unrelated tools and more like directing a disciplined engineering process.
+
+---
+
+# 2. V0.2 Product Definition
+
+**Coalition is a local-first desktop control plane that governs AI-assisted software development by turning human intent into versioned architecture contracts, directing an external Builder, coordinating independent human-relayed AI review, collecting deterministic evidence, and preventing implementation from silently drifting away from the design the human approved.**
+
+Coalition does not need to write code itself to accomplish this.
+
+Its differentiated responsibility is governance.
+
+---
+
+# 3. Why V0.2 Changes Direction
+
+The v0.1 design placed too much responsibility inside Coalition.
+
+V0.1 contemplated building or owning:
+
+- an OpenRouter model gateway;
+- API-key onboarding;
+- model discovery;
+- pricing and token-cost calculation;
+- a Coalition-native Builder;
+- repository tools such as file read/write and command execution;
+- source-context selection;
+- model benchmark tracking;
+- provider abstraction;
+- model role recommendation;
+- potentially multiple AI-provider integrations.
+
+Those systems are useful, but they are not the essential reason Coalition should exist.
+
+The essential product is the governed lifecycle:
+
+```text
+Human Idea
+    │
+    ▼
+Architectural Exploration
+    │
+    ▼
+Architecture Contract
+    │
+    ▼
+Human Freeze
+    │
+    ▼
+Builder
+    │
+    ▼
+Deterministic Validation
+    │
+    ▼
+Independent Reviewer
+    │
+    ├── Corrections Required ─────┐
+    │                             │
+    │                             ▼
+    │                          Builder
+    │                             │
+    └─────────────────────────────┘
+    │
+    ▼
+Ready for Human Review
+```
+
+And at any development point:
+
+```text
+Human decides architecture must change
+            │
+            ▼
+     CHANGE ARCHITECTURE
+            │
+            ▼
+Implementation paused
+            │
+            ▼
+Architecture revision
+            │
+            ▼
+Human re-freeze
+            │
+            ▼
+Builder resumes
+```
+
+V0.2 therefore concentrates implementation effort on this workflow rather than recreating a coding-agent platform.
+
+---
+
+# 4. Core Design Principles
+
+## 4.1 Human Authority
+
+The human owns the product.
+
+AI systems may reason, implement, review, criticize, and recommend.
+
+They may not redefine the approved product without explicit human action.
+
+## 4.2 Architecture Is the Contract
+
+Once frozen, the architecture is authoritative.
+
+Implementation convenience does not supersede the contract.
+
+A Builder may report that a requirement is difficult, contradictory, unsafe, or impractical.
+
+A Reviewer may report that the architecture is ambiguous or flawed.
+
+Neither may silently change it.
+
+## 4.3 Role Separation
+
+Coalition V1 recognizes three operational roles:
+
+- **Architect** — ChatGPT through an explicit human relay.
+- **Builder** — Antigravity CLI.
+- **Reviewer** — ChatGPT through an explicit human relay, preferably in a separate conversation from the Architect.
+
+An optional **Arbiter** role remains conceptually valid but is not required for the first vertical slice.
+
+## 4.4 Evidence Over Claims
+
+Builder statements such as "complete" or "fixed" are not evidence.
+
+Coalition should prefer:
+
+1. Git diff and repository state.
+2. Build results.
+3. Type/compiler results.
+4. Automated tests.
+5. Static or security checks where configured.
+6. Requirement-specific acceptance evidence.
+7. Independent Reviewer judgment.
+8. Human evaluation.
+
+## 4.5 Simplicity
+
+Coalition should avoid functionality already provided well by another tool unless Coalition must own it for governance or correctness.
+
+Prefer:
+
+- Antigravity for coding-agent execution;
+- Git for source history;
+- normal project commands for validation;
+- ChatGPT's existing interface for Architect and Reviewer conversations;
+- Markdown/YAML/JSON for project contracts;
+- SQLite only for local operational state;
+- explicit human relay instead of fragile UI scraping.
+
+## 4.6 Local First
+
+Coalition V1 requires no Coalition cloud backend.
+
+Project source and architecture remain local.
+
+Coalition should not require:
+
+- a Coalition account;
+- hosted Coalition source storage;
+- SaaS billing;
+- cloud project state;
+- AI API keys;
+- an OpenRouter account.
+
+## 4.7 Subscription-Backed AI
+
+V1 should be usable with consumer subscriptions the user may already have:
+
+```text
+ChatGPT Plus
++
+Google AI Pro / Antigravity
++
+Coalition
+```
+
+Coalition itself does not purchase, resell, meter, or bill AI tokens.
+
+## 4.8 Explicit Integration Boundaries
+
+Coalition must use supported integration surfaces.
+
+It must not depend on scraping third-party AI web interfaces, hidden endpoints, stolen OAuth credentials, or simulated autonomous extraction from ChatGPT.
+
+---
+
+# 5. Application Form
+
+Coalition V1 should be a **native cross-platform desktop application** with a web-technology user interface.
+
+Recommended stack:
+
+```text
+Tauri 2.x
+├── React
+├── TypeScript
+├── Vite
+└── Rust
+```
+
+Target platforms:
+
+```text
+1. Windows 10/11
+2. macOS
+3. Linux later
+```
+
+The application should not require a localhost FastAPI server.
+
+The application should not require Python on the end-user machine.
+
+The application should not require Electron.
+
+---
+
+# 6. Why Tauri Fits Coalition
+
+Coalition requires capabilities that a conventional hosted web application cannot reliably provide:
+
+- global keyboard shortcuts;
+- clipboard read/write after explicit user action;
+- local filesystem access;
+- Git command execution;
+- Antigravity CLI process management;
+- streaming process I/O;
+- local validation command execution;
+- native notifications;
+- opening the user's normal browser;
+- application lifecycle and recovery;
+- cross-platform packaging.
+
+At the same time, Coalition benefits from web UI development because its interface is primarily dashboards, documents, state, reviews, histories, and controls.
+
+Tauri provides an appropriate boundary:
+
+```text
+React / TypeScript
+= user-facing application
+
+Rust / Tauri
+= trusted local machine capabilities
+```
+
+---
+
+# 7. High-Level Technical Architecture
+
+```text
+                        COALITION
+
+                  Tauri Desktop App
+┌────────────────────────────────────────────────────────┐
+│                                                        │
+│                 React / TypeScript UI                  │
+│                                                        │
+│   Projects                                             │
+│   Architecture                                         │
+│   Requirements                                         │
+│   Builder status                                       │
+│   Validation                                           │
+│   Reviews                                              │
+│   Architecture changes                                 │
+│   Activity / history                                   │
+│                                                        │
+└─────────────────────────┬──────────────────────────────┘
+                          │ Tauri commands/events
+                          ▼
+┌────────────────────────────────────────────────────────┐
+│                   Coalition Core                       │
+│                        Rust                            │
+│                                                        │
+│   Workflow State Machine                              │
+│   Architecture Version Manager                        │
+│   Relay Package Manager                               │
+│   Antigravity Adapter                                 │
+│   Git Adapter                                          │
+│   Validation Runner                                    │
+│   Project Artifact Manager                             │
+│   Event / Audit Recorder                               │
+│   Recovery Manager                                     │
+│                                                        │
+├───────────────┬──────────────────┬─────────────────────┤
+│ Desktop       │ Antigravity      │ Local Project       │
+│ Integration   │ Integration      │ Integration         │
+│               │                  │                     │
+│ clipboard     │ official `agy`   │ filesystem          │
+│ hotkeys       │ stdin/stdout     │ Git CLI             │
+│ opener        │ stream-json      │ test/build commands │
+│ notifications │ conversations    │ `.coalition/`       │
+└───────┬───────┴─────────┬────────┴──────────┬──────────┘
+        │                 │                   │
+        ▼                 ▼                   ▼
+   ChatGPT Web        Antigravity          Git Repo
+   Human Relay        Google account
+```
+
+---
+
+# 8. Technology Baseline
+
+## Desktop Framework
+
+Tauri 2.x
+
+## Frontend
+
+React  
+TypeScript  
+Vite
+
+## Native / Core Logic
+
+Rust
+
+## Local Operational Database
+
+SQLite
+
+## Durable Project Artifacts
+
+Markdown  
+YAML  
+JSON
+
+## Source Control
+
+External Git CLI
+
+## Builder
+
+Official Antigravity CLI (`agy`)
+
+## Architect
+
+ChatGPT Plus through explicit human relay
+
+## Reviewer
+
+ChatGPT Plus through explicit human relay
+
+## Networking
+
+No Coalition-operated AI network integration required in V1.
+
+## AI Secrets
+
+None stored by Coalition in V1.
+
+---
+
+# 9. Responsibility Boundary: React vs Rust
+
+React/TypeScript should own presentation and user interaction.
+
+Examples:
+
+- project dashboard;
+- architecture document views;
+- requirement tables;
+- freeze/re-freeze dialogs;
+- review cards;
+- change-impact views;
+- validation results;
+- Builder activity stream;
+- settings;
+- onboarding;
+- history and audit views.
+
+Rust should own authoritative machine-side behavior.
+
+Examples:
+
+- workflow transitions;
+- filesystem access;
+- project locking;
+- Antigravity process management;
+- Git execution;
+- validation execution;
+- relay import/export operations;
+- clipboard operations initiated by the user;
+- global shortcuts;
+- process cancellation;
+- recovery;
+- SQLite writes;
+- validation of state transitions.
+
+The UI displays workflow state.
+
+The UI should not be the authoritative workflow engine.
+
+---
+
+# 10. Project Source of Truth
+
+Coalition uses two forms of local persistence with intentionally different authority.
+
+## 10.1 `.coalition/` — Durable Project Contract
+
+The repository-local `.coalition/` directory stores project meaning.
+
+It is:
+
+- human-readable;
+- Git-versioned;
+- portable;
+- inspectable without Coalition;
+- the durable source for architecture, requirements, reviews, and decisions.
+
+Proposed structure:
+
+```text
+project-root/
+│
+├── source...
+│
+└── .coalition/
+    ├── project.yaml
+    │
+    ├── design/
+    │   ├── product-vision.md
+    │   ├── requirements.md
+    │   ├── architecture.md
+    │   ├── constraints.md
+    │   ├── interfaces.md
+    │   └── security.md
+    │
+    ├── implementation/
+    │   ├── implementation-plan.md
+    │   ├── acceptance-criteria.yaml
+    │   └── test-plan.md
+    │
+    ├── decisions/
+    │   ├── ADR-001.md
+    │   └── ...
+    │
+    ├── architecture-versions/
+    │   ├── v1.0/
+    │   ├── v1.1/
+    │   └── ...
+    │
+    ├── changes/
+    │   ├── ACR-001.md
+    │   └── ...
+    │
+    ├── reviews/
+    │   ├── cycle-001/
+    │   └── ...
+    │
+    └── evidence/
+        └── ...
+```
+
+Exact naming may change before implementation.
+
+## 10.2 SQLite — Operational State
+
+SQLite stores what Coalition is currently doing locally.
+
+Examples:
+
+```text
+projects
+workflow_state
+active_runs
+antigravity_sessions
+relay_events
+validation_runs
+ui_preferences
+recent_activity
+recovery_state
+```
+
+Principle:
+
+```text
+.coalition/
+= what the project IS
+
+SQLite
+= what Coalition is DOING
+```
+
+No architecture should become inaccessible merely because Coalition's local database is lost.
+
+---
+
+# 11. First-Run Experience
+
+V1 onboarding should remain short.
+
+## Step 1 — Welcome
+
+Explain:
+
+> Coalition coordinates ChatGPT and Antigravity around a frozen architecture contract so implementation can be independently reviewed without requiring AI API keys.
+
+## Step 2 — Dependency Detection
+
+Coalition checks for:
+
+- Git;
+- Antigravity CLI (`agy`);
+- supported OS version.
+
+Optional project runtimes such as Node, Python, Docker, .NET, Java, or Rust are detected later per project.
+
+## Step 3 — Antigravity Authentication Check
+
+Coalition runs a harmless CLI check.
+
+If Antigravity is not authenticated, the user is directed to authenticate through the official Antigravity flow.
+
+Coalition never asks for or stores the Google password or Antigravity OAuth token.
+
+## Step 4 — ChatGPT Relay Explanation
+
+Coalition explains the manual trust boundary:
+
+```text
+Coalition prepares prompts.
+You send them through ChatGPT.
+You explicitly copy the response.
+Coalition imports what you copied.
+```
+
+Setup completes.
+
+---
+
+# 12. Project Creation
+
+The user chooses:
+
+**New Project**
+
+Then:
+
+```text
+Start From an Idea
+
+Import Existing Planning
+
+Open Existing Repository
+```
+
+These may converge into the same project workspace.
+
+---
+
+# 13. Start From an Idea
+
+Coalition creates an initial Architect relay package.
+
+Example:
+
+```text
+What do you want to build?
+
+[ description ]
+
+[ Prepare Architect Session ]
+```
+
+Coalition generates a structured initial prompt for ChatGPT containing:
+
+- Coalition Architect role instructions;
+- current project context;
+- known decisions;
+- unresolved design areas;
+- expected artifact outputs;
+- instruction not to freeze architecture autonomously.
+
+The prompt is copied to the clipboard only when the user requests it.
+
+---
+
+# 14. Import Existing Planning
+
+Users may begin with:
+
+- Markdown documents;
+- exported AI conversations;
+- requirements documents;
+- architecture drafts;
+- notes;
+- existing repositories;
+- combinations of these.
+
+Coalition creates an Architect packet asking ChatGPT to identify:
+
+- settled decisions;
+- requirements;
+- architecture;
+- assumptions;
+- contradictions;
+- missing information;
+- acceptance criteria;
+- implementation phases.
+
+Import does not bypass architectural review.
+
+It bootstraps it.
+
+---
+
+# 15. ChatGPT Human Relay
+
+The ChatGPT integration is intentionally not an automated browser integration.
+
+Coalition should never require:
+
+- DOM scraping;
+- accessibility-tree extraction from ChatGPT;
+- OCR of ChatGPT responses;
+- simulated clicking of ChatGPT's Copy button;
+- automatic harvesting of ChatGPT output;
+- hidden ChatGPT endpoints;
+- consumer-account OAuth reuse.
+
+Instead, Coalition provides an explicit relay.
+
+## Outbound Flow
+
+```text
+Coalition prepares packet
+        ↓
+User presses "Copy for ChatGPT"
+        ↓
+Coalition writes packet to clipboard
+        ↓
+Coalition may open/focus ChatGPT URL
+        ↓
+User pastes and sends
+```
+
+## Inbound Flow
+
+```text
+ChatGPT responds
+        ↓
+User explicitly copies response
+        ↓
+User presses Coalition Import hotkey/button
+        ↓
+Coalition reads clipboard
+        ↓
+Coalition validates/parses response
+        ↓
+User confirms material project changes
+```
+
+The user remains the deliberate transfer mechanism.
+
+---
+
+# 16. Relay Hotkeys
+
+Proposed initial global shortcuts:
+
+```text
+CommandOrControl + Shift + R
+Prepare/copy the currently required ChatGPT relay packet
+
+CommandOrControl + Shift + I
+Import clipboard into the active Coalition relay
+
+CommandOrControl + Shift + P
+Pause active Coalition automation
+```
+
+Final shortcuts should be configurable and checked for conflicts.
+
+Coalition should not continuously inspect the user's clipboard by default.
+
+Clipboard access should occur only after explicit user action.
+
+---
+
+# 17. Relay Packet Format
+
+Coalition should not rely on vague conversational prompts.
+
+Every relay should have a machine-recognizable envelope.
+
+Conceptually:
+
+```yaml
+coalition_packet:
+  schema: 1
+  project_id: herald
+  packet_id: RELAY-0042
+  role: REVIEWER
+  architecture_version: 1.2
+  review_cycle: 3
+  expected_response: REVIEW_VERDICT
+```
+
+The human-visible prompt follows the envelope.
+
+The requested response should also use a structured fenced block where practical.
+
+Example:
+
+```yaml
+verdict: CORRECTIONS_REQUIRED
+findings:
+  - id: REV-014
+    severity: high
+    requirement: ARCH-021
+    problem: ...
+    required_change: ...
+    required_test: ...
+```
+
+Coalition should tolerate explanatory prose around the structured result, but the structured block should be authoritative when present.
+
+---
+
+# 18. Architect Workspace
+
+The Architect workspace combines local structured project artifacts with the external ChatGPT conversation.
+
+Conceptual UI:
+
+```text
+┌──────────────────────────────┬─────────────────────────────┐
+│ ARCHITECT RELAY              │ PROJECT DESIGN              │
+│                              │                             │
+│ ChatGPT session              │ Product Vision          ✓  │
+│ External                     │ Requirements            ✓  │
+│                              │ Architecture            ◐  │
+│ [ Copy Next Prompt ]         │ Interfaces              ○  │
+│ [ Import Response ]          │ Security                ○  │
+│                              │ Test Plan               ○  │
+│ Last import: 2 min ago       │ Acceptance Criteria     ○  │
+│                              │                             │
+└──────────────────────────────┴─────────────────────────────┘
+```
+
+Coalition stores the resulting artifacts locally.
+
+It does not need to mirror or scrape the entire ChatGPT conversation.
+
+---
+
+# 19. Architecture Freeze
+
+When the required project artifacts are complete, Coalition presents:
+
+```text
+ARCHITECTURE READY
+
+✓ Product Vision
+✓ Requirements
+✓ Architecture
+✓ Constraints / Security
+✓ Implementation Plan
+✓ Test Plan
+✓ Acceptance Criteria
+
+[ Continue Designing ]
+
+[ Freeze Architecture & Build ]
+```
+
+Only the human may select the freeze action.
+
+The freeze process:
+
+1. validates required artifacts;
+2. snapshots them into `architecture-versions/vX.Y/`;
+3. records a Git commit or requires a clean commit boundary;
+4. marks the architecture immutable;
+5. generates the Builder implementation packet;
+6. transitions the project to `FROZEN` and then `BUILDING`.
+
+---
+
+# 20. Frozen Architecture Rules
+
+After freeze:
+
+- Architect cannot silently modify the frozen contract.
+- Builder cannot modify the frozen contract.
+- Reviewer cannot redefine it.
+- Coalition must detect attempted modifications to frozen architecture artifacts.
+- Any substantive architecture change requires the human-only Architecture Change workflow.
+
+Agents may report an architecture concern.
+
+They may not resolve it by altering the frozen contract.
+
+---
+
+# 21. Builder Integration
+
+The Builder is the official Antigravity CLI.
+
+Coalition does not emulate the Antigravity desktop UI.
+
+Coalition does not scrape it.
+
+Coalition launches and communicates with the supported CLI process.
+
+Preferred integration:
+
+```text
+agy --input-format stream-json --output-format stream-json
+```
+
+This allows Coalition to:
+
+- start one Builder session;
+- send prompts over stdin;
+- receive machine-readable events;
+- receive tool/progress events;
+- receive terminal result events;
+- retain a conversation ID;
+- determine when a turn succeeds or fails;
+- send follow-up corrections without restarting the conceptual Builder context.
+
+---
+
+# 22. Antigravity Session Model
+
+Recommended V1 behavior:
+
+- One active Antigravity conversation per project build epoch.
+- The session may span several implementation/correction turns.
+- Conversation IDs are persisted in SQLite.
+- Important Builder inputs and final outputs are also recorded under `.coalition/` where necessary for auditability.
+- If the process dies, Coalition should attempt to resume using the supported conversation mechanism rather than assuming hidden in-memory continuity.
+
+Architecture re-freeze should create a new Builder epoch.
+
+This prevents stale architectural assumptions from silently surviving a major contract revision.
+
+---
+
+# 23. Builder Input Contract
+
+The Builder receives a bounded implementation packet.
+
+Example:
+
+```text
+ROLE: Builder
+
+AUTHORITATIVE ARCHITECTURE:
+Architecture v1.2
+
+CURRENT MILESTONE:
+Milestone 3 — Approval Workflow
+
+REQUIREMENTS:
+REQ-021, REQ-022, REQ-031
+
+ACCEPTANCE CRITERIA:
+AC-044 through AC-052
+
+RULES:
+- Do not modify frozen architecture artifacts.
+- Do not redefine requirements.
+- Run required validation.
+- If the architecture appears impossible, contradictory, or materially wrong,
+  stop and report ARCHITECTURE_CONCERN.
+- Report the files changed, commands executed, tests run, and unresolved risks.
+```
+
+Coalition controls the packet.
+
+Antigravity controls how implementation is performed within the authorized project context.
+
+---
+
+# 24. Builder Milestones
+
+The Builder should work in bounded milestones.
+
+Example:
+
+```text
+1. Project Foundation
+2. Domain Model
+3. Core Workflow
+4. User Interface
+5. Integration
+6. Final Validation
+```
+
+Each milestone should have:
+
+- scoped requirements;
+- scoped acceptance criteria;
+- expected validation;
+- completion evidence;
+- a recoverable Git boundary.
+
+This reduces drift and makes review smaller and more precise.
+
+---
+
+# 25. Antigravity Permissions
+
+Coalition should not default to universal automatic permission approval.
+
+In particular, V1 should not routinely use an option equivalent to approving every tool action.
+
+Recommended posture:
+
+```text
+LOW RISK
+Project file reads/writes
+Known validation commands
+Git status/diff
+Normal project build/test activity
+
+HIGHER RISK
+Network access
+Package installation
+Commands outside project root
+Credential access
+Destructive filesystem commands
+Git reset/clean/force operations
+Deployment
+```
+
+V1 should prefer:
+
+- project-scoped execution;
+- Antigravity sandboxing where practical;
+- explicit permissions;
+- visible escalation for sensitive operations.
+
+The exact permission policy remains a pre-implementation design decision.
+
+---
+
+# 26. Git as Source History
+
+Coalition relies on Git rather than inventing source control.
+
+Coalition should collect:
+
+- current branch;
+- working-tree state;
+- diff;
+- commits;
+- architecture freeze commit;
+- Builder milestone commits where configured;
+- review correction boundaries.
+
+Coalition must never silently overwrite known-good work.
+
+---
+
+# 27. Recommended Git Working Model
+
+Recommended starting design:
+
+```text
+user branch / baseline
+        │
+        └── coalition/<project-or-feature>
+                │
+                ├── architecture freeze
+                ├── milestone 1
+                ├── milestone 2
+                ├── reviewer corrections
+                └── accepted implementation
+```
+
+Coalition should refuse autonomous build start when the working tree is in an unsafe ambiguous state unless the user explicitly chooses how to proceed.
+
+Future versions may use Git worktrees for stronger isolation.
+
+---
+
+# 28. Deterministic Validation
+
+Coalition does not create its own language-specific test framework.
+
+Each project declares validation commands.
+
+Example:
+
+```yaml
+validation:
+  required:
+    - npm run typecheck
+    - npm test
+    - npm run build
+  optional:
+    - npm run lint
+```
+
+Coalition records:
+
+- command;
+- start time;
+- duration;
+- exit code;
+- stdout/stderr location;
+- pass/fail state;
+- associated Git commit;
+- associated architecture version.
+
+Required deterministic validation must pass before a review can result in automated acceptance unless the architecture explicitly allows otherwise.
+
+---
+
+# 29. Reviewer Workflow
+
+The Reviewer is ChatGPT through a human relay.
+
+The Reviewer receives a Coalition-generated packet containing only the evidence necessary for the review.
+
+Potential contents:
+
+- architecture version;
+- relevant requirements;
+- acceptance criteria;
+- implementation milestone;
+- Git diff;
+- changed files or selected source excerpts;
+- validation results;
+- Builder completion report;
+- prior unresolved findings.
+
+The Reviewer is instructed to evaluate conformity, not redesign the product.
+
+---
+
+# 30. Review Verdicts
+
+V1 verdicts:
+
+```text
+ACCEPT
+CORRECTIONS_REQUIRED
+BLOCKED
+ARCHITECTURE_CONCERN
+```
+
+Structured finding:
+
+```yaml
+id: REV-014
+severity: high
+requirement: ARCH-021
+file: src/example.ts
+problem: ...
+required_change: ...
+required_test: ...
+```
+
+`ARCHITECTURE_CONCERN` is a human escalation.
+
+It does not authorize contract mutation.
+
+---
+
+# 31. Correction Loop
+
+```text
+Antigravity Builder
+        │
+        ▼
+Validation
+        │
+        ▼
+Coalition prepares Reviewer packet
+        │
+        ▼
+Human sends via ChatGPT
+        │
+        ▼
+Human copies Reviewer response
+        │
+        ▼
+Coalition imports verdict
+        │
+        ├── ACCEPT
+        │
+        └── CORRECTIONS_REQUIRED
+                    │
+                    ▼
+             Antigravity Builder
+                    │
+                    ▼
+                Validation
+                    │
+                    ▼
+                 Review
+```
+
+Only the ChatGPT relay portion requires manual transport.
+
+Everything else should be automated where safe.
+
+---
+
+# 32. Reviewer Independence
+
+Coalition should encourage, but cannot technically guarantee, independent ChatGPT reasoning when the same subscription powers both Architect and Reviewer.
+
+Recommended UX guidance:
+
+```text
+Chat 1 — Project Architect
+Chat 2 — Implementation Reviewer
+Chat 3 — Architecture Revision (optional)
+```
+
+Coalition should generate different role instructions and context packages.
+
+The Reviewer should not receive Builder chain-of-thought or unsupported assertions.
+
+It receives artifacts and evidence.
+
+---
+
+# 33. Human-Only Architecture Change
+
+Architecture Change remains a foundational feature.
+
+An always-available control should exist during development:
+
+**Change Architecture**
+
+Internally it may remain informally known as the "Oh Shit" button.
+
+Invoking it:
+
+1. stops new Builder instructions;
+2. interrupts or safely pauses active autonomous work;
+3. records current Git state;
+4. records active Antigravity state;
+5. records validation state;
+6. preserves open review findings;
+7. transitions the project to `ARCHITECTURE_CHANGE`.
+
+---
+
+# 34. Architecture Change Workflow
+
+```text
+Architecture v1.0
+      │
+      ▼
+Implementation
+      │
+      ▼
+Human identifies design problem
+      │
+      ▼
+CHANGE ARCHITECTURE
+      │
+      ▼
+Implementation paused
+      │
+      ▼
+Coalition prepares Architect revision packet
+      │
+      ▼
+Human + ChatGPT Architect
+      │
+      ▼
+Proposed v1.1
+      │
+      ▼
+Impact Analysis
+      │
+      ▼
+Human re-freeze
+      │
+      ▼
+New Builder epoch
+      │
+      ▼
+Implementation resumes
+```
+
+---
+
+# 35. Architecture Change Record
+
+Every substantive revision creates an ACR.
+
+Example:
+
+```text
+ACR-003
+
+Architecture:
+v1.0 → v1.1
+
+Initiated by:
+Human
+
+Reason:
+Real-world testing showed that real-time event updates are required
+instead of 30-second polling.
+
+Affected areas:
+- backend event model
+- frontend synchronization
+- interfaces
+- validation
+
+Superseded decisions:
+ADR-005
+
+New decisions:
+ADR-011
+ADR-012
+```
+
+Architectural provenance is part of the product, not optional documentation.
+
+---
+
+# 36. Architecture Impact Analysis
+
+Before re-freeze, Coalition should produce an impact packet using:
+
+- revised architecture;
+- current Git state;
+- completed milestones;
+- open findings;
+- validation state.
+
+The Architect can assess:
+
+```text
+Existing implementation reusable
+Components requiring rework
+Tests invalidated
+Requirements superseded
+Acceptance criteria added/removed
+New implementation milestones
+Migration risks
+```
+
+V1 does not need to pretend these percentages or estimates are mathematically precise.
+
+They are planning aids.
+
+---
+
+# 37. Project State Machine
+
+Proposed V1 states:
+
+```text
+DRAFT
+  │
+  ▼
+ARCHITECTING
+  │
+  ▼
+READY_TO_FREEZE
+  │
+  ▼
+FROZEN
+  │
+  ▼
+BUILDING
+  │
+  ▼
+VALIDATING
+  │
+  ▼
+WAITING_FOR_REVIEW
+  │
+  ├── CORRECTIONS_REQUIRED ─────→ BUILDING
+  │
+  ├── BLOCKED
+  │
+  ├── ARCHITECTURE_CONCERN
+  │
+  └── REVIEW_ACCEPTED
+              │
+              ▼
+       FINAL_VALIDATION
+              │
+              ▼
+   READY_FOR_HUMAN_REVIEW
+              │
+              ▼
+       HUMAN_ACCEPTED
+```
+
+Architecture revision adds:
+
+```text
+ANY DEVELOPMENT STATE
+        │
+        │ human only
+        ▼
+ARCHITECTURE_CHANGE
+        │
+        ▼
+ARCHITECTING_REVISION
+        │
+        ▼
+READY_TO_REFREEZE
+        │
+        ▼
+FROZEN vNext
+        │
+        ▼
+BUILDING
+```
+
+State transitions should be validated by Rust core logic, not inferred from UI pages.
+
+---
+
+# 38. Pause, Resume, and Recovery
+
+Coalition must assume interruption is normal.
+
+Examples:
+
+- app closes;
+- computer reboots;
+- Antigravity process exits;
+- validation hangs;
+- Git changes externally;
+- user pauses intentionally;
+- ChatGPT review is not returned until later.
+
+On restart Coalition should be able to say:
+
+```text
+Interrupted project found
+
+Herald
+Architecture v1.2
+Review Cycle 3
+
+Last durable event:
+Antigravity completed correction REV-014.
+Validation was not yet rerun.
+
+[ Resume ]
+[ Inspect ]
+```
+
+No critical project state should exist only inside a transient AI conversation.
+
+---
+
+# 39. Activity Transparency
+
+Default activity should be human-readable:
+
+```text
+Builder
+Implementing Milestone 3...
+
+Current activity
+Running unit tests
+
+Files changed
+7
+
+Validation
+104 / 104 passing
+```
+
+Advanced activity may expose:
+
+```text
+17:42:18 Builder turn started
+17:42:23 read_file src/foo.ts
+17:43:01 write_file src/foo.ts
+17:43:20 command npm test
+17:43:41 exit 0
+17:43:47 result SUCCESS
+```
+
+Users should not need raw agent logs to understand progress.
+
+---
+
+# 40. Human Review Boundary
+
+Coalition can determine that automated gates are satisfied.
+
+It cannot accept the product on behalf of the human.
+
+Ready state example:
+
+```text
+READY FOR HUMAN REVIEW
+
+Architecture               v1.2
+Acceptance Criteria        42 / 42
+Required Validation        PASS
+Reviewer                   ACCEPT
+Blocking Findings          0
+Architecture Revisions     2
+Review Cycles              3
+Commits                    11
+```
+
+Actions:
+
+```text
+Review Changes
+View Architecture
+Run Application
+View Validation
+View Review History
+Approve
+Change Architecture
+```
+
+---
+
+# 41. No AI Cost Accounting in V1
+
+V0.1 proposed detailed token and dollar cost tracking.
+
+V0.2 deliberately removes that from core V1.
+
+Coalition does not own billing for ChatGPT Plus or Google AI Pro.
+
+It may display usage metadata that Antigravity exposes, but it should not attempt to convert subscription usage into a fictitious per-project dollar cost.
+
+Potential V1 indicators:
+
+```text
+Antigravity turns
+Antigravity token metadata when available
+Review cycles
+Architect relay count
+Builder runtime duration
+```
+
+If API adapters are added later, true API cost accounting can return for those adapters.
+
+---
+
+# 42. No Model Catalog in V1
+
+V0.1 included:
+
+- model discovery;
+- benchmark aggregation;
+- model-fit rankings;
+- model-role recommendations;
+- public benchmark provenance.
+
+These are removed from V1.
+
+V1 has an intentionally opinionated role setup:
+
+```text
+Architect
+ChatGPT subscription
+
+Builder
+Antigravity / Google AI plan
+
+Reviewer
+ChatGPT subscription
+```
+
+Model benchmarking may return later if Coalition supports multiple interchangeable AI adapters.
+
+---
+
+# 43. Security Model
+
+Coalition is a local application with meaningful authority over a development repository.
+
+V1 security principles:
+
+- project-scoped filesystem access;
+- no silent access to unrelated folders;
+- no AI credentials stored by Coalition;
+- no automatic production deployment;
+- no automatic force-push;
+- no destructive Git action without explicit policy/approval;
+- command execution logged;
+- Builder execution stoppable;
+- architecture artifacts protected while frozen;
+- external process arguments sanitized;
+- relay content treated as untrusted input until parsed/validated;
+- imported ChatGPT output cannot directly execute arbitrary local commands merely because it contains them.
+
+---
+
+# 44. Prompt-Injection and Cross-Agent Safety
+
+Coalition creates a new risk: one AI's output becomes another AI's input.
+
+Therefore imported Reviewer output must never be treated as executable instructions directly.
+
+Correct flow:
+
+```text
+ChatGPT Reviewer output
+        ↓
+Coalition parser
+        ↓
+Structured findings
+        ↓
+Coalition-generated correction packet
+        ↓
+Antigravity
+```
+
+Not:
+
+```text
+ChatGPT arbitrary response
+        ↓
+raw pass-through
+        ↓
+Antigravity executes whatever it says
+```
+
+The same principle applies to Builder completion reports passed to Reviewer.
+
+Coalition owns the protocol between roles.
+
+---
+
+# 45. External Tool Changes
+
+Coalition depends on third-party products whose interfaces and terms may change.
+
+Therefore adapters must be isolated behind explicit interfaces.
+
+Conceptually:
+
+```text
+ArchitectRelay
+├── ChatGPTHumanRelayV1
+└── future adapters
+
+BuilderAdapter
+├── AntigravityCliV1
+└── future adapters
+
+ReviewerRelay
+├── ChatGPTHumanRelayV1
+└── future adapters
+```
+
+If Antigravity changes its event schema, Coalition should update one adapter rather than rewrite the workflow engine.
+
+---
+
+# 46. Terms-Compliance Boundary
+
+V1 should adopt explicit product rules:
+
+## ChatGPT
+
+Coalition may:
+
+- construct prompts locally;
+- copy user-requested prompts to the clipboard;
+- open the user's normal ChatGPT surface;
+- import content the user deliberately copied;
+- parse and store that imported content locally.
+
+Coalition should not:
+
+- programmatically extract ChatGPT output;
+- scrape ChatGPT DOM content;
+- use OCR to harvest ChatGPT responses;
+- robot-click controls for the purpose of extracting response content;
+- bypass product restrictions.
+
+## Antigravity
+
+Coalition should:
+
+- invoke Google's official CLI;
+- use documented headless and structured-output modes;
+- let the official tool own Google authentication;
+- use documented conversation/session mechanisms.
+
+Coalition should not:
+
+- steal or reuse hidden OAuth credentials;
+- impersonate undocumented Antigravity clients;
+- call private endpoints instead of the official automation surface.
+
+These assumptions must be reverified against current terms before public release.
+
+---
+
+# 47. Desktop UX
+
+Coalition should feel like a project application rather than an IDE.
+
+Home screen:
+
+```text
+COALITION
+
+Projects
+
+[ + New Project ]
+
+Herald
+REVIEW READY
+Architecture v1.2
+
+LiTerra3D
+BUILDING
+Architecture v2.1
+
+Network Tool
+ARCHITECTING
+```
+
+Project view emphasizes state, not chat.
+
+---
+
+# 48. Suggested Project View
+
+```text
+┌────────────────────────────────────────────────────┐
+│ HERALD                              Architecture 1.2│
+│ BUILDING                                            │
+├────────────────────────────────────────────────────┤
+│                                                    │
+│ Current Milestone                                  │
+│ Approval Workflow                                  │
+│                                                    │
+│ Builder                                             │
+│ Antigravity ● Running                              │
+│                                                    │
+│ Validation                                          │
+│ 104 / 104 tests passing                            │
+│                                                    │
+│ Review                                              │
+│ 2 findings resolved                                │
+│ 1 awaiting verification                            │
+│                                                    │
+│ [ View Activity ]  [ Pause ]                       │
+│                                                    │
+│ [ Change Architecture ]                            │
+└────────────────────────────────────────────────────┘
+```
+
+---
+
+# 49. Reviewer Relay UX
+
+When review is ready:
+
+```text
+REVIEW READY
+
+Architecture v1.2
+Milestone 3
+Commit a81f92c
+Validation PASS
+
+Review packet contains:
+✓ Relevant architecture
+✓ Acceptance criteria
+✓ Git diff
+✓ Validation evidence
+✓ Builder report
+
+[ Copy Review Packet ]
+[ Open ChatGPT ]
+```
+
+After the human copies the ChatGPT response:
+
+```text
+[ Import ChatGPT Review ]
+```
+
+Then:
+
+```text
+Reviewer verdict detected
+
+CORRECTIONS_REQUIRED
+
+REV-014   High
+REV-015   Medium
+
+[ Inspect ]
+[ Accept Import & Send to Builder ]
+```
+
+The explicit confirmation protects against accidentally importing unrelated clipboard content.
+
+---
+
+# 50. System Tray Behavior
+
+A system tray component is desirable but not required for the first implementation slice.
+
+Potential behavior:
+
+```text
+Coalition
+Herald — Builder running
+
+Open Coalition
+Pause Builder
+Copy Pending Review
+Quit
+```
+
+Global hotkeys must not depend on the main window being focused.
+
+---
+
+# 51. Notifications
+
+Useful local notifications:
+
+```text
+Builder needs permission
+
+Review packet ready
+
+Validation failed
+
+Architecture concern raised
+
+Human decision required
+
+Project ready for human review
+```
+
+Coalition should avoid noisy notifications for ordinary Builder tool events.
+
+---
+
+# 52. Packaging
+
+V1 distribution targets:
+
+## Windows
+
+Signed installer / setup executable.
+
+## macOS
+
+Signed and notarized application distributed through a standard macOS package/DMG path.
+
+Linux packaging may follow after the Windows/macOS behavior is stable.
+
+Coalition's build pipeline should produce platform-native releases rather than require users to install developer runtimes.
+
+---
+
+# 53. Windows-First Development Recommendation
+
+Although Tauri supports multiple desktop platforms, V1 development should be **Windows-first**.
+
+Reasons:
+
+- primary initial development/testing environment;
+- simpler initial QA matrix;
+- clipboard/hotkey/process behavior can be stabilized on one OS first;
+- Antigravity/Git workflow can be proven before duplicating packaging and OS-specific troubleshooting.
+
+The code architecture must remain cross-platform from the beginning.
+
+macOS should be treated as the second supported platform, not as a future redesign.
+
+---
+
+# 54. V1 Scope
+
+V1 should prove one complete governed workflow.
+
+Included:
+
+- Tauri desktop application;
+- Windows-first implementation;
+- React/TypeScript UI;
+- Rust Coalition core;
+- SQLite operational state;
+- `.coalition/` project artifacts;
+- existing repository onboarding;
+- start-from-idea workflow;
+- imported planning workflow;
+- ChatGPT Architect human relay;
+- architecture artifact generation/import;
+- architecture freeze;
+- Antigravity CLI Builder integration;
+- structured Antigravity streaming events;
+- Git integration;
+- configurable deterministic validation;
+- ChatGPT Reviewer human relay;
+- structured review findings;
+- correction loop;
+- human-only architecture revision;
+- pause/resume/recovery;
+- activity history;
+- ready-for-human-review state.
+
+---
+
+# 55. Explicitly Not V1
+
+To preserve simplicity, V1 should not include:
+
+- OpenRouter;
+- OpenAI API integration;
+- Gemini API integration;
+- direct model-provider APIs;
+- API key management;
+- AI billing or token purchasing;
+- model marketplace/catalog;
+- benchmark aggregation;
+- role-specific model scoring;
+- Coalition-native coding agent;
+- embedded IDE/editor;
+- ChatGPT DOM automation;
+- Antigravity GUI automation;
+- cloud Coalition accounts;
+- hosted source repositories;
+- multi-user collaboration;
+- RBAC;
+- SaaS billing;
+- remote Builder fleets;
+- automatic deployment;
+- IDE extensions;
+- mobile applications;
+- GitHub App integration;
+- enterprise governance.
+
+---
+
+# 56. Optional Arbiter
+
+The Arbiter concept remains valid but can be deferred until after the core correction loop works.
+
+Potential future workflow:
+
+```text
+Reviewer:
+ARCH-021 not satisfied
+
+Builder:
+Implementation does satisfy ARCH-021 because...
+
+        ↓
+      Arbiter
+```
+
+An Arbiter may return:
+
+```text
+BUILDER_CORRECT
+REVIEWER_CORRECT
+AMBIGUOUS_ARCHITECTURE
+```
+
+The Arbiter still cannot change architecture.
+
+---
+
+# 57. Future Adapter Direction
+
+The V0.2 architecture intentionally leaves seams for future alternatives without implementing them now.
+
+## Architect / Reviewer
+
+```text
+Today:
+ChatGPT Human Relay
+
+Future:
+OpenAI API
+Anthropic API
+local model
+other subscription-supported relay
+```
+
+## Builder
+
+```text
+Today:
+Antigravity CLI
+
+Future:
+Claude Code
+OpenHands
+Coalition Native
+other agent runtimes
+```
+
+## Repository
+
+```text
+Today:
+Local Git
+
+Future:
+GitHub
+GitLab
+Bitbucket
+enterprise SCM
+```
+
+## Validation
+
+```text
+Today:
+Local commands
+
+Future:
+CI providers
+security scanners
+deployment validation
+```
+
+Adapters should remain replaceable.
+
+The workflow is the product.
+
+---
+
+# 58. Major Design Choices Still To Resolve
+
+These choices matter, but none should block this v0.2 design.
+
+## 58.1 Exact Antigravity Permission Policy
+
+Decision required:
+
+How much routine Builder activity should Coalition auto-authorize?
+
+Recommended direction:
+
+- project-scoped normal development activity may be automatic;
+- commands outside the project, secrets, deployment, destructive Git, and unusual network access require explicit approval;
+- use sandboxing where practical;
+- never default to universal skip-permissions mode.
+
+## 58.2 Persistent Builder Process vs Per-Turn CLI Process
+
+Recommended direction:
+
+Use a persistent `stream-json` process during an active build epoch because it provides structured events and conversational continuity.
+
+Persist conversation ID and support recovery through official resume mechanisms.
+
+## 58.3 Git Branch vs Worktree Isolation
+
+Recommended V1:
+
+Create/use a dedicated Coalition branch.
+
+Evaluate worktrees after the first vertical slice if stronger separation is needed.
+
+## 58.4 Frozen Artifact Protection
+
+Decision required:
+
+Whether Coalition merely detects modifications to frozen files or uses filesystem protections in addition to Git checks.
+
+Recommended V1:
+
+Detect and block workflow progression if a frozen artifact changed outside the approved architecture-change cycle; avoid OS-level read-only tricks until needed.
+
+## 58.5 Relay Schema Strictness
+
+Recommended direction:
+
+Use a structured schema for authoritative results while tolerating surrounding prose.
+
+Do not make V1 dependent on perfectly formatted LLM output.
+
+## 58.6 Clipboard Behavior
+
+Recommended direction:
+
+No passive clipboard surveillance.
+
+Read the clipboard only when the user presses Import or the configured global hotkey.
+
+## 58.7 Windows/macOS Release Timing
+
+Recommended direction:
+
+Implement and validate Windows first while maintaining cross-platform abstractions from day one.
+
+Add macOS once the complete Windows vertical slice is stable.
+
+## 58.8 Project Validation Schema
+
+Need to finalize how projects declare:
+
+- required commands;
+- optional commands;
+- timeouts;
+- environment requirements;
+- whether commands may run concurrently;
+- acceptable warnings.
+
+Keep schema simple in V1.
+
+## 58.9 Human Approval Frequency
+
+Need to choose the balance between automation and interruption.
+
+Recommended default:
+
+Human approval only for:
+
+- architecture freeze/re-freeze;
+- sensitive Builder permissions;
+- importing substantive ChatGPT findings/architecture changes;
+- resolving architecture concerns;
+- final product acceptance.
+
+Routine Builder corrections and deterministic validation should proceed automatically.
+
+---
+
+# 59. V1 Success Criteria
+
+V1 succeeds if a user can:
+
+1. Install Coalition as a normal desktop application.
+2. Open or create a local software project.
+3. Use ChatGPT Plus as the Architect without configuring an API key.
+4. Import structured architectural decisions into Coalition through an explicit human relay.
+5. Freeze the architecture.
+6. Have Coalition invoke Antigravity through its supported CLI using the user's existing Google authentication.
+7. Observe Builder progress without reading raw terminal logs.
+8. Automatically collect Git and deterministic validation evidence.
+9. Generate a Reviewer package.
+10. Use ChatGPT Plus as an independent Reviewer through the human relay.
+11. Import structured review findings.
+12. Automatically route accepted correction findings back to Antigravity.
+13. Repeat build/validate/review cycles reliably.
+14. Pause the Builder at any point.
+15. Invoke a human-only Architecture Change cycle.
+16. Preserve prior architecture versions and change rationale.
+17. Recover after application or machine interruption.
+18. End in Ready for Human Review.
+19. Require the human—not an AI—to accept the final product.
+20. Complete all of the above without requiring AI API keys or Coalition-managed AI usage billing.
+
+If Coalition accomplishes this reliably, it has proven the V0.2 product thesis.
+
+---
+
+# 60. Proposed Implementation Philosophy
+
+Coalition itself should be developed according to the principles it promotes.
+
+Build one narrow vertical slice first:
+
+```text
+Existing repository
+      ↓
+Import architecture
+      ↓
+Freeze
+      ↓
+Antigravity implements one milestone
+      ↓
+Run deterministic validation
+      ↓
+Generate review packet
+      ↓
+Human relays to ChatGPT
+      ↓
+Import one correction
+      ↓
+Antigravity fixes it
+      ↓
+Validation passes
+      ↓
+Reviewer accepts
+      ↓
+Ready for Human Review
+```
+
+Do not begin by implementing every artifact type, every project state, and every future adapter.
+
+First prove the loop.
+
+Then add architecture revision.
+
+Then harden recovery and packaging.
+
+Then broaden project onboarding and UX.
+
+---
+
+# 61. Suggested Initial Development Phases
+
+## Phase 0 — Architecture Prototype
+
+Prove:
+
+- Tauri shell;
+- Rust process spawning;
+- `agy` streaming protocol;
+- Git status/diff;
+- clipboard import/export;
+- global shortcuts;
+- SQLite persistence.
+
+No polished UI required.
+
+## Phase 1 — Single Project Vertical Slice
+
+Implement:
+
+- open local repo;
+- create `.coalition/`;
+- import a basic architecture;
+- freeze;
+- launch Builder;
+- show Builder progress;
+- run validation;
+- produce one review packet;
+- import one review result;
+- send one correction;
+- reach ready-for-human-review.
+
+## Phase 2 — Architecture Governance
+
+Implement:
+
+- artifact workspace;
+- version snapshots;
+- freeze validation;
+- Architecture Change;
+- ACR generation;
+- re-freeze;
+- new Builder epoch.
+
+## Phase 3 — Recovery and Safety
+
+Implement:
+
+- interruption recovery;
+- process cancellation;
+- Builder permission policy;
+- dirty Git handling;
+- command timeouts;
+- audit history;
+- frozen-artifact drift detection.
+
+## Phase 4 — Product UX
+
+Implement:
+
+- polished dashboard;
+- onboarding;
+- notifications;
+- hotkey configuration;
+- project history;
+- reviewer finding UX;
+- installer/update flow.
+
+## Phase 5 — macOS
+
+Validate:
+
+- packaging/signing/notarization;
+- clipboard behavior;
+- global hotkeys;
+- path handling;
+- browser opener;
+- Antigravity CLI discovery;
+- Git/runtime discovery.
+
+---
+
+# 62. Product Differentiation
+
+Coalition should not be positioned as another multi-agent coding tool.
+
+A stronger definition is:
+
+> Coalition is the governance layer between the software a human intended and the AI tools that attempt to build it.
+
+Differentiators:
+
+1. Explicit human-approved architecture contract.
+2. Human-only architecture revision.
+3. Independent Architect/Builder/Reviewer roles.
+4. Builder and Reviewer do not silently redefine intent.
+5. Deterministic evidence before AI acceptance.
+6. Durable architecture provenance.
+7. Git-backed project history.
+8. Explicit cross-agent protocol rather than unstructured agent chatter.
+9. Subscription-backed V1 with no AI API-key requirement.
+10. External coding-agent integration instead of recreating an IDE.
+11. Local-first operation.
+12. Human remains final authority.
+
+---
+
+# 63. Example Complete Journey
+
+A user installs Coalition on Windows.
+
+Coalition detects Git and Antigravity.
+
+The user is already authenticated to Antigravity through their Google account.
+
+The user creates a project and imports planning previously developed in ChatGPT.
+
+Coalition prepares an Architect packet.
+
+The user sends it through ChatGPT Plus.
+
+ChatGPT proposes structured project artifacts and unresolved issues.
+
+The user copies the response and imports it with the Coalition hotkey.
+
+The user continues this loop until Coalition shows:
+
+```text
+ARCHITECTURE READY
+
+Requirements           31
+Acceptance Criteria     22
+Architecture Decisions   8
+Open Questions           0
+```
+
+The human clicks:
+
+**Freeze Architecture & Build**
+
+Coalition snapshots Architecture v1.0.
+
+Coalition starts the Antigravity Builder through the official CLI.
+
+Antigravity implements Milestone 1.
+
+Coalition streams useful progress into the desktop UI.
+
+Validation runs automatically.
+
+Tests pass.
+
+Coalition creates a Reviewer packet containing the architecture, acceptance criteria, Git diff, and validation results.
+
+The user copies the packet and sends it to a separate ChatGPT Reviewer conversation.
+
+The Reviewer returns:
+
+```text
+CORRECTIONS_REQUIRED
+
+REV-003
+Authorization requirement is bypassed.
+
+REV-004
+Regression coverage is missing.
+```
+
+The user copies the response and presses Coalition's Import hotkey.
+
+Coalition parses the findings and asks for confirmation.
+
+The user accepts the import.
+
+Coalition generates a bounded correction packet and sends it automatically to the active Antigravity session.
+
+Antigravity corrects the implementation.
+
+Tests pass again.
+
+Another review is prepared.
+
+During subsequent testing, the human realizes the application needs a different event model.
+
+The user selects:
+
+**Change Architecture**
+
+Coalition pauses development, records state, and prepares an Architecture Revision packet.
+
+The user and ChatGPT Architect revise the design.
+
+Coalition records ACR-001.
+
+The human freezes Architecture v1.1.
+
+Coalition starts a new Builder epoch against the revised contract.
+
+Eventually all required gates pass.
+
+Coalition displays:
+
+```text
+READY FOR HUMAN REVIEW
+
+Architecture               v1.1
+Acceptance Criteria        38 / 38
+Required Validation        PASS
+Reviewer                   ACCEPT
+Blocking Findings          0
+Architecture Revisions     1
+Review Cycles              3
+```
+
+The human decides whether the product is actually complete.
+
+---
+
+# 64. North Star
+
+Coalition should make AI-assisted software engineering feel less like manually managing several unrelated chatbots and more like directing a disciplined engineering team.
+
+The user should be able to begin with:
+
+> I have an idea.
+
+and eventually reach:
+
+> The architecture I approved was implemented by an external coding agent, tested, independently challenged, corrected, revised only when I explicitly chose to revise it, and is now ready for my evaluation.
+
+Coalition does not need to be the best coding agent.
+
+It needs to be the system that ensures coding agents remain accountable to the product the human intended.
+
+---
+
+# 65. V0.2 North-Star Architecture
+
+```text
+                      HUMAN
+                        │
+                        ▼
+                  COALITION APP
+               Tauri + React + Rust
+                        │
+       ┌────────────────┼────────────────┐
+       │                │                │
+       ▼                ▼                ▼
+ Architecture       Workflow         Evidence
+ Contract           Governance       Git / Tests
+       │                │                │
+       └────────────┬───┴───────┬────────┘
+                    │           │
+                    ▼           ▼
+             ChatGPT Plus   Antigravity
+             Human Relay    Official CLI
+                    │           │
+             Architect /       Builder
+              Reviewer          │
+                    │           │
+                    └─────┬─────┘
+                          ▼
+                   Local Repository
+```
+
+The human defines success.
+
+The architecture records success.
+
+Antigravity attempts it.
+
+ChatGPT challenges it.
+
+Deterministic evidence supports or contradicts it.
+
+Coalition governs the process.
+
+The human decides when it is finished.

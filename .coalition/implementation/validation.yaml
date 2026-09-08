@@ -1,0 +1,48 @@
+schema_version: 1
+
+enabled: true
+
+policy:
+  gate_review_on_required_failure: true
+  allow_manual_runs: true
+  allow_builder_requested_runs: true
+
+commands:
+  - id: frontend-typecheck
+    name: Frontend TypeScript check
+    command: npm run typecheck
+    required: true
+    timeout_seconds: 600
+
+  - id: frontend-tests
+    name: Frontend tests
+    command: npm test -- --run
+    required: true
+    timeout_seconds: 900
+
+  - id: frontend-build
+    name: Frontend build
+    command: npm run build
+    required: true
+    timeout_seconds: 600
+
+  - id: rust-format
+    name: Rust formatting
+    command: cargo fmt --check
+    working_directory: src-tauri
+    required: true
+    timeout_seconds: 300
+
+  - id: rust-clippy
+    name: Rust Clippy
+    command: cargo clippy -- -D warnings
+    working_directory: src-tauri
+    required: true
+    timeout_seconds: 900
+
+  - id: rust-tests
+    name: Rust tests
+    command: cargo test
+    working_directory: src-tauri
+    required: true
+    timeout_seconds: 1200
