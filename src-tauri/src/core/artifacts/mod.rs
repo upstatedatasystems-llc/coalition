@@ -31,6 +31,25 @@ pub const CANONICAL_ARCHITECTURE_ARTIFACTS: &[&str] = &[
     "implementation/test-plan.md",
 ];
 
+pub const CURRENT_READINESS_POLICY_VERSION: u32 = 1;
+
+pub const KNOWN_READINESS_ARTIFACT_PATHS: &[&str] = &[
+    "design/product-vision.md",
+    "design/requirements.md",
+    "design/architecture.md",
+    "design/constraints.md",
+    "design/interfaces.md",
+    "design/security.md",
+    "implementation/implementation-plan.md",
+    "implementation/acceptance-criteria.yaml",
+    "implementation/test-plan.md",
+    "design/open-questions.md",
+];
+
+pub fn is_known_readiness_artifact_path(path: &str) -> bool {
+    KNOWN_READINESS_ARTIFACT_PATHS.contains(&path)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ArchitectureState {
@@ -111,6 +130,10 @@ pub enum ArtifactError {
     UnsafeReparsePoint(String),
     #[error("Unsupported project schema version: {0}. Only version 1 is supported")]
     UnsupportedSchemaVersion(u32),
+    #[error("Unsupported readiness policy version: {0}. Only version 1 is supported")]
+    UnsupportedReadinessPolicyVersion(u32),
+    #[error("Unknown artifact path in readiness applicability: {0}")]
+    UnknownReadinessArtifactPath(String),
     #[error("Invalid project ID '{0}': must be a valid UUID")]
     InvalidProjectId(String),
     #[error("Invalid timestamp '{0}': must be RFC3339 formatted")]
@@ -179,6 +202,19 @@ impl ArtifactManager {
                     ));
                 }
             },
+        }
+
+        if let Some(ref readiness) = project.readiness {
+            if readiness.policy_version != CURRENT_READINESS_POLICY_VERSION {
+                return Err(ArtifactError::UnsupportedReadinessPolicyVersion(
+                    readiness.policy_version,
+                ));
+            }
+            for path in readiness.applicability.keys() {
+                if !is_known_readiness_artifact_path(path) {
+                    return Err(ArtifactError::UnknownReadinessArtifactPath(path.clone()));
+                }
+            }
         }
 
         Ok(())
@@ -477,6 +513,12 @@ impl ArtifactManager {
         artifact_path: &str,
         applicability: ArtifactApplicability,
     ) -> Result<ProjectYaml, ArtifactError> {
+        if !is_known_readiness_artifact_path(artifact_path) {
+            return Err(ArtifactError::UnknownReadinessArtifactPath(
+                artifact_path.to_string(),
+            ));
+        }
+
         let root = repo_root.as_ref();
         let project_yaml_path = root.join(".coalition").join("project.yaml");
         let mut project = Self::read_project_yaml(&project_yaml_path)?;

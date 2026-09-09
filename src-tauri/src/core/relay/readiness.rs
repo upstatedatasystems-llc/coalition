@@ -134,13 +134,21 @@ pub struct ReadinessReport {
 pub struct ReadinessEvaluator;
 
 impl ReadinessEvaluator {
+    /// Checks if an artifact path is recognized by the readiness policy.
+    pub fn is_known_rule_path(path: &str) -> bool {
+        crate::core::artifacts::is_known_readiness_artifact_path(path)
+    }
+
     /// Evaluates the current durable artifacts in `.coalition/` against the project's readiness policy.
-    pub fn evaluate<P: AsRef<Path>>(repo_root: P) -> ReadinessReport {
+    pub fn evaluate<P: AsRef<Path>>(
+        repo_root: P,
+    ) -> Result<ReadinessReport, crate::core::artifacts::ArtifactError> {
         let root = repo_root.as_ref();
         let mut policy = default_readiness_policy();
 
         let project_yaml_path = root.join(".coalition").join("project.yaml");
-        if let Ok(project) = ArtifactManager::read_project_yaml(&project_yaml_path) {
+        if project_yaml_path.exists() {
+            let project = ArtifactManager::read_project_yaml(&project_yaml_path)?;
             if let Some(ref cfg) = project.readiness {
                 policy.policy_version = cfg.policy_version;
                 for (path, app) in &cfg.applicability {
@@ -151,7 +159,7 @@ impl ReadinessEvaluator {
             }
         }
 
-        Self::evaluate_with_policy(root, &policy)
+        Ok(Self::evaluate_with_policy(root, &policy))
     }
 
     /// Sets the durable readiness applicability for an artifact in the project's project.yaml.
@@ -166,7 +174,7 @@ impl ReadinessEvaluator {
             artifact_path,
             applicability,
         )?;
-        Ok(Self::evaluate(root))
+        Self::evaluate(root)
     }
 
     pub fn evaluate_with_policy<P: AsRef<Path>>(
@@ -452,7 +460,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         ArtifactManager::initialize_new_project(dir.path(), "test-readiness").unwrap();
 
-        let report = ReadinessEvaluator::evaluate(dir.path());
+        let report = ReadinessEvaluator::evaluate(dir.path()).unwrap();
         assert_eq!(report.overall_readiness, OverallReadiness::Incomplete);
         assert_eq!(report.ready_required_count, 0);
         assert_eq!(report.total_required_count, 9);
@@ -475,7 +483,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = ReadinessEvaluator::evaluate(dir.path());
+        let report = ReadinessEvaluator::evaluate(dir.path()).unwrap();
         let item = report
             .artifacts
             .iter()
@@ -491,7 +499,7 @@ mod tests {
         )
         .unwrap();
 
-        let report2 = ReadinessEvaluator::evaluate(dir.path());
+        let report2 = ReadinessEvaluator::evaluate(dir.path()).unwrap();
         let item2 = report2
             .artifacts
             .iter()
@@ -512,7 +520,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = ReadinessEvaluator::evaluate(dir.path());
+        let report = ReadinessEvaluator::evaluate(dir.path()).unwrap();
         let item = report
             .artifacts
             .iter()
@@ -534,7 +542,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = ReadinessEvaluator::evaluate(dir.path());
+        let report = ReadinessEvaluator::evaluate(dir.path()).unwrap();
         let item = report
             .artifacts
             .iter()
@@ -556,7 +564,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = ReadinessEvaluator::evaluate(dir.path());
+        let report = ReadinessEvaluator::evaluate(dir.path()).unwrap();
         let item = report
             .artifacts
             .iter()
@@ -615,7 +623,7 @@ mod tests {
         }
 
         // open-questions.md is MISSING
-        let report = ReadinessEvaluator::evaluate(dir.path());
+        let report = ReadinessEvaluator::evaluate(dir.path()).unwrap();
         assert_eq!(report.overall_readiness, OverallReadiness::ReadyToFreeze);
         assert_eq!(report.ready_required_count, 9);
         assert_eq!(report.total_required_count, 9);
@@ -636,7 +644,7 @@ mod tests {
         )
         .unwrap();
 
-        let report2 = ReadinessEvaluator::evaluate(dir.path());
+        let report2 = ReadinessEvaluator::evaluate(dir.path()).unwrap();
         assert_eq!(report2.overall_readiness, OverallReadiness::ReadyToFreeze);
         assert!(report2.has_open_questions);
         assert_eq!(report2.unresolved_open_questions_count, 1);
@@ -691,7 +699,7 @@ mod tests {
             ArtifactManager::write_artifact_atomic(dir.path(), p, c).unwrap();
         }
 
-        let report1 = ReadinessEvaluator::evaluate(dir.path());
+        let report1 = ReadinessEvaluator::evaluate(dir.path()).unwrap();
         assert_eq!(report1.overall_readiness, OverallReadiness::ReadyToFreeze);
 
         // Edit one artifact to be a placeholder
@@ -702,7 +710,7 @@ mod tests {
         )
         .unwrap();
 
-        let report2 = ReadinessEvaluator::evaluate(dir.path());
+        let report2 = ReadinessEvaluator::evaluate(dir.path()).unwrap();
         assert_eq!(report2.overall_readiness, OverallReadiness::Incomplete);
         assert_eq!(report2.ready_required_count, 8);
     }
@@ -713,7 +721,7 @@ mod tests {
         ArtifactManager::initialize_new_project(dir.path(), "test-applicability").unwrap();
 
         // Initially total_required_count is 9
-        let report0 = ReadinessEvaluator::evaluate(dir.path());
+        let report0 = ReadinessEvaluator::evaluate(dir.path()).unwrap();
         assert_eq!(report0.total_required_count, 9);
 
         // Mark test-plan.md as NOT_APPLICABLE and constraints.md as OPTIONAL
@@ -769,7 +777,7 @@ mod tests {
             ArtifactManager::write_artifact_atomic(dir.path(), p, c).unwrap();
         }
 
-        let report3 = ReadinessEvaluator::evaluate(dir.path());
+        let report3 = ReadinessEvaluator::evaluate(dir.path()).unwrap();
         assert_eq!(report3.ready_required_count, 7);
         assert_eq!(report3.total_required_count, 7);
         assert_eq!(report3.overall_readiness, OverallReadiness::ReadyToFreeze);
@@ -784,6 +792,92 @@ mod tests {
         assert_eq!(
             na_item.details,
             Some("Marked NOT_APPLICABLE for this project".to_string())
+        );
+    }
+
+    #[test]
+    fn test_readiness_policy_version_and_applicability_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        ArtifactManager::initialize_new_project(dir.path(), "test-policy-version").unwrap();
+
+        // 1. policy_version 1 is accepted
+        let yaml_p1 = r#"
+schema_version: 1
+project_id: "00000000-0000-4000-8000-000000000001"
+name: "policy-v1"
+current_architecture_version: null
+architecture_state: "draft"
+created_at: "2026-09-08T12:00:00Z"
+readiness:
+  policy_version: 1
+  applicability:
+    design/product-vision.md: REQUIRED
+"#;
+        let p_yaml = dir.path().join(".coalition").join("project.yaml");
+        std::fs::write(&p_yaml, yaml_p1).unwrap();
+        let report = ReadinessEvaluator::evaluate(dir.path()).unwrap();
+        assert_eq!(report.policy_version, 1);
+
+        // 2. Unsupported future policy_version (e.g. 999) is rejected
+        let yaml_future = r#"
+schema_version: 1
+project_id: "00000000-0000-4000-8000-000000000001"
+name: "policy-future"
+current_architecture_version: null
+architecture_state: "draft"
+created_at: "2026-09-08T12:00:00Z"
+readiness:
+  policy_version: 999
+  applicability: {}
+"#;
+        std::fs::write(&p_yaml, yaml_future).unwrap();
+        let err_future = ReadinessEvaluator::evaluate(dir.path()).unwrap_err();
+        assert_eq!(
+            err_future,
+            crate::core::artifacts::ArtifactError::UnsupportedReadinessPolicyVersion(999)
+        );
+
+        // Also check read_project_yaml directly
+        let err_read = ArtifactManager::read_project_yaml(&p_yaml).unwrap_err();
+        assert_eq!(
+            err_read,
+            crate::core::artifacts::ArtifactError::UnsupportedReadinessPolicyVersion(999)
+        );
+
+        // 3. Unknown applicability path is rejected
+        let yaml_unknown_path = r#"
+schema_version: 1
+project_id: "00000000-0000-4000-8000-000000000001"
+name: "policy-unknown-path"
+current_architecture_version: null
+architecture_state: "draft"
+created_at: "2026-09-08T12:00:00Z"
+readiness:
+  policy_version: 1
+  applicability:
+    unknown/bogus-artifact.md: OPTIONAL
+"#;
+        std::fs::write(&p_yaml, yaml_unknown_path).unwrap();
+        let err_unknown = ReadinessEvaluator::evaluate(dir.path()).unwrap_err();
+        assert_eq!(
+            err_unknown,
+            crate::core::artifacts::ArtifactError::UnknownReadinessArtifactPath(
+                "unknown/bogus-artifact.md".to_string()
+            )
+        );
+
+        // Also set_artifact_applicability rejects unknown path
+        let err_set = ReadinessEvaluator::set_artifact_applicability(
+            dir.path(),
+            "unsupported/not-in-policy.txt",
+            ArtifactApplicability::Optional,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err_set,
+            crate::core::artifacts::ArtifactError::UnknownReadinessArtifactPath(
+                "unsupported/not-in-policy.txt".to_string()
+            )
         );
     }
 }

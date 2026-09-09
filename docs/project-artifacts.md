@@ -50,6 +50,11 @@ name: "my-project"
 current_architecture_version: null
 architecture_state: draft
 created_at: "2026-09-08T12:00:00Z"
+readiness:
+  policy_version: 1
+  applicability:
+    implementation/test-plan.md: NOT_APPLICABLE
+    design/constraints.md: OPTIONAL
 ```
 
 - `schema_version`: Explicit unsigned integer (1). Deserialization and validation strictly reject versions != 1.
@@ -60,6 +65,9 @@ created_at: "2026-09-08T12:00:00Z"
   - If `architecture_state` is `frozen`, `current_architecture_version` must be `Some(v)` with a non-empty trimmed version string.
 - `architecture_state`: Typed domain state (`draft` | `frozen`).
 - `created_at`: ISO-8601 UTC RFC3339 timestamp validated via `chrono::DateTime::parse_from_rfc3339`.
+- `readiness`: Optional durable readiness applicability configuration:
+  - `policy_version`: Unsigned integer (1). Only version 1 is supported; unsupported future versions are rejected with `UNSUPPORTED_READINESS_POLICY_VERSION`.
+  - `applicability`: Map of canonical artifact path to applicability enum (`REQUIRED`, `OPTIONAL`, `NOT_APPLICABLE`). Unknown paths are rejected with `UNKNOWN_READINESS_ARTIFACT_PATH`.
 
 ### Hierarchy & Layout Validation
 
@@ -115,30 +123,44 @@ In Stage 2A, Coalition introduces the Architect relay workspace and governs the 
 
 Only files within this allowlist may be drafted, imported, or manually edited through the Architect workspace:
 
-1. `design/product-vision.md` — Product Vision & Strategic Goals (Required)
-2. `design/requirements.md` — Functional & Non-Functional Requirements (Required)
-3. `design/architecture.md` — System Architecture & Component Design (Required)
-4. `design/constraints.md` — Technical & Operational Constraints (Required)
-5. `design/interfaces.md` — Interfaces, IPC Protocols & Typed Contracts (Required)
-6. `design/security.md` — Security Model, Invariants & Boundaries (Required)
-7. `implementation/implementation-plan.md` — Phased Delivery & Testing Milestones (Required)
-8. `implementation/acceptance-criteria.yaml` — Measurable Acceptance Criteria (Required)
-9. `implementation/test-plan.md` — Testing Strategy & Verification Plan (Required)
-10. `design/open-questions.md` — Architectural Open Questions & Decisions (Optional)
+1. `design/product-vision.md` — Product Vision & Strategic Goals (Default: Required)
+2. `design/requirements.md` — Functional & Non-Functional Requirements (Default: Required)
+3. `design/architecture.md` — System Architecture & Component Design (Default: Required)
+4. `design/constraints.md` — Technical & Operational Constraints (Default: Required)
+5. `design/interfaces.md` — Interfaces, IPC Protocols & Typed Contracts (Default: Required)
+6. `design/security.md` — Security Model, Invariants & Boundaries (Default: Required)
+7. `implementation/implementation-plan.md` — Phased Delivery & Testing Milestones (Default: Required)
+8. `implementation/acceptance-criteria.yaml` — Measurable Acceptance Criteria (Default: Required)
+9. `implementation/test-plan.md` — Testing Strategy & Verification Plan (Default: Required)
+10. `design/open-questions.md` — Architectural Open Questions & Decisions (Default: Optional)
+11. `decisions/ADR-*.md` — Architectural Decision Records (Optional)
 
 Any relay proposal or manual save targeting a path outside this allowlist is rejected with `INVALID_ARTIFACT_PATH`. Any path containing relative path traversals (`..`), drive letters, or absolute paths is rejected with `PATH_TRAVERSAL_DETECTED`.
 
-### Versioned Readiness Policy (v1)
+### Versioned Readiness Policy (v1) & Per-Project Applicability
 
 Readiness rules are explicit, versioned (`policy_version: 1`), and evaluate substantive artifact content rather than arbitrary length thresholds:
 
-- **Applicability**:
-  - `REQUIRED`: The 9 core specification artifacts must all reach `READY` status before the project can transition to `READY_TO_FREEZE`.
-  - `OPTIONAL`: Supporting artifacts (e.g. `design/open-questions.md`) do not block `READY_TO_FREEZE`, but unresolved open questions are highlighted prominently in the UI.
+- **Supported Policy Versions**:
+  - `policy_version: 1` is the current and only supported policy version.
+  - Encountering unsupported future policy versions in `project.yaml` is strictly rejected with `UNSUPPORTED_READINESS_POLICY_VERSION`.
+- **Per-Project Applicability Overrides**:
+  - Coalition does not mandate that every artifact must be required for every project merely because directories exist.
+  - Projects can configure durable per-project applicability overrides in `.coalition/project.yaml` under `readiness.applicability`:
+    - `REQUIRED`: The artifact must reach `READY` status with substantive content before the project can transition to `READY_TO_FREEZE`.
+    - `OPTIONAL`: Supporting artifacts (e.g. `design/open-questions.md` or non-critical design docs) do not block `READY_TO_FREEZE`. If present, substantive evaluation applies, and unresolved open questions are surfaced prominently in the UI.
+    - `NOT_APPLICABLE`: The artifact is explicitly declared not applicable for this project's architecture contract. It does not gate readiness and is reported with status `NOT_APPLICABLE`.
+  - Override keys must strictly correspond to known artifacts in the readiness policy rule set; unknown paths are rejected with `UNKNOWN_READINESS_ARTIFACT_PATH`.
+- **Authoritative Workflow State Governance**:
+  - Changing artifact applicability is governed by Rust workflow state.
+  - Applicability changes are permitted **only** in `ARCHITECTING` and `READY_TO_FREEZE`.
+  - Applicability changes are rejected in all other states (`DRAFT`, `FROZEN`, `BUILDING`, etc.) with `ILLEGAL_WORKFLOW_STATE`.
+  - Applicability changes require a clean batch state (`ensure_clean_batch_state`).
+  - Successfully updating applicability automatically re-evaluates readiness and authoritatively reconciles workflow state (`ARCHITECTING ↔ READY_TO_FREEZE`).
 - **Substantive Markdown Evaluation**:
   - Strips Markdown headings (`#`), HTML comments (`<!-- ... -->`), and horizontal rules (`---`).
   - Detects template and placeholder tokens (`TODO`, `TBD`, `[placeholder]`, `lorem`, `wip`, `draft`).
-  - Requires meaningful non-placeholder words and characters.
+  - Requires meaningful non-placeholder words and at least 20 substantive characters.
 - **Structured YAML Evaluation**:
   - Parses `implementation/acceptance-criteria.yaml` using a structured YAML parser.
   - Verifies that the document contains a valid YAML mapping or sequence with substantive criteria rather than placeholder scalars.
@@ -146,9 +168,10 @@ Readiness rules are explicit, versioned (`policy_version: 1`), and evaluate subs
   - `MISSING`: The file does not exist in `.coalition/`.
   - `INCOMPLETE`: The file exists but contains only headings, empty boilerplate, or placeholder tokens.
   - `READY`: The file contains substantive, validated architecture content.
+  - `NOT_APPLICABLE`: The artifact is marked `NOT_APPLICABLE` in `project.yaml`.
 
 Overall project readiness:
-- `READY_TO_FREEZE`: All required artifacts have status `READY`.
+- `READY_TO_FREEZE`: All required artifacts have status `READY` (or `NOT_APPLICABLE`).
 - `INCOMPLETE`: One or more required artifacts are `MISSING` or `INCOMPLETE`.
 
 ### Crash-Safe Batch Import Protocol & Recovery

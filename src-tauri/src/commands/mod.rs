@@ -1,5 +1,5 @@
 use crate::core::activity::{ActivityEventRecord, ActivityManager};
-use crate::core::artifacts::{ArtifactApplicability, ArtifactError, ArtifactManager};
+use crate::core::artifacts::{ArtifactApplicability, ArtifactError};
 use crate::core::builder::{
     AgyEvent, AntigravityCliAdapter, BuilderTurnRequest, BuilderTurnResponse, ModelInfo,
 };
@@ -91,6 +91,19 @@ impl From<ArtifactError> for CommandError {
                     v
                 ),
                 serde_json::json!({ "version": v }),
+            ),
+            ArtifactError::UnsupportedReadinessPolicyVersion(v) => Self::with_details(
+                "UNSUPPORTED_READINESS_POLICY_VERSION",
+                format!(
+                    "Unsupported readiness policy version {}. Only version 1 is supported",
+                    v
+                ),
+                serde_json::json!({ "version": v }),
+            ),
+            ArtifactError::UnknownReadinessArtifactPath(p) => Self::with_details(
+                "UNKNOWN_READINESS_ARTIFACT_PATH",
+                format!("Unknown artifact path in readiness applicability: {}", p),
+                serde_json::json!({ "path": p }),
             ),
             ArtifactError::InvalidProjectId(msg) => Self::new("INVALID_PROJECT_ID", msg),
             ArtifactError::EmptyProjectName => {
@@ -289,6 +302,19 @@ impl From<RelayError> for CommandError {
             RelayError::AlreadyDecided(s) => {
                 Self::new("IMPORT_ALREADY_DECIDED", format!("Import already {}", s))
             }
+            RelayError::UnsupportedReadinessPolicyVersion(v) => Self::with_details(
+                "UNSUPPORTED_READINESS_POLICY_VERSION",
+                format!(
+                    "Unsupported readiness policy version {}. Only version 1 is supported",
+                    v
+                ),
+                serde_json::json!({ "version": v }),
+            ),
+            RelayError::UnknownReadinessArtifactPath(p) => Self::with_details(
+                "UNKNOWN_READINESS_ARTIFACT_PATH",
+                format!("Unknown artifact path in readiness applicability: {}", p),
+                serde_json::json!({ "path": p }),
+            ),
             #[cfg(test)]
             RelayError::InjectedFailure(msg) => Self::new("INJECTED_FAILURE", msg),
         }
@@ -346,15 +372,28 @@ pub async fn register_or_open_project(
     let details = ProjectService::register_or_open_project(db.connection_mut(), git, path)
         .map_err(CommandError::from)?;
 
-    if details.is_available {
+    let details = if details.is_available {
         let repo_path = PathBuf::from(&details.project.repository_path);
-        RelayService::reconcile_interrupted_batches(
+        let reconciled = RelayService::reconcile_interrupted_batches(
             db.connection(),
             &repo_path,
             &details.project.project_id,
         )
         .map_err(CommandError::from)?;
-    }
+
+        if reconciled {
+            ProjectService::get_project_details(
+                db.connection(),
+                Some(git),
+                &details.project.project_id,
+            )
+            .map_err(CommandError::from)?
+        } else {
+            details
+        }
+    } else {
+        details
+    };
 
     *state.active_project_id.lock().await = Some(details.project.project_id.clone());
 
@@ -378,15 +417,28 @@ pub async fn get_project_details(
         ProjectService::get_project_details(db.connection(), git_lock.as_ref(), &project_id)
             .map_err(CommandError::from)?;
 
-    if details.is_available {
+    let details = if details.is_available {
         let repo_path = PathBuf::from(&details.project.repository_path);
-        RelayService::reconcile_interrupted_batches(
+        let reconciled = RelayService::reconcile_interrupted_batches(
             db.connection(),
             &repo_path,
             &details.project.project_id,
         )
         .map_err(CommandError::from)?;
-    }
+
+        if reconciled {
+            ProjectService::get_project_details(
+                db.connection(),
+                git_lock.as_ref(),
+                &details.project.project_id,
+            )
+            .map_err(CommandError::from)?
+        } else {
+            details
+        }
+    } else {
+        details
+    };
 
     *state.active_project_id.lock().await = Some(details.project.project_id.clone());
 
@@ -897,14 +949,12 @@ pub async fn set_project_artifact_applicability(
 ) -> Result<WorkspaceState, CommandError> {
     let db = state.db.lock().await;
     let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
-    RelayService::ensure_clean_batch_state(db.connection(), &repo_path, &project_id)
-        .map_err(CommandError::from)?;
-    ArtifactManager::update_project_readiness_applicability(
+    RelayService::set_project_artifact_applicability(
+        db.connection(),
         &repo_path,
+        &project_id,
         &artifact_path,
         applicability,
     )
-    .map_err(CommandError::from)?;
-    RelayService::get_workspace_state(db.connection(), &repo_path, &project_id)
-        .map_err(CommandError::from)
+    .map_err(CommandError::from)
 }

@@ -1,7 +1,7 @@
 pub mod readiness;
 
 use crate::core::activity::ActivityManager;
-use crate::core::artifacts::{ArtifactError, ArtifactManager};
+use crate::core::artifacts::{ArtifactApplicability, ArtifactError, ArtifactManager};
 use crate::core::relay::readiness::{OverallReadiness, ReadinessEvaluator, ReadinessReport};
 use crate::core::workflow::{self, WorkflowAction, WorkflowState};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -244,6 +244,10 @@ pub enum RelayError {
     OpenQuestionsDirectArtifactRejected(String),
     #[error("Import already decided: status is {0}")]
     AlreadyDecided(String),
+    #[error("Unsupported readiness policy version: {0}. Only version 1 is supported")]
+    UnsupportedReadinessPolicyVersion(u32),
+    #[error("Unknown artifact path in readiness applicability: {0}")]
+    UnknownReadinessArtifactPath(String),
     #[cfg(test)]
     #[error("Injected test failure: {0}")]
     InjectedFailure(String),
@@ -257,7 +261,13 @@ impl From<rusqlite::Error> for RelayError {
 
 impl From<ArtifactError> for RelayError {
     fn from(e: ArtifactError) -> Self {
-        Self::Artifact(e.to_string())
+        match e {
+            ArtifactError::UnsupportedReadinessPolicyVersion(v) => {
+                Self::UnsupportedReadinessPolicyVersion(v)
+            }
+            ArtifactError::UnknownReadinessArtifactPath(p) => Self::UnknownReadinessArtifactPath(p),
+            other => Self::Artifact(other.to_string()),
+        }
     }
 }
 
@@ -273,9 +283,9 @@ impl RelayPromptBuilder {
         packet_id: &str,
         packet_type: RelayPacketType,
         custom_notes: Option<&str>,
-    ) -> (String, String, String) {
+    ) -> Result<(String, String, String), RelayError> {
         let root = repo_root.as_ref();
-        let readiness = ReadinessEvaluator::evaluate(root);
+        let readiness = ReadinessEvaluator::evaluate(root)?;
 
         let mut context_summary = format!(
             "Project Name: {}\nProject ID: {}\nCurrent Architecture State: draft\nReadiness: {}/{} required artifacts ready\n",
@@ -427,7 +437,7 @@ impl RelayPromptBuilder {
             pv_action_example
         ));
 
-        (prompt, human_instructions, context_summary)
+        Ok((prompt, human_instructions, context_summary))
     }
 }
 
@@ -746,7 +756,7 @@ impl RelayService {
             &packet_id,
             packet_type,
             custom_notes,
-        );
+        )?;
 
         let type_str = match packet_type {
             RelayPacketType::ArchitectInitial => "ARCHITECT_INITIAL",
@@ -1681,7 +1691,7 @@ impl RelayService {
         }
 
         // 11. Re-evaluate readiness and reconcile workflow state
-        let readiness = ReadinessEvaluator::evaluate(root);
+        let readiness = ReadinessEvaluator::evaluate(root)?;
         Self::reconcile_workflow_readiness_state(conn, project_id, &readiness, "Human")?;
 
         #[cfg(test)]
@@ -1925,7 +1935,7 @@ impl RelayService {
                     "UPDATE relay_packets SET status = 'IMPORTED' WHERE packet_id = ?1",
                     params![packet_id],
                 )?;
-                let readiness = ReadinessEvaluator::evaluate(root);
+                let readiness = ReadinessEvaluator::evaluate(root)?;
                 Self::reconcile_workflow_readiness_state(conn, project_id, &readiness, "System")?;
                 conn.execute(
                     "DELETE FROM relay_import_batch_journal WHERE import_id = ?1",
@@ -2033,7 +2043,7 @@ impl RelayService {
         .map_err(|e| RelayError::Database(e.to_string()))?;
 
         // 8. Re-evaluate readiness
-        let readiness = ReadinessEvaluator::evaluate(root);
+        let readiness = ReadinessEvaluator::evaluate(root)?;
 
         // 9. Reconcile workflow state
         Self::reconcile_workflow_readiness_state(conn, project_id, &readiness, "Human")?;
@@ -2149,14 +2159,17 @@ impl RelayService {
     }
 
     /// Assembles the complete architecture workspace state for UI rendering.
+    /// Fails closed if an active batch remains unresolved.
     pub fn get_workspace_state<P: AsRef<Path>>(
         conn: &Connection,
         repo_root: P,
         project_id: &str,
     ) -> Result<WorkspaceState, RelayError> {
         let root = repo_root.as_ref();
+        Self::ensure_clean_batch_state(conn, root, project_id)?;
+
         let pending_packet = Self::get_pending_packet(conn, project_id)?;
-        let readiness = ReadinessEvaluator::evaluate(root);
+        let readiness = ReadinessEvaluator::evaluate(root)?;
         // Reconcile workflow state based on current readiness (e.g. external edits or applicability change)
         Self::reconcile_workflow_readiness_state(conn, project_id, &readiness, "System")?;
         let history = Self::get_relay_history(conn, project_id, 20)?;
@@ -2181,6 +2194,63 @@ impl RelayService {
             readiness,
             history,
         })
+    }
+
+    /// Authoritatively sets the durable readiness applicability for an artifact.
+    /// Governed by Rust workflow state: permitted only in ARCHITECTING or READY_TO_FREEZE.
+    /// Validates that no active interrupted batch exists and that the artifact path is known to the policy.
+    /// Re-evaluates readiness, reconciles workflow state, and returns the updated workspace state.
+    pub fn set_project_artifact_applicability<P: AsRef<Path>>(
+        conn: &Connection,
+        repo_root: P,
+        project_id: &str,
+        artifact_path: &str,
+        applicability: ArtifactApplicability,
+    ) -> Result<WorkspaceState, RelayError> {
+        let root = repo_root.as_ref();
+
+        // 1. Ensure clean batch state
+        Self::ensure_clean_batch_state(conn, root, project_id)?;
+
+        // 2. Load authoritative workflow state
+        let state_str: String = conn
+            .query_row(
+                "SELECT state FROM workflow_state WHERE project_id = ?1",
+                params![project_id],
+                |r| r.get(0),
+            )
+            .map_err(|_| RelayError::ProjectNotFound(project_id.to_string()))?;
+
+        let current_state: WorkflowState = state_str
+            .parse()
+            .map_err(|e: workflow::WorkflowError| RelayError::Workflow(e.to_string()))?;
+
+        // 3. Permit changes ONLY in ARCHITECTING or READY_TO_FREEZE
+        if current_state != WorkflowState::Architecting
+            && current_state != WorkflowState::ReadyToFreeze
+        {
+            return Err(RelayError::IllegalWorkflowState {
+                current: current_state.to_string(),
+                operation: "set_project_artifact_applicability".to_string(),
+            });
+        }
+
+        // 4. Validate artifact_path against the versioned readiness-policy rule set
+        if !crate::core::artifacts::is_known_readiness_artifact_path(artifact_path) {
+            return Err(RelayError::UnknownReadinessArtifactPath(
+                artifact_path.to_string(),
+            ));
+        }
+
+        // 5. Update durable project.yaml
+        ArtifactManager::update_project_readiness_applicability(
+            root,
+            artifact_path,
+            applicability,
+        )?;
+
+        // 6. Return updated workspace state (which evaluates readiness and reconciles workflow state)
+        Self::get_workspace_state(conn, root, project_id)
     }
 
     fn record_relay_history(
@@ -3124,5 +3194,351 @@ mod tests {
         assert!(pkt2
             .prompt
             .contains("- `design/requirements.md`: ABSENT FROM DISK -> Use action: \"CREATE\""));
+    }
+
+    #[test]
+    fn test_set_project_artifact_applicability_authority_and_state_transitions() {
+        let (dir, mut db, pid) = setup_test_project();
+
+        // 1. In DRAFT state, set_project_artifact_applicability must fail
+        let err_draft = RelayService::set_project_artifact_applicability(
+            db.connection(),
+            dir.path(),
+            &pid,
+            "implementation/test-plan.md",
+            ArtifactApplicability::NotApplicable,
+        )
+        .unwrap_err();
+        match err_draft {
+            RelayError::IllegalWorkflowState { current, operation } => {
+                assert_eq!(current, "DRAFT");
+                assert_eq!(operation, "set_project_artifact_applicability");
+            }
+            other => panic!("Expected IllegalWorkflowState in DRAFT, got {:?}", other),
+        }
+
+        // Transition to ARCHITECTING
+        RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+            .unwrap();
+
+        // 2. In ARCHITECTING state, legal pre-freeze change succeeds
+        let ws1 = RelayService::set_project_artifact_applicability(
+            db.connection(),
+            dir.path(),
+            &pid,
+            "implementation/test-plan.md",
+            ArtifactApplicability::NotApplicable,
+        )
+        .unwrap();
+        assert_eq!(ws1.readiness.total_required_count, 8);
+
+        // Verify durable project.yaml was updated
+        let p_yaml =
+            ArtifactManager::read_project_yaml(dir.path().join(".coalition").join("project.yaml"))
+                .unwrap();
+        assert_eq!(
+            p_yaml
+                .readiness
+                .unwrap()
+                .applicability
+                .get("implementation/test-plan.md"),
+            Some(&ArtifactApplicability::NotApplicable)
+        );
+
+        // 3. Unknown artifact path fails
+        let err_unknown = RelayService::set_project_artifact_applicability(
+            db.connection(),
+            dir.path(),
+            &pid,
+            "design/not-a-real-file.md",
+            ArtifactApplicability::Optional,
+        )
+        .unwrap_err();
+        match err_unknown {
+            RelayError::UnknownReadinessArtifactPath(p) => {
+                assert_eq!(p, "design/not-a-real-file.md");
+            }
+            other => panic!("Expected UnknownReadinessArtifactPath, got {:?}", other),
+        }
+
+        // 4. In FROZEN state, change fails
+        db.connection()
+            .execute(
+                "UPDATE workflow_state SET state = 'FROZEN' WHERE project_id = ?1",
+                params![pid],
+            )
+            .unwrap();
+        let err_frozen = RelayService::set_project_artifact_applicability(
+            db.connection(),
+            dir.path(),
+            &pid,
+            "design/constraints.md",
+            ArtifactApplicability::Optional,
+        )
+        .unwrap_err();
+        match err_frozen {
+            RelayError::IllegalWorkflowState { current, .. } => {
+                assert_eq!(current, "FROZEN");
+            }
+            other => panic!("Expected IllegalWorkflowState in FROZEN, got {:?}", other),
+        }
+
+        // 5. In BUILDING state, change fails
+        db.connection()
+            .execute(
+                "UPDATE workflow_state SET state = 'BUILDING' WHERE project_id = ?1",
+                params![pid],
+            )
+            .unwrap();
+        let err_building = RelayService::set_project_artifact_applicability(
+            db.connection(),
+            dir.path(),
+            &pid,
+            "design/constraints.md",
+            ArtifactApplicability::Optional,
+        )
+        .unwrap_err();
+        match err_building {
+            RelayError::IllegalWorkflowState { current, .. } => {
+                assert_eq!(current, "BUILDING");
+            }
+            other => panic!("Expected IllegalWorkflowState in BUILDING, got {:?}", other),
+        }
+
+        // 6. Readiness transition occurs when applicability completes/regresses package
+        // Restore to ARCHITECTING
+        db.connection()
+            .execute(
+                "UPDATE workflow_state SET state = 'ARCHITECTING' WHERE project_id = ?1",
+                params![pid],
+            )
+            .unwrap();
+
+        // Write 8 substantive required artifacts (all except test-plan.md)
+        let docs = [
+            (
+                "design/product-vision.md",
+                "# Vision\nSubstantive content for product vision.",
+            ),
+            (
+                "design/requirements.md",
+                "# Requirements\nREQ-01: Invariants strictly enforced.",
+            ),
+            (
+                "design/architecture.md",
+                "# Architecture\nLayered modular architecture with Rust backend.",
+            ),
+            (
+                "design/constraints.md",
+                "# Constraints\nOffline-first operation and safe paths.",
+            ),
+            (
+                "design/interfaces.md",
+                "# Interfaces\nTyped IPC contracts across frontend and machine side.",
+            ),
+            (
+                "design/security.md",
+                "# Security\nLeast privilege process management.",
+            ),
+            (
+                "implementation/implementation-plan.md",
+                "# Plan\nPhased delivery milestones.",
+            ),
+            (
+                "implementation/acceptance-criteria.yaml",
+                "criteria:\n  - id: AC-1\n    name: Pass\n",
+            ),
+        ];
+        for (p, c) in docs {
+            ArtifactManager::write_artifact_atomic(dir.path(), p, c).unwrap();
+        }
+
+        // Set test-plan.md to REQUIRED -> readiness is Incomplete (8/9 ready)
+        let ws_inc = RelayService::set_project_artifact_applicability(
+            db.connection(),
+            dir.path(),
+            &pid,
+            "implementation/test-plan.md",
+            ArtifactApplicability::Required,
+        )
+        .unwrap();
+        assert_eq!(
+            ws_inc.readiness.overall_readiness,
+            OverallReadiness::Incomplete
+        );
+        let st1: String = db
+            .connection()
+            .query_row(
+                "SELECT state FROM workflow_state WHERE project_id = ?1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(st1, "ARCHITECTING");
+
+        // Now change test-plan.md to NOT_APPLICABLE -> completes package -> transitions to READY_TO_FREEZE
+        let ws_ready = RelayService::set_project_artifact_applicability(
+            db.connection(),
+            dir.path(),
+            &pid,
+            "implementation/test-plan.md",
+            ArtifactApplicability::NotApplicable,
+        )
+        .unwrap();
+        assert_eq!(
+            ws_ready.readiness.overall_readiness,
+            OverallReadiness::ReadyToFreeze
+        );
+        let st2: String = db
+            .connection()
+            .query_row(
+                "SELECT state FROM workflow_state WHERE project_id = ?1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(st2, "READY_TO_FREEZE");
+
+        // Now regress by changing test-plan.md back to REQUIRED -> transitions back to ARCHITECTING
+        let ws_regressed = RelayService::set_project_artifact_applicability(
+            db.connection(),
+            dir.path(),
+            &pid,
+            "implementation/test-plan.md",
+            ArtifactApplicability::Required,
+        )
+        .unwrap();
+        assert_eq!(
+            ws_regressed.readiness.overall_readiness,
+            OverallReadiness::Incomplete
+        );
+        let st3: String = db
+            .connection()
+            .query_row(
+                "SELECT state FROM workflow_state WHERE project_id = ?1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(st3, "ARCHITECTING");
+    }
+
+    #[test]
+    fn test_workspace_reads_fail_closed_around_active_batch_recovery() {
+        let (dir, mut db, pid) = setup_test_project();
+        // Transition to ARCHITECTING
+        let pkt =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+
+        // Prepare response with multiple artifacts that would otherwise satisfy readiness
+        let response_text = format!(
+            "```yaml\ncoalition_response:\n  schema: 1\n  project_id: \"{}\"\n  packet_id: \"{}\"\n  response_type: \"ARCHITECT_UPDATE\"\n  summary: \"Complete all artifacts\"\n  artifacts:\n    - path: \"design/product-vision.md\"\n      action: \"CREATE\"\n      content: \"# Vision\\nSubstantive vision document.\"\n    - path: \"design/requirements.md\"\n      action: \"CREATE\"\n      content: \"# Requirements\\nSubstantive requirements.\"\n```",
+            pid, pkt.metadata.packet_id
+        );
+
+        let preview =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &response_text)
+                .unwrap();
+
+        // Inject MidBatch failure during accept
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::MidBatch));
+        let accept_err =
+            RelayService::accept_import(db.connection(), dir.path(), &pid, &preview.import_id)
+                .unwrap_err();
+        match accept_err {
+            RelayError::InjectedFailure(s) => assert_eq!(s, "MidBatch"),
+            other => panic!("Expected InjectedFailure, got {:?}", other),
+        }
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::None));
+
+        // Case A: If recovery reconciliation fails (e.g. injected reconciliation failure), get_workspace_state returns BATCH_RECOVERY_REQUIRED
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::DuringRecoveryReconciliation));
+        let ws_err =
+            RelayService::get_workspace_state(db.connection(), dir.path(), &pid).unwrap_err();
+        match ws_err {
+            RelayError::BatchRecoveryRequired(_) => (),
+            other => panic!("Expected BatchRecoveryRequired, got {:?}", other),
+        }
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::None));
+
+        // Case B: When recovery reconciliation runs normally, get_workspace_state reconciles the partial batch
+        // and returns clean state rolled back to baseline — never READY_TO_FREEZE based on mixed files!
+        let ws_clean =
+            RelayService::get_workspace_state(db.connection(), dir.path(), &pid).unwrap();
+        assert_eq!(
+            ws_clean.readiness.overall_readiness,
+            OverallReadiness::Incomplete
+        );
+
+        let st: String = db
+            .connection()
+            .query_row(
+                "SELECT state FROM workflow_state WHERE project_id = ?1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(st, "ARCHITECTING");
+    }
+
+    #[test]
+    fn test_post_recovery_project_details_reflect_authoritative_state() {
+        let (dir, mut db, pid) = setup_test_project();
+        let pkt =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+
+        // Provide all 9 required artifacts in the response
+        let full_resp = format!(
+            "```yaml\ncoalition_response:\n  schema: 1\n  project_id: \"{}\"\n  packet_id: \"{}\"\n  response_type: \"ARCHITECT_UPDATE\"\n  summary: \"Full architecture set\"\n  artifacts:\n    - path: \"design/product-vision.md\"\n      action: \"CREATE\"\n      content: \"# Vision\\nThis is a substantive vision document for the system.\"\n    - path: \"design/requirements.md\"\n      action: \"CREATE\"\n      content: \"# Requirements\\nREQ-01: System must enforce invariants reliably.\"\n    - path: \"design/architecture.md\"\n      action: \"CREATE\"\n      content: \"# Architecture\\nLayered modular architecture with Rust backend.\"\n    - path: \"design/constraints.md\"\n      action: \"CREATE\"\n      content: \"# Constraints\\nOffline-first operation and bounded local resource usage.\"\n    - path: \"design/interfaces.md\"\n      action: \"CREATE\"\n      content: \"# Interfaces\\nTyped IPC contracts across frontend and machine side.\"\n    - path: \"design/security.md\"\n      action: \"CREATE\"\n      content: \"# Security\\nLeast privilege process management and local safe paths.\"\n    - path: \"implementation/implementation-plan.md\"\n      action: \"CREATE\"\n      content: \"# Plan\\nPhased delivery with deterministic test milestones.\"\n    - path: \"implementation/acceptance-criteria.yaml\"\n      action: \"CREATE\"\n      content: \"criteria:\\n  - id: AC-1\\n    name: Verified passes\\n\"\n    - path: \"implementation/test-plan.md\"\n      action: \"CREATE\"\n      content: \"# Test Plan\\nDeterministic automated test suite and regression checks.\"\n```",
+            pid, pkt.metadata.packet_id
+        );
+
+        let preview =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &full_resp).unwrap();
+
+        // Inject BeforeSqliteDecisionUpdate: disk files written, journal updated to COMMITTING, but before SQLite marks ACCEPTED
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::BeforeSqliteDecisionUpdate));
+        let accept_err =
+            RelayService::accept_import(db.connection(), dir.path(), &pid, &preview.import_id)
+                .unwrap_err();
+        match accept_err {
+            RelayError::InjectedFailure(s) => assert_eq!(s, "BeforeSqliteDecisionUpdate"),
+            other => panic!("Expected BeforeSqliteDecisionUpdate, got {:?}", other),
+        }
+        INJECTED_BATCH_FAILURE.with(|f| f.set(InjectedBatchFailure::None));
+
+        // Prior to recovery, workflow_state in DB is still ARCHITECTING
+        let st_prior: String = db
+            .connection()
+            .query_row(
+                "SELECT state FROM workflow_state WHERE project_id = ?1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(st_prior, "ARCHITECTING");
+
+        // Simulate recovery reconciliation during project open / details query
+        let repo_path = dir.path().to_path_buf();
+        let reconciled =
+            RelayService::reconcile_interrupted_batches(db.connection(), &repo_path, &pid).unwrap();
+        assert!(reconciled, "Interrupted committed batch must be reconciled");
+
+        // Re-query project details post-recovery
+        let git_adapter = crate::core::git::GitAdapter::new().ok();
+        let post_details = crate::core::projects::ProjectService::get_project_details(
+            db.connection(),
+            git_adapter.as_ref(),
+            &pid,
+        )
+        .unwrap();
+
+        // Returned ProjectDetails immediately reflects post-recovery READY_TO_FREEZE workflow state
+        assert_eq!(
+            post_details.workflow_state.state,
+            WorkflowState::ReadyToFreeze
+        );
     }
 }
