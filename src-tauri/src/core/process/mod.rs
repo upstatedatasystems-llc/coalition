@@ -12,6 +12,21 @@ use tokio::sync::mpsc;
 pub const MAX_ACCUMULATED_LINES: usize = 10_000;
 pub const MAX_ACCUMULATED_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 
+/// Truncates `s` to at most `max_bytes` bytes, ensuring the cut occurs on a valid UTF-8 char boundary.
+pub fn truncate_utf8_safe(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    match s
+        .char_indices()
+        .take_while(|(idx, ch)| *idx + ch.len_utf8() <= max_bytes)
+        .last()
+    {
+        Some((idx, ch)) => &s[..idx + ch.len_utf8()],
+        None => "",
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum ProcessError {
     #[error("IO error: {0}")]
@@ -303,26 +318,69 @@ impl ProcessRunner {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let child = cmd.spawn()?;
+        let mut child = cmd.spawn()?;
         let pid = child.id();
 
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        // Incrementally read stdout with strict byte limit and drain remainder to avoid pipe deadlock
+        let stdout_handle = std::thread::spawn(move || -> Vec<u8> {
+            let mut buf = Vec::new();
+            if let Some(mut stream) = stdout {
+                use std::io::Read;
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if buf.len() < MAX_ACCUMULATED_BYTES {
+                                let to_take = std::cmp::min(n, MAX_ACCUMULATED_BYTES - buf.len());
+                                buf.extend_from_slice(&chunk[..to_take]);
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+            }
+            buf
+        });
+
+        // Incrementally read stderr with strict byte limit and drain remainder to avoid pipe deadlock
+        let stderr_handle = std::thread::spawn(move || -> Vec<u8> {
+            let mut buf = Vec::new();
+            if let Some(mut stream) = stderr {
+                use std::io::Read;
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if buf.len() < MAX_ACCUMULATED_BYTES {
+                                let to_take = std::cmp::min(n, MAX_ACCUMULATED_BYTES - buf.len());
+                                buf.extend_from_slice(&chunk[..to_take]);
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+            }
+            buf
+        });
+
+        // Wait on child process with timeout
         let (tx, rx) = std::sync::mpsc::channel();
-        let child_thread = std::thread::spawn(move || {
-            let res = child.wait_with_output();
+        let wait_thread = std::thread::spawn(move || {
+            let res = child.wait();
             let _ = tx.send(res);
         });
 
-        match rx.recv_timeout(timeout_duration) {
-            Ok(output_res) => {
-                let _ = child_thread.join();
-                let mut output = output_res?;
-                if output.stdout.len() > MAX_ACCUMULATED_BYTES {
-                    output.stdout.truncate(MAX_ACCUMULATED_BYTES);
-                }
-                if output.stderr.len() > MAX_ACCUMULATED_BYTES {
-                    output.stderr.truncate(MAX_ACCUMULATED_BYTES);
-                }
-                Ok(output)
+        let exit_status = match rx.recv_timeout(timeout_duration) {
+            Ok(status_res) => {
+                let _ = wait_thread.join();
+                status_res?
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 #[cfg(target_os = "windows")]
@@ -337,16 +395,59 @@ impl ProcessRunner {
                         libc::kill(pid as i32, libc::SIGKILL);
                     }
                 }
-                let _ = child_thread.join();
-                Err(ProcessError::Timeout(timeout_duration))
+                let _ = wait_thread.join();
+                let _ = stdout_handle.join();
+                let _ = stderr_handle.join();
+                return Err(ProcessError::Timeout(timeout_duration));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = child_thread.join();
-                Err(ProcessError::Execution(
-                    "Process execution thread disconnected unexpectedly".to_string(),
-                ))
+                let _ = wait_thread.join();
+                let _ = stdout_handle.join();
+                let _ = stderr_handle.join();
+                return Err(ProcessError::Execution(
+                    "Process wait thread disconnected unexpectedly".to_string(),
+                ));
             }
+        };
+
+        let stdout_data = stdout_handle.join().unwrap_or_default();
+        let stderr_data = stderr_handle.join().unwrap_or_default();
+
+        Ok(std::process::Output {
+            status: exit_status,
+            stdout: stdout_data,
+            stderr: stderr_data,
+        })
+    }
+
+    /// Safely opens an HTTP/HTTPS URL in the default desktop browser under the common process layer.
+    pub fn open_url(url: &str) -> Result<(), ProcessError> {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(ProcessError::Execution(
+                "Only HTTP and HTTPS URLs are allowed".to_string(),
+            ));
         }
+
+        #[cfg(target_os = "windows")]
+        {
+            let mut cmd = std::process::Command::new("rundll32");
+            cmd.args(["url.dll,FileProtocolHandler", url]);
+            cmd.spawn()?;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut cmd = std::process::Command::new("open");
+            cmd.arg(url);
+            cmd.spawn()?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut cmd = std::process::Command::new("xdg-open");
+            cmd.arg(url);
+            cmd.spawn()?;
+        }
+
+        Ok(())
     }
 }
 
@@ -487,5 +588,55 @@ mod tests {
         assert!(result.timed_out);
         assert!(!result.canceled);
         assert!(result.duration_ms >= 300);
+    }
+
+    #[test]
+    fn test_truncate_utf8_safe() {
+        // Pure ASCII
+        assert_eq!(truncate_utf8_safe("hello world", 5), "hello");
+        assert_eq!(truncate_utf8_safe("hello", 10), "hello");
+        assert_eq!(truncate_utf8_safe("hello", 0), "");
+
+        // 2-byte Cyrillic chars (each letter is 2 bytes: 'д' = [0xD0, 0xB4])
+        let cyrillic = "дада"; // 4 chars, 8 bytes
+        assert_eq!(truncate_utf8_safe(cyrillic, 3), "д"); // 3 bytes cut falls inside second char -> 1 char returned (2 bytes)
+        assert_eq!(truncate_utf8_safe(cyrillic, 4), "да"); // exactly 4 bytes -> 2 chars returned
+
+        // 3-byte CJK chars (each char is 3 bytes: 'あ' = [0xE3, 0x81, 0x82])
+        let japanese = "あいう"; // 3 chars, 9 bytes
+        assert_eq!(truncate_utf8_safe(japanese, 5), "あ"); // 5 bytes cut falls inside second char -> 1 char returned (3 bytes)
+        assert_eq!(truncate_utf8_safe(japanese, 6), "あい"); // exactly 6 bytes -> 2 chars returned
+
+        // 4-byte emoji chars (each emoji is 4 bytes: '🚀' = [0xF0, 0x9F, 0x9a, 0x80])
+        let emojis = "🚀🦀✨"; // 3 chars, 12 bytes
+        assert_eq!(truncate_utf8_safe(emojis, 1), ""); // cut at byte 1 cannot fit 4-byte emoji
+        assert_eq!(truncate_utf8_safe(emojis, 3), ""); // cut at byte 3 cannot fit 4-byte emoji
+        assert_eq!(truncate_utf8_safe(emojis, 4), "🚀"); // exactly 4 bytes -> 1 emoji
+        assert_eq!(truncate_utf8_safe(emojis, 7), "🚀"); // 7 bytes cut falls inside 2nd emoji -> 1 emoji
+        assert_eq!(truncate_utf8_safe(emojis, 8), "🚀🦀"); // exactly 8 bytes -> 2 emojis
+    }
+
+    #[test]
+    fn test_open_url_scheme_validation() {
+        assert!(ProcessRunner::open_url("ftp://example.com").is_err());
+        assert!(ProcessRunner::open_url("javascript:alert(1)").is_err());
+        assert!(ProcessRunner::open_url("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_run_sync_bounded_execution() {
+        #[cfg(target_os = "windows")]
+        let (cmd, args) = ("cmd.exe", vec!["/C", "echo sync-bounded-ok"]);
+        #[cfg(not(target_os = "windows"))]
+        let (cmd, args) = ("sh", vec!["-c", "echo sync-bounded-ok"]);
+
+        let out =
+            ProcessRunner::run_sync_bounded(Path::new(cmd), &args, None, Duration::from_secs(5))
+                .expect("run sync bounded");
+
+        assert!(out.status.success());
+        let stdout_str = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout_str.contains("sync-bounded-ok"));
+        assert!(out.stdout.len() <= MAX_ACCUMULATED_BYTES);
     }
 }

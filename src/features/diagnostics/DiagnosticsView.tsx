@@ -13,9 +13,6 @@ export const DiagnosticsView: React.FC = () => {
   const [prompt, setPrompt] = useState<string>('respond with pong');
   const [selectedModel, setSelectedModel] = useState<string>('gemini-3.8-flash-high');
   const [effort, setEffort] = useState<string>('medium');
-  const [useFakeAgy, setUseFakeAgy] = useState<boolean>(true);
-  const [testIcarus, setTestIcarus] = useState<boolean>(false);
-  const [activeConversationId, setActiveConversationId] = useState<string>('');
   const [isExecuting, setIsExecuting] = useState<boolean>(false);
   const [eventLogs, setEventLogs] = useState<string[]>([]);
   const [lastResponse, setLastResponse] = useState<BuilderTurnResponse | null>(null);
@@ -79,22 +76,16 @@ export const DiagnosticsView: React.FC = () => {
     setIsExecuting(true);
     setLastResponse(null);
     try {
-      const resp = await invoke<BuilderTurnResponse>('start_builder_turn', {
+      const resp = await invoke<BuilderTurnResponse>('run_diagnostic_fake_agy_turn', {
         payload: {
           prompt,
-          conversation_id: activeConversationId || null,
           model: selectedModel,
           effort,
-          icarus_mode: testIcarus,
-          use_fake_agy: useFakeAgy,
         },
       });
       setLastResponse(resp);
-      if (resp.conversation_id) {
-        setActiveConversationId(resp.conversation_id);
-      }
     } catch (err: unknown) {
-      alert(`Turn Execution Failed: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
+      alert(`Diagnostic Turn Failed: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
     } finally {
       setIsExecuting(false);
     }
@@ -220,24 +211,6 @@ export const DiagnosticsView: React.FC = () => {
             <option value="medium">Medium</option>
             <option value="high">High</option>
           </select>
-
-          <label>
-            <input
-              type="checkbox"
-              checked={useFakeAgy}
-              onChange={(e) => setUseFakeAgy(e.target.checked)}
-            />
-            Use fake-agy test double (0 quota)
-          </label>
-
-          <label>
-            <input
-              type="checkbox"
-              checked={testIcarus}
-              onChange={(e) => setTestIcarus(e.target.checked)}
-            />
-            Icarus Mode (Mock flag)
-          </label>
         </div>
 
         <div className="btn-row">

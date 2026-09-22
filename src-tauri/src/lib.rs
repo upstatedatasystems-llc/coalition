@@ -5,7 +5,6 @@ pub mod db;
 use commands::AppState;
 use db::DbManager;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::Mutex;
@@ -36,9 +35,10 @@ pub fn run() {
                 db: Arc::new(Mutex::new(db)),
                 git: Mutex::new(None),
                 agy: Mutex::new(None),
-                cancel_flag: Arc::new(AtomicBool::new(false)),
                 active_project_id: Mutex::new(None),
-                active_builder_registry: Arc::new(Mutex::new(crate::core::builder::ActiveBuilderRegistry::new())),
+                active_builder_registry: Arc::new(Mutex::new(
+                    crate::core::builder::ActiveBuilderRegistry::new(),
+                )),
             };
 
             app.manage(state);
@@ -91,6 +91,7 @@ pub fn run() {
             commands::get_builder_events,
             commands::start_builder_turn,
             commands::cancel_builder_turn,
+            commands::run_diagnostic_fake_agy_turn,
             commands::get_usage_telemetry,
             commands::reset_chatgpt_usage,
             commands::calibrate_chatgpt_usage,

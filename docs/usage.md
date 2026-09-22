@@ -16,11 +16,14 @@ Coalition provides comprehensive visibility into model resource consumption with
 ### 2. ChatGPT Architecture Relay Metrics (Estimated & Calibrated)
 - Because ChatGPT interaction is an explicit human relay without direct API ties, tokens cannot be fetched from OpenAI.
 - Estimated conservatively using a calibrated estimator (`ChatGptUsageEstimator`, default: `4.0 chars/token`).
-- Recorded for both `OUTBOUND_PACKET` (when copied to clipboard via `copy_relay_packet_to_clipboard`) and `INBOUND_IMPORT` (when architecture preview is imported from clipboard). Prompt drafting alone does not increment usage until actually copied.
+- **Estimator Provenance**: Every usage event recorded in `chatgpt_usage_history` persists the specific `estimator_version` and `chars_per_token` in effect at record time.
+- **Copy-First Invariant**: For `OUTBOUND_PACKET` events, usage is recorded only *after* the OS clipboard write has succeeded. Draft generation or clipboard write failures do not record usage.
 - Aggregated across two key operational windows:
-  - **Rolling 5-Hour Window**: Tracks active burst throughput with an estimated capacity percentage against typical tier limits.
-  - **Weekly Rolling Window**: Tracks cumulative sprint volume with weekly capacity percentage.
+  - **Rolling 5-Hour Window**: Tracks active burst throughput.
+  - **Weekly Rolling Window**: Tracks cumulative sprint volume.
+- **Honest Capacity Grounding**: Capacity percentages remain unset (`null`) unless explicitly configured with authoritative tier quotas, preventing misleading or arbitrary utilization percentages.
 - **Human Calibration**: Includes an interactive estimator calibration modal and `calibrate_chatgpt_usage` command. The user can submit a sample character count alongside an observed OpenAI token count to tune `chars_per_token` and increment the estimator version.
 - Includes a dedicated "Reset Window" control allowing the human to restart their tracking window.
 - Always accompanied by the prominent disclaimer:
   *"Estimated relay throughput (~4 chars/token heuristic). Does not reflect official OpenAI billing or subscription usage."*
+

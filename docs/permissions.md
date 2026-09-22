@@ -24,17 +24,24 @@ Coalition never fakes interactive stdin prompts or silently mutates global Antig
    - Can be toggled on or off for subsequent turns at any time.
 
 ### Honest Permission Evaluation vs. Generic Runtime Errors
-When `agy` encounters a tool block or permission denial in headless execution without Icarus, it emits an execution refusal in stderr. Coalition inspects this output and classifies the target action (`READ_ONLY`, `MUTATING`, `HIGH_RISK`) using `evaluate_tool_risk`. Coalition strictly avoids misclassifying generic runtime compilation, build, or script errors as permission denials.
+When `agy` encounters a tool block or permission denial in headless execution without Icarus, it emits an execution refusal in stderr. Coalition inspects this output and classifies the target action (`READ_ONLY`, `MUTATING`, `HIGH_RISK`, `CRITICAL`, or `UNCLASSIFIED_EXTERNAL_ACTION`) using `evaluate_tool_risk`. Coalition strictly avoids misclassifying generic runtime compilation, build, or script errors as permission denials.
 
 ## Risk Classification
 
 When tools are evaluated during execution:
-- **`READ_ONLY`**: Non-mutating queries (`view_file`, `list_dir`, `grep_search`). Safe under all policies.
-- **`MUTATING`**: Workspace file modifications (`write_to_file`, `replace_file_content`).
+- **`READ_ONLY`**: Non-mutating inspections and queries (`view_file`, `list_dir`, `grep_search`). Safe under all policies.
+- **`MUTATING`**: Workspace file creation and modifications (`write_to_file`, `replace_file_content`).
 - **`HIGH_RISK`**: Arbitrary command execution (`run_command`, subagent orchestration, external network actions).
+- **`CRITICAL`**: Sensitive system modifications or credential operations.
+- **`UNCLASSIFIED_EXTERNAL_ACTION`**: External tool invocations where the specific sub-command cannot be deterministically inferred from the engine's refusal payload.
+
+## Active-Run Visual Indicators
+
+The UI displays an **Active Run: Icarus Mode** warning banner strictly when the currently executing session was launched with `active_run_icarus == true`. It does not rely on transient project-level settings, preventing false warnings during least-privilege runs.
 
 ## Scoping & Storage Invariants
 
 - Icarus state and permission history reside exclusively in transient operational storage (`project_icarus_state` and `builder_permission_history` tables in SQLite).
 - Permission state is never committed to `.coalition/` durable project files.
 - Permission decisions do not leak across projects or to other developers cloning the repository.
+

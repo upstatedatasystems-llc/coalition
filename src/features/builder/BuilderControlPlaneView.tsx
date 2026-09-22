@@ -232,6 +232,7 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
         try {
           const pastEvents = await invoke<BuilderEventRecord[]>('get_builder_events', {
             sessionId: latest.session_id,
+            limit: 1000,
           });
           if (pastEvents.length > 0) {
             const restoredLines = pastEvents.map((e) => {
@@ -265,9 +266,6 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
       } else {
         line += `⚙️ Step ${step?.step_index ?? ''}: ${step?.step_type || 'update'} (${step?.state || ''})`;
       }
-    } else if (eventType === 'tool_execution') {
-      const tool = evt.tool_execution as Record<string, unknown> | undefined;
-      line += `🔧 Tool: ${tool?.tool_name || 'external'} → ${tool?.status || 'executing'}`;
     } else if (eventType === 'result') {
       const result = evt.result as Record<string, unknown> | undefined;
       line += `🏁 Turn Finished [${result?.status || 'DONE'}] (Turns: ${result?.num_turns ?? 1}, Duration: ${result?.duration_seconds ?? 0}s)`;
@@ -395,7 +393,7 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
   return (
     <div className="builder-control-plane" data-testid="builder-control-plane">
       {/* 1. Active-Run Icarus Persistent Warning Banner */}
-      {(activeRunIcarus || (isRunning && icarusState?.enabled)) && (
+      {activeRunIcarus === true && (
         <div className="icarus-warning-banner active-run-icarus-banner" role="alert" data-testid="active-run-icarus-banner">
           <div className="icarus-banner-content">
             <span className="icarus-icon">⚡</span>
@@ -420,7 +418,7 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
       )}
 
       {/* Standard Project-Level Icarus Warning Banner */}
-      {!activeRunIcarus && icarusState?.enabled && (
+      {activeRunIcarus !== true && icarusState?.enabled && (
         <div className="icarus-warning-banner" role="alert" data-testid="icarus-banner">
           <div className="icarus-banner-content">
             <span className="icarus-icon">⚠️</span>

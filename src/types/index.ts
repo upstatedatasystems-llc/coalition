@@ -367,7 +367,7 @@ export interface BuilderSessionRecord {
   model: string;
   effort?: string | null;
   icarus_mode: boolean;
-  status: 'RUNNING' | 'SUCCESS' | 'INTERRUPTED' | 'CANCELLED' | 'FAILED';
+  status: 'RUNNING' | 'SUCCESS' | 'INTERRUPTED' | 'CANCELLED' | 'FAILED' | 'TIMEOUT';
   prompt: string;
   response_text?: string | null;
   error_message?: string | null;
@@ -434,6 +434,5 @@ export interface StartBuilderTurnPayload {
   projectId: string;
   model?: string | null;
   effort?: string | null;
-  useFakeAgy?: boolean;
 }
 

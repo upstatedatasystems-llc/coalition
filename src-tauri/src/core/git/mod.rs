@@ -55,7 +55,11 @@ pub struct GitAdapter {
 }
 
 impl GitAdapter {
-    fn run_git_cmd(&self, args: &[&str], cwd: Option<&Path>) -> Result<std::process::Output, GitError> {
+    fn run_git_cmd(
+        &self,
+        args: &[&str],
+        cwd: Option<&Path>,
+    ) -> Result<std::process::Output, GitError> {
         ProcessRunner::run_sync_bounded(&self.git_bin, args, cwd, Duration::from_secs(30))
             .map_err(|e| GitError::ExecutionFailed(e.to_string()))
     }
@@ -267,8 +271,7 @@ impl GitAdapter {
         let dir = working_dir.as_ref();
 
         // 1. Porcelain status with all untracked individual files listed (-uall)
-        let status_output = self
-            .run_git_cmd(&["status", "--porcelain=v1", "-uall"], Some(dir))?;
+        let status_output = self.run_git_cmd(&["status", "--porcelain=v1", "-uall"], Some(dir))?;
 
         if !status_output.status.success() {
             let stderr = String::from_utf8_lossy(&status_output.stderr);
@@ -298,8 +301,7 @@ impl GitAdapter {
         let counts = Self::parse_porcelain_status(&filtered_porcelain);
 
         // 2. Unstaged diff hash
-        let unstaged_diff = self
-            .run_git_cmd(&["diff", "--no-ext-diff"], Some(dir))?;
+        let unstaged_diff = self.run_git_cmd(&["diff", "--no-ext-diff"], Some(dir))?;
 
         if !unstaged_diff.status.success() {
             let stderr = String::from_utf8_lossy(&unstaged_diff.stderr);
@@ -315,8 +317,7 @@ impl GitAdapter {
         let unstaged_diff_hash = format!("{:x}", hasher.finalize());
 
         // 3. Staged / cached diff hash
-        let staged_diff = self
-            .run_git_cmd(&["diff", "--cached", "--no-ext-diff"], Some(dir))?;
+        let staged_diff = self.run_git_cmd(&["diff", "--cached", "--no-ext-diff"], Some(dir))?;
 
         if !staged_diff.status.success() {
             let stderr = String::from_utf8_lossy(&staged_diff.stderr);

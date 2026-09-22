@@ -1,10 +1,9 @@
 use crate::core::activity::{ActivityEventRecord, ActivityManager};
 use crate::core::artifacts::{ArtifactApplicability, ArtifactError};
 use crate::core::builder::{
-    evaluate_tool_risk, ActiveBuilderRegistry, AgyEvent, AgyUsage, AntigravityCliAdapter,
-    BuilderError, BuilderEventRecord, BuilderSessionRecord, BuilderTurnRequest,
-    BuilderTurnResponse, ChatGptUsageSummary, IcarusState, ModelInfo, PermissionRecord,
-    UsageTelemetryReport,
+    ActiveBuilderRegistry, AgyUsage, AntigravityCliAdapter, BuilderError, BuilderEventRecord,
+    BuilderSessionRecord, BuilderTurnRequest, BuilderTurnResponse, ChatGptUsageSummary,
+    IcarusState, ModelInfo, PermissionRecord, UsageTelemetryReport,
 };
 use crate::core::git::{GitAdapter, GitError, GitRepoInfo};
 use crate::core::projects::{ProjectDetails, ProjectError, ProjectService, ProjectSummary};
@@ -17,16 +16,15 @@ use crate::core::workflow::{self, WorkflowAction, WorkflowError, WorkflowStateRe
 use crate::db::{DbError, DbManager, ProofResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
-use tokio::sync::{mpsc, Mutex};
+use tauri::{AppHandle, State};
+use tokio::sync::Mutex;
 
 pub struct AppState {
     pub db: Arc<Mutex<DbManager>>,
     pub git: Mutex<Option<GitAdapter>>,
     pub agy: Mutex<Option<AntigravityCliAdapter>>,
-    pub cancel_flag: Arc<AtomicBool>,
     pub active_project_id: Mutex<Option<String>>,
     pub active_builder_registry: Arc<Mutex<ActiveBuilderRegistry>>,
 }
@@ -575,9 +573,8 @@ pub fn validate_builder_preflight(
     )
     .map_err(CommandError::from)?;
 
-    let coalition_dir =
-        crate::core::artifacts::ArtifactManager::resolve_coalition_dir(&repo_path)
-            .map_err(CommandError::from)?;
+    let coalition_dir = crate::core::artifacts::ArtifactManager::resolve_coalition_dir(&repo_path)
+        .map_err(CommandError::from)?;
     let project_yaml = crate::core::artifacts::ArtifactManager::read_project_yaml(
         coalition_dir.join("project.yaml"),
     )
@@ -606,9 +603,8 @@ pub fn validate_builder_preflight(
     )
     .map_err(CommandError::from)?;
 
-    let drift =
-        crate::core::freeze::FreezeService::check_contract_drift(&repo_path, project_id)
-            .map_err(CommandError::from)?;
+    let drift = crate::core::freeze::FreezeService::check_contract_drift(&repo_path, project_id)
+        .map_err(CommandError::from)?;
     if drift.has_drift {
         return Err(CommandError::with_details(
             "FROZEN_CONTRACT_DRIFT_DETECTED",
@@ -617,9 +613,8 @@ pub fn validate_builder_preflight(
         ));
     }
 
-    let builder_packet =
-        crate::core::freeze::FreezeService::get_builder_packet(&repo_path, None)
-            .map_err(CommandError::from)?;
+    let builder_packet = crate::core::freeze::FreezeService::get_builder_packet(&repo_path, None)
+        .map_err(CommandError::from)?;
 
     Ok((repo_path, version, builder_packet))
 }
@@ -763,8 +758,6 @@ pub struct StartBuilderTurnPayload {
     pub project_id: String,
     pub model: Option<String>,
     pub effort: Option<String>,
-    #[serde(default, alias = "use_fake_agy")]
-    pub use_fake_agy: bool,
 }
 
 #[tauri::command]
@@ -814,9 +807,10 @@ pub async fn list_builder_sessions(
 pub async fn get_builder_events(
     state: State<'_, AppState>,
     session_id: String,
+    limit: Option<usize>,
 ) -> Result<Vec<BuilderEventRecord>, CommandError> {
     let db = state.db.lock().await;
-    db.list_builder_events(&session_id)
+    db.list_builder_events(&session_id, limit)
         .map_err(CommandError::from)
 }
 
@@ -826,97 +820,7 @@ pub async fn start_builder_turn(
     state: State<'_, AppState>,
     payload: StartBuilderTurnPayload,
 ) -> Result<BuilderTurnResponse, CommandError> {
-    state.cancel_flag.store(false, Ordering::Relaxed);
-
-    // 1. Check current workflow state: must be FROZEN, BUILDING, or CORRECTIONS_REQUIRED
-    let current_wf_state = {
-        let db = state.db.lock().await;
-        db.connection()
-            .query_row(
-                "SELECT state FROM workflow_state WHERE project_id = ?1",
-                rusqlite::params![payload.project_id],
-                |r| r.get::<_, String>(0),
-            )
-            .map_err(|e| CommandError::new("WORKFLOW_STATE_NOT_FOUND", e.to_string()))?
-    };
-
-    if current_wf_state != "FROZEN"
-        && current_wf_state != "BUILDING"
-        && current_wf_state != "CORRECTIONS_REQUIRED"
-    {
-        return Err(CommandError::new(
-            "INVALID_WORKFLOW_STATE",
-            format!(
-                "Cannot start Builder turn while project is in {} state. Architecture must be FROZEN first.",
-                current_wf_state
-            ),
-        ));
-    }
-
-    // 2. Perform authoritative preflights BEFORE mutating workflow state or launching anything.
-    // If preflight fails (drift, snapshot corruption, missing repo, etc.), workflow state remains untouched!
-    let (repo_path, _arch_version, builder_packet) = {
-        let mut db = state.db.lock().await;
-        validate_builder_preflight(&mut db, &payload.project_id)?
-    };
-
-    let epoch_id = builder_packet.metadata.builder_epoch_id.clone();
-
-    // 3. Concurrency check via ActiveBuilderRegistry: 1 active execution per project/epoch
-    {
-        let registry = state.active_builder_registry.lock().await;
-        if let Some(existing) = registry.get_active_execution(&payload.project_id) {
-            return Err(CommandError::new(
-                "CONCURRENT_BUILD_FORBIDDEN",
-                format!(
-                    "Concurrent build forbidden: session '{}' is already actively running for project '{}'.",
-                    existing.session_id, payload.project_id
-                ),
-            ));
-        }
-    }
-
-    // 4. Preflights have succeeded. If workflow state was FROZEN or CORRECTIONS_REQUIRED, transition to BUILDING.
-    if current_wf_state == "FROZEN" || current_wf_state == "CORRECTIONS_REQUIRED" {
-        let mut db = state.db.lock().await;
-        workflow::apply_workflow_action(
-            db.connection_mut(),
-            &payload.project_id,
-            WorkflowAction::StartBuild,
-            "HUMAN",
-        )
-        .map_err(CommandError::from)?;
-    }
-
-    // 5. Invariant: Stage 3 Builder input comes 100% from the frozen Builder Packet.
-    // No arbitrary followUpPrompt is accepted or steered.
-    let turn_prompt = builder_packet.prompt.clone();
-
-    // 6. Check for existing conversation in this epoch and Icarus state
-    let (existing_conv_id, icarus_mode) = {
-        let db = state.db.lock().await;
-        let latest_session = db
-            .get_latest_builder_session(&payload.project_id)
-            .map_err(CommandError::from)?;
-        let cid = latest_session.and_then(|s| {
-            if s.epoch_id == epoch_id {
-                s.conversation_id
-            } else {
-                None
-            }
-        });
-        let icarus = db
-            .get_icarus_state(&payload.project_id)
-            .map_err(CommandError::from)?
-            .enabled;
-        (cid, icarus)
-    };
-
-    // 7. Resolve adapter and live model selection (no hardcoded fallback)
-    let adapter = if payload.use_fake_agy {
-        let fake_path = get_fake_agy_path()?;
-        AntigravityCliAdapter::with_path(fake_path)
-    } else {
+    let adapter = {
         let lock = state.agy.lock().await;
         if let Some(ref a) = *lock {
             AntigravityCliAdapter::with_path(a.binary_path())
@@ -926,306 +830,23 @@ pub async fn start_builder_turn(
         }
     };
 
-    let model_name = match payload.model {
-        Some(ref m) if !m.trim().is_empty() => m.clone(),
-        _ => {
-            let models = adapter.list_models().map_err(|e| {
-                CommandError::new(
-                    "MODEL_SELECTION_REQUIRED",
-                    format!("No model specified and live model discovery failed: {}", e),
-                )
-            })?;
-            let default_model = models.first();
-            match default_model {
-                Some(m) => m.id.clone(),
-                None => {
-                    return Err(CommandError::new(
-                        "NO_MODELS_AVAILABLE",
-                        "No models are reported available by Antigravity CLI. Please check `agy models`.",
-                    ));
-                }
-            }
-        }
-    };
-    let effort_level = payload.effort.clone();
-
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let started_at = chrono::Utc::now().to_rfc3339();
-
-    // 8. Register active execution in registry (returns per-session cancel flag)
-    let session_cancel_flag = {
-        let mut registry = state.active_builder_registry.lock().await;
-        registry
-            .register(
-                &payload.project_id,
-                &session_id,
-                &epoch_id,
-                existing_conv_id.clone(),
-                &model_name,
-                effort_level.clone(),
-                icarus_mode,
-            )
-            .map_err(|e| CommandError::new("CONCURRENT_BUILD_FORBIDDEN", e.to_string()))?
-    };
-
-    // 9. Insert initial session record
-    {
-        let db = state.db.lock().await;
-        let session_rec = BuilderSessionRecord {
-            session_id: session_id.clone(),
-            project_id: payload.project_id.clone(),
-            epoch_id: epoch_id.clone(),
-            conversation_id: existing_conv_id.clone(),
-            model: model_name.clone(),
-            effort: effort_level.clone(),
-            icarus_mode,
-            status: crate::core::builder::STATUS_RUNNING.to_string(),
-            prompt: turn_prompt.clone(),
-            response_text: None,
-            error_message: None,
-            started_at: started_at.clone(),
-            completed_at: None,
-            duration_ms: 0,
-            usage: AgyUsage::default(),
-        };
-        db.insert_builder_session(&session_rec)
-            .map_err(CommandError::from)?;
-
-        let meta = serde_json::json!({
-            "session_id": session_id,
-            "epoch_id": epoch_id,
-            "model": model_name,
-            "effort": effort_level,
-            "icarus_mode": icarus_mode,
-            "conversation_id": existing_conv_id,
-        });
-        let _ = ActivityManager::record_event(
-            db.connection(),
-            &payload.project_id,
-            "BUILDER_TURN_STARTED",
-            "BUILDER",
-            &format!(
-                "Started Builder turn with model {} (epoch: {}){}",
-                model_name,
-                epoch_id,
-                if icarus_mode { " [ICARUS MODE]" } else { "" }
-            ),
-            Some(&meta),
-        );
-    }
-
-    // 10. Channel and event streaming: emit to frontend and persist to builder_events table
-    let (tx, mut rx) = mpsc::channel::<AgyEvent>(200);
-
-    let app_clone = app.clone();
-    let session_id_clone = session_id.clone();
-    let project_id_clone = payload.project_id.clone();
-    let db_clone = state.db.clone();
-
-    tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            let _ = app_clone.emit(
-                "coalition:builder-event",
-                &serde_json::json!({
-                    "session_id": session_id_clone,
-                    "project_id": project_id_clone,
-                    "event": event,
-                }),
-            );
-
-            // Persist normalized event to SQLite builder_events table
-            let (event_type, step_idx, state_str, content_str, details_json) = match &event {
-                AgyEvent::Init { conversation_id: _, init } => (
-                    "INIT".to_string(),
-                    None,
-                    init.permission_mode.clone(),
-                    init.model.clone(),
-                    serde_json::to_string(&init).ok(),
-                ),
-                AgyEvent::StepUpdate { step_update } => {
-                    let content_delta = step_update.text_delta.clone();
-                    let bounded = content_delta.map(|c| {
-                        if c.len() > 32 * 1024 {
-                            format!("{}... [TRUNCATED]", &c[..32 * 1024])
-                        } else {
-                            c
-                        }
-                    });
-                    (
-                        step_update
-                            .step_type
-                            .clone()
-                            .unwrap_or_else(|| "STEP_UPDATE".to_string()),
-                        step_update.step_index,
-                        step_update.state.clone(),
-                        bounded,
-                        serde_json::to_string(&step_update).ok(),
-                    )
-                }
-                AgyEvent::Result { result } => (
-                    "RESULT".to_string(),
-                    None,
-                    Some(result.status.clone()),
-                    result.response.clone(),
-                    serde_json::to_string(&result).ok(),
-                ),
-                AgyEvent::Unknown => (
-                    "UNKNOWN".to_string(),
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-            };
-
-            let now = chrono::Utc::now().to_rfc3339();
-            let rec = BuilderEventRecord {
-                id: 0,
-                session_id: session_id_clone.clone(),
-                project_id: project_id_clone.clone(),
-                step_index: step_idx,
-                event_type,
-                state: state_str,
-                content: content_str,
-                details_json,
-                timestamp: now,
-            };
-
-            let db = db_clone.lock().await;
-            let _ = db.insert_builder_event(&rec);
-        }
+    let app_handle = app.clone();
+    let sink: crate::core::builder::BuilderEventSink = Arc::new(move |evt, val| {
+        use tauri::Emitter;
+        let _ = app_handle.emit(evt, val);
     });
 
-    let request = BuilderTurnRequest {
-        prompt: turn_prompt,
-        conversation_id: existing_conv_id,
-        model: Some(model_name.clone()),
-        effort: effort_level,
-        icarus_mode,
-        working_dir: Some(repo_path.to_string_lossy().to_string()),
-    };
-
-    let turn_start = tokio::time::Instant::now();
-    let execution_result = adapter
-        .run_turn(request, session_cancel_flag, Some(tx))
-        .await;
-    let duration_ms = turn_start.elapsed().as_millis() as u64;
-    let completed_at = chrono::Utc::now().to_rfc3339();
-
-    // 11. Unregister active execution from registry
-    {
-        let mut registry = state.active_builder_registry.lock().await;
-        registry.unregister(&payload.project_id, &session_id);
-    }
-
-    match execution_result {
-        Ok(resp) => {
-            let db = state.db.lock().await;
-            let final_status = if resp.was_canceled {
-                crate::core::builder::STATUS_CANCELLED
-            } else if resp.status == "SUCCESS" || resp.status == "COMPLETED" {
-                crate::core::builder::STATUS_SUCCESS
-            } else {
-                &resp.status
-            };
-
-            let _ = db.update_builder_session_status(
-                &session_id,
-                final_status,
-                Some(&resp.text_response),
-                None,
-                Some(&completed_at),
-                duration_ms,
-                &resp.cumulative_usage,
-                resp.conversation_id.as_deref(),
-            );
-
-            let meta = serde_json::json!({
-                "session_id": session_id,
-                "status": final_status,
-                "duration_ms": duration_ms,
-                "tokens": resp.cumulative_usage.total_tokens,
-                "conversation_id": resp.conversation_id,
-            });
-            let _ = ActivityManager::record_event(
-                db.connection(),
-                &payload.project_id,
-                if resp.was_canceled {
-                    "BUILDER_TURN_CANCELED"
-                } else {
-                    "BUILDER_TURN_COMPLETED"
-                },
-                "BUILDER",
-                &format!(
-                    "Builder turn {} with status: {}",
-                    if resp.was_canceled {
-                        "canceled"
-                    } else {
-                        "completed"
-                    },
-                    final_status
-                ),
-                Some(&meta),
-            );
-
-            // Accurate permission inspection:
-            // Check for actual permission denials or blocked tool execution
-            let lower_stderr = resp.stderr.to_lowercase();
-            if lower_stderr.contains("permission denied")
-                || lower_stderr.contains("tool execution denied")
-                || lower_stderr.contains("confirmation rejected")
-            {
-                let (risk_level, default_reason) = evaluate_tool_risk("external_action", &resp.stderr);
-                let perm_rec = PermissionRecord {
-                    id: 0,
-                    project_id: payload.project_id.clone(),
-                    session_id: Some(session_id.clone()),
-                    tool_name: "external_action".to_string(),
-                    target: None,
-                    risk_level: risk_level.to_string(),
-                    decision: "BLOCKED".to_string(),
-                    reason: Some(format!(
-                        "{}. Review security policy or enable Icarus mode with human authority to authorize.",
-                        default_reason
-                    )),
-                    created_at: completed_at.clone(),
-                };
-                let _ = db.record_permission_history(&perm_rec);
-            }
-
-            Ok(resp)
-        }
-        Err(e) => {
-            let err_str = e.to_string();
-            let db = state.db.lock().await;
-            let _ = db.update_builder_session_status(
-                &session_id,
-                crate::core::builder::STATUS_FAILED,
-                None,
-                Some(&err_str),
-                Some(&completed_at),
-                duration_ms,
-                &AgyUsage::default(),
-                None,
-            );
-
-            let meta = serde_json::json!({
-                "session_id": session_id,
-                "error": err_str,
-                "duration_ms": duration_ms,
-            });
-            let _ = ActivityManager::record_event(
-                db.connection(),
-                &payload.project_id,
-                "BUILDER_TURN_FAILED",
-                "BUILDER",
-                &format!("Builder turn failed: {}", err_str),
-                Some(&meta),
-            );
-
-            Err(CommandError::new("BUILDER_TURN_FAILED", err_str))
-        }
-    }
+    crate::core::builder::BuilderService::start_governed_turn(
+        state.db.clone(),
+        state.active_builder_registry.clone(),
+        Some(sink),
+        &payload.project_id,
+        payload.model,
+        payload.effort,
+        Some(adapter),
+    )
+    .await
+    .map_err(CommandError::from)
 }
 
 #[tauri::command]
@@ -1233,57 +854,52 @@ pub async fn cancel_builder_turn(
     state: State<'_, AppState>,
     project_id: Option<String>,
     session_id: Option<String>,
-) -> Result<(), CommandError> {
-    state.cancel_flag.store(true, Ordering::SeqCst);
-    let registry = state.active_builder_registry.lock().await;
+) -> Result<String, CommandError> {
+    crate::core::builder::BuilderService::cancel_turn(
+        state.active_builder_registry.clone(),
+        state.db.clone(),
+        project_id.as_deref(),
+        session_id.as_deref(),
+    )
+    .await
+    .map_err(CommandError::from)
+}
 
-    let target_session_id = if let Some(ref sid) = session_id {
-        let _ = registry.cancel_session(sid);
-        Some(sid.clone())
-    } else if let Some(ref pid) = project_id {
-        registry.cancel_project(pid).ok()
-    } else {
-        None
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticFakeAgyPayload {
+    pub prompt: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+#[tauri::command]
+pub async fn run_diagnostic_fake_agy_turn(
+    payload: DiagnosticFakeAgyPayload,
+) -> Result<BuilderTurnResponse, CommandError> {
+    let fake_path = get_fake_agy_path()?;
+    let adapter = AntigravityCliAdapter::with_path(fake_path);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let model = payload
+        .model
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| "gemini-3.8-flash-high".to_string());
+    let prompt = payload
+        .prompt
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "Diagnostic fake agy test prompt".to_string());
+    let req = BuilderTurnRequest {
+        prompt,
+        conversation_id: None,
+        model: Some(model),
+        effort: payload.effort,
+        icarus_mode: false,
+        working_dir: None,
     };
-
-    drop(registry);
-
-    if let Some(sid) = target_session_id {
-        let db = state.db.lock().await;
-        let now = chrono::Utc::now().to_rfc3339();
-        if let Ok(Some(session)) = db.get_builder_session(&sid) {
-            if session.status == crate::core::builder::STATUS_RUNNING {
-                let _ = db.update_builder_session_status(
-                    &session.session_id,
-                    crate::core::builder::STATUS_CANCELLED,
-                    None,
-                    None,
-                    Some(&now),
-                    session.duration_ms,
-                    &session.usage,
-                    session.conversation_id.as_deref(),
-                );
-            }
-        }
-    } else if let Some(ref pid) = project_id {
-        let db = state.db.lock().await;
-        if let Ok(Some(session)) = db.get_latest_builder_session(pid) {
-            if session.status == crate::core::builder::STATUS_RUNNING {
-                let now = chrono::Utc::now().to_rfc3339();
-                let _ = db.update_builder_session_status(
-                    &session.session_id,
-                    crate::core::builder::STATUS_CANCELLED,
-                    None,
-                    None,
-                    Some(&now),
-                    session.duration_ms,
-                    &session.usage,
-                    session.conversation_id.as_deref(),
-                );
-            }
-        }
-    }
-    Ok(())
+    adapter
+        .run_turn(req, cancel, None)
+        .await
+        .map_err(CommandError::from)
 }
 
 #[tauri::command]
@@ -1414,65 +1030,15 @@ pub async fn desktop_clipboard_read() -> Result<String, CommandError> {
 
 #[tauri::command]
 pub async fn desktop_open_url(url: String) -> Result<(), CommandError> {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(CommandError::new(
-            "INVALID_URL",
-            "Only HTTP and HTTPS URLs are allowed",
-        ));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("rundll32")
-            .args(["url.dll,FileProtocolHandler", &url])
-            .spawn()
-            .map_err(|e| CommandError::new("URL_OPEN_ERROR", e.to_string()))?;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(&url)
-            .spawn()
-            .map_err(|e| CommandError::new("URL_OPEN_ERROR", e.to_string()))?;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(&url)
-            .spawn()
-            .map_err(|e| CommandError::new("URL_OPEN_ERROR", e.to_string()))?;
-    }
-
-    Ok(())
+    crate::core::process::ProcessRunner::open_url(&url)
+        .map_err(|e| CommandError::new("URL_OPEN_ERROR", e.to_string()))
 }
 
 /// Narrows opening to strictly ChatGPT without arbitrary URL-opening capability.
 #[tauri::command]
 pub async fn open_chatgpt() -> Result<(), CommandError> {
-    let url = "https://chatgpt.com";
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("rundll32")
-            .args(["url.dll,FileProtocolHandler", url])
-            .spawn()
-            .map_err(|e| CommandError::new("URL_OPEN_ERROR", e.to_string()))?;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| CommandError::new("URL_OPEN_ERROR", e.to_string()))?;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| CommandError::new("URL_OPEN_ERROR", e.to_string()))?;
-    }
-
-    Ok(())
+    crate::core::process::ProcessRunner::open_url("https://chatgpt.com")
+        .map_err(|e| CommandError::new("URL_OPEN_ERROR", e.to_string()))
 }
 
 // ----------------------------------------------------------------------------
@@ -1542,23 +1108,29 @@ pub async fn copy_relay_packet_to_clipboard(
     state: State<'_, AppState>,
     packet_id: String,
 ) -> Result<(), CommandError> {
-    let db = state.db.lock().await;
-    let (prompt, project_id): (String, String) = db
-        .connection()
-        .query_row(
-            "SELECT prompt, project_id FROM relay_packets WHERE packet_id = ?1",
-            rusqlite::params![packet_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .map_err(|_| {
-            CommandError::new(
-                "PACKET_NOT_FOUND",
-                format!("Packet {} not found", packet_id),
+    let (prompt, project_id) = {
+        let db = state.db.lock().await;
+        let (p, pid): (String, String) = db
+            .connection()
+            .query_row(
+                "SELECT prompt, project_id FROM relay_packets WHERE packet_id = ?1",
+                rusqlite::params![packet_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
-        })?;
+            .map_err(|_| {
+                CommandError::new(
+                    "PACKET_NOT_FOUND",
+                    format!("Packet {} not found", packet_id),
+                )
+            })?;
+        (p, pid)
+    };
 
-    // Record outbound usage upon actual copy action using calibrated estimator
+    // Invariant: Outbound usage recorded ONLY after successful clipboard write
+    desktop_clipboard_write(prompt.clone()).await?;
+
     let char_count = prompt.len();
+    let db = state.db.lock().await;
     let summary = db.get_chatgpt_usage_summary(&project_id).ok();
     let chars_per_token = summary.map(|s| s.chars_per_token).unwrap_or(4.0);
     let estimated_tokens = if chars_per_token > 0.0 {
@@ -1573,11 +1145,11 @@ pub async fn copy_relay_packet_to_clipboard(
         "OUTBOUND_PACKET",
         char_count,
         estimated_tokens,
+        1,
+        chars_per_token,
     );
 
-    drop(db);
-
-    desktop_clipboard_write(prompt).await
+    Ok(())
 }
 
 #[tauri::command]
@@ -1607,6 +1179,8 @@ pub async fn import_from_clipboard(
         "INBOUND_IMPORT",
         char_count,
         estimated_tokens,
+        1,
+        chars_per_token,
     );
 
     Ok(preview)

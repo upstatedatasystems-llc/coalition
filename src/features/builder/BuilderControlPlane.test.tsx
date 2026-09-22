@@ -485,4 +485,135 @@ describe('BuilderControlPlaneView', () => {
     expect(screen.getByText('BLOCKED')).toBeInTheDocument();
     expect(screen.getByText(/Why was a tool blocked\?/i)).toBeInTheDocument();
   });
+
+  it('renders active-run Icarus banner exclusively based on session icarus_mode, decoupled from project preference', async () => {
+    // Case 1: Active running session has icarus_mode = true, but project icarus preference is disabled (false)
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'list_builder_models') return Promise.resolve(mockModels);
+      if (cmd === 'get_builder_packet') return Promise.resolve(mockBuilderPacket);
+      if (cmd === 'get_contract_drift') return Promise.resolve(mockCleanDriftReport);
+      if (cmd === 'get_icarus_state') return Promise.resolve(mockIcarusInactive); // disabled at project level
+      if (cmd === 'get_usage_telemetry') return Promise.resolve(mockTelemetry);
+      if (cmd === 'get_permission_history') return Promise.resolve([]);
+      if (cmd === 'list_builder_sessions') {
+        return Promise.resolve([
+          {
+            session_id: 'active-session-icarus',
+            project_id: 'proj-stage3',
+            epoch_id: 'epoch-stage3-12345',
+            model: 'gemini-3.8-flash-high',
+            icarus_mode: true, // run was launched in Icarus mode
+            status: 'RUNNING',
+            prompt: 'test prompt',
+            started_at: '2026-09-22T14:00:00Z',
+            duration_ms: 1000,
+            usage: { input_tokens: 0, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 0 },
+          },
+        ]);
+      }
+      return Promise.resolve(null);
+    });
+
+    await act(async () => {
+      render(
+        <BuilderControlPlaneView
+          projectId="proj-stage3"
+          projectName="Stage3 Test Project"
+          workflowState="BUILDING"
+          onRefreshProject={onRefreshProject}
+        />
+      );
+    });
+
+    // Active-run banner MUST be visible because session has icarus_mode === true
+    expect(screen.getByTestId('active-run-icarus-banner')).toBeInTheDocument();
+    // Project-level banner MUST NOT be shown
+    expect(screen.queryByTestId('icarus-banner')).not.toBeInTheDocument();
+  });
+
+  it('does not render active-run Icarus banner if active session was least-privilege even if project preference was turned on later', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'list_builder_models') return Promise.resolve(mockModels);
+      if (cmd === 'get_builder_packet') return Promise.resolve(mockBuilderPacket);
+      if (cmd === 'get_contract_drift') return Promise.resolve(mockCleanDriftReport);
+      if (cmd === 'get_icarus_state') return Promise.resolve(mockIcarusActive); // enabled at project level
+      if (cmd === 'get_usage_telemetry') return Promise.resolve(mockTelemetry);
+      if (cmd === 'get_permission_history') return Promise.resolve([]);
+      if (cmd === 'list_builder_sessions') {
+        return Promise.resolve([
+          {
+            session_id: 'active-session-least-privilege',
+            project_id: 'proj-stage3',
+            epoch_id: 'epoch-stage3-12345',
+            model: 'gemini-3.8-flash-high',
+            icarus_mode: false, // run was NOT launched in Icarus mode
+            status: 'RUNNING',
+            prompt: 'test prompt',
+            started_at: '2026-09-22T14:00:00Z',
+            duration_ms: 1000,
+            usage: { input_tokens: 0, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 0 },
+          },
+        ]);
+      }
+      return Promise.resolve(null);
+    });
+
+    await act(async () => {
+      render(
+        <BuilderControlPlaneView
+          projectId="proj-stage3"
+          projectName="Stage3 Test Project"
+          workflowState="BUILDING"
+          onRefreshProject={onRefreshProject}
+        />
+      );
+    });
+
+    // Active-run banner MUST NOT be visible
+    expect(screen.queryByTestId('active-run-icarus-banner')).not.toBeInTheDocument();
+    // Project-level banner is shown because project preference is active
+    expect(screen.getByTestId('icarus-banner')).toBeInTheDocument();
+  });
+
+  it('correctly displays TIMEOUT status in session history', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'list_builder_models') return Promise.resolve(mockModels);
+      if (cmd === 'get_builder_packet') return Promise.resolve(mockBuilderPacket);
+      if (cmd === 'get_contract_drift') return Promise.resolve(mockCleanDriftReport);
+      if (cmd === 'get_icarus_state') return Promise.resolve(mockIcarusInactive);
+      if (cmd === 'get_usage_telemetry') return Promise.resolve(mockTelemetry);
+      if (cmd === 'get_permission_history') return Promise.resolve([]);
+      if (cmd === 'list_builder_sessions') {
+        return Promise.resolve([
+          {
+            session_id: 'timed-out-session',
+            project_id: 'proj-stage3',
+            epoch_id: 'epoch-stage3-12345',
+            model: 'gemini-3.8-flash-high',
+            icarus_mode: false,
+            status: 'TIMEOUT',
+            prompt: 'timed out prompt',
+            started_at: '2026-09-22T14:00:00Z',
+            completed_at: '2026-09-22T14:10:00Z',
+            duration_ms: 600000,
+            usage: { input_tokens: 100, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 100 },
+          },
+        ]);
+      }
+      return Promise.resolve(null);
+    });
+
+    await act(async () => {
+      render(
+        <BuilderControlPlaneView
+          projectId="proj-stage3"
+          projectName="Stage3 Test Project"
+          workflowState="BUILDING"
+          onRefreshProject={onRefreshProject}
+        />
+      );
+    });
+
+    expect(screen.getByText('TIMEOUT')).toBeInTheDocument();
+  });
 });

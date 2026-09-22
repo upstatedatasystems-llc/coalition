@@ -324,6 +324,13 @@ impl DbManager {
                 ALTER TABLE chatgpt_calibration_settings ADD COLUMN sample_count INTEGER NOT NULL DEFAULT 0;
                 ALTER TABLE chatgpt_calibration_settings ADD COLUMN last_calibrated_at TEXT;",
             ),
+            (
+                9,
+                "009_stage3_provenance_and_normalization",
+                "ALTER TABLE chatgpt_usage_records ADD COLUMN estimator_version INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE chatgpt_usage_records ADD COLUMN chars_per_token REAL NOT NULL DEFAULT 4.0;
+                UPDATE builder_sessions SET status = 'SUCCESS' WHERE status = 'COMPLETED';",
+            ),
         ];
 
         let mut applied = Vec::new();
@@ -681,13 +688,22 @@ impl DbManager {
     pub fn list_builder_events(
         &self,
         session_id: &str,
+        limit: Option<usize>,
     ) -> Result<Vec<BuilderEventRecord>, DbError> {
+        let max_records = limit.unwrap_or(1000);
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, project_id, step_index, event_type, state, content, details_json, timestamp
-             FROM builder_events WHERE session_id = ?1 ORDER BY id ASC",
+             FROM (
+                 SELECT id, session_id, project_id, step_index, event_type, state, content, details_json, timestamp
+                 FROM builder_events
+                 WHERE session_id = ?1
+                 ORDER BY id DESC
+                 LIMIT ?2
+             ) sub
+             ORDER BY id ASC",
         )?;
 
-        let rows = stmt.query_map(params![session_id], |r| {
+        let rows = stmt.query_map(params![session_id, max_records as i64], |r| {
             Ok(BuilderEventRecord {
                 id: r.get(0)?,
                 session_id: r.get(1)?,
@@ -709,6 +725,7 @@ impl DbManager {
     }
 
     // ChatGPT Usage & Capacity Telemetry
+    #[allow(clippy::too_many_arguments)]
     pub fn record_chatgpt_usage(
         &self,
         project_id: &str,
@@ -716,19 +733,23 @@ impl DbManager {
         direction: &str,
         char_count: usize,
         estimated_tokens: usize,
+        estimator_version: u32,
+        chars_per_token: f64,
     ) -> Result<(), DbError> {
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO chatgpt_usage_records (
-                project_id, packet_id, direction, char_count, estimated_tokens, timestamp
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                project_id, packet_id, direction, char_count, estimated_tokens, timestamp, estimator_version, chars_per_token
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 project_id,
                 packet_id,
                 direction,
                 char_count as i64,
                 estimated_tokens as i64,
-                now
+                now,
+                estimator_version,
+                chars_per_token,
             ],
         )?;
         Ok(())
@@ -792,13 +813,12 @@ impl DbManager {
             |r| r.get(0),
         )?;
 
-        let estimated_5h_capacity_pct =
-            Some(((rolling_5h_tokens as f64 / 80_000.0) * 100.0).min(100.0));
-        let estimated_weekly_capacity_pct =
-            Some(((rolling_7d_tokens as f64 / 500_000.0) * 100.0).min(100.0));
+        // Do not fabricate hardcoded 80,000 / 500,000 subscription plan allowances.
+        let estimated_5h_capacity_pct: Option<f64> = None;
+        let estimated_weekly_capacity_pct: Option<f64> = None;
 
         let disclaimer = format!(
-            "Estimated relay throughput based on character heuristics (~{:.1} chars/token). ChatGPT Plus message caps and rate limits are managed by OpenAI and are not provider-reported here.",
+            "Estimated relay throughput based on character heuristics (~{:.1} chars/token). Model limits and tier quotas are managed by OpenAI and are not provider-reported here.",
             chars_per_token
         );
 
@@ -1035,7 +1055,7 @@ mod tests {
     fn test_sqlite_in_memory_migrations_and_proof() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let result = db.run_proof().expect("run proof");
-        assert_eq!(result.applied_migrations.len(), 8);
+        assert_eq!(result.applied_migrations.len(), 9);
         assert_eq!(result.applied_migrations[0].version, 1);
         assert_eq!(result.applied_migrations[1].version, 2);
         assert_eq!(result.applied_migrations[2].version, 3);
@@ -1044,6 +1064,7 @@ mod tests {
         assert_eq!(result.applied_migrations[5].version, 6);
         assert_eq!(result.applied_migrations[6].version, 7);
         assert_eq!(result.applied_migrations[7].version, 8);
+        assert_eq!(result.applied_migrations[8].version, 9);
         assert_eq!(result.test_record_id, 1);
         assert_eq!(result.total_records, 1);
 
@@ -1101,7 +1122,7 @@ mod tests {
 
         let mut db = DbManager { conn };
         let applied = db.run_migrations().expect("run forward migrations");
-        assert_eq!(applied.len(), 7);
+        assert_eq!(applied.len(), 8);
         assert_eq!(applied[0].version, 2);
         assert_eq!(applied[1].version, 3);
         assert_eq!(applied[2].version, 4);
@@ -1109,6 +1130,7 @@ mod tests {
         assert_eq!(applied[4].version, 6);
         assert_eq!(applied[5].version, 7);
         assert_eq!(applied[6].version, 8);
+        assert_eq!(applied[7].version, 9);
 
         // Verify Phase 0 data preserved
         let count: i64 = db
@@ -1144,7 +1166,7 @@ mod tests {
     fn test_migrations_already_migrated_is_idempotent() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let applied1 = db.run_migrations().expect("first migration run");
-        assert_eq!(applied1.len(), 8);
+        assert_eq!(applied1.len(), 9);
 
         let applied2 = db.run_migrations().expect("second migration run");
         assert_eq!(applied2.len(), 0);
@@ -1246,9 +1268,9 @@ mod tests {
             )
             .unwrap();
 
-        db.record_chatgpt_usage("p1", Some("pkt-1"), "OUTBOUND_PACKET", 4000, 1000)
+        db.record_chatgpt_usage("p1", Some("pkt-1"), "OUTBOUND_PACKET", 4000, 1000, 1, 4.0)
             .unwrap();
-        db.record_chatgpt_usage("p1", Some("pkt-1"), "INBOUND_IMPORT", 2000, 500)
+        db.record_chatgpt_usage("p1", Some("pkt-1"), "INBOUND_IMPORT", 2000, 500, 1, 4.0)
             .unwrap();
 
         let summary = db.get_chatgpt_usage_summary("p1").unwrap();
@@ -1323,5 +1345,121 @@ mod tests {
         assert_eq!(summary1.estimator_version, 2);
         assert_eq!(summary1.sample_count, 1);
         assert!(summary1.last_calibrated_at.is_some());
+    }
+
+    #[test]
+    fn test_builder_sessions_all_statuses_round_trip() {
+        let mut db = DbManager::new_in_memory().expect("in memory db");
+        db.run_migrations().expect("migrations");
+
+        db.connection()
+            .execute(
+                "INSERT INTO projects (project_id, name, repository_path, created_at, updated_at, last_opened_at)
+                 VALUES ('p1', 'Test', '/path/test', 'now', 'now', 'now')",
+                [],
+            )
+            .unwrap();
+
+        let statuses = [
+            crate::core::builder::STATUS_RUNNING,
+            crate::core::builder::STATUS_SUCCESS,
+            crate::core::builder::STATUS_FAILED,
+            crate::core::builder::STATUS_CANCELLED,
+            crate::core::builder::STATUS_TIMEOUT,
+            crate::core::builder::STATUS_INTERRUPTED,
+        ];
+
+        for (i, status) in statuses.iter().enumerate() {
+            let session_id = format!("sess-{}", i);
+            let session = crate::core::builder::BuilderSessionRecord {
+                session_id: session_id.clone(),
+                project_id: "p1".to_string(),
+                epoch_id: "epoch-1".to_string(),
+                conversation_id: None,
+                model: "gemini-3.8-flash-high".to_string(),
+                effort: Some("medium".to_string()),
+                icarus_mode: false,
+                status: status.to_string(),
+                prompt: "test prompt".to_string(),
+                response_text: None,
+                error_message: None,
+                started_at: "2026-09-22T10:00:00Z".to_string(),
+                completed_at: None,
+                duration_ms: 1000,
+                usage: crate::core::builder::AgyUsage::default(),
+            };
+
+            db.insert_builder_session(&session).unwrap();
+            let retrieved = db.get_builder_session(&session_id).unwrap().unwrap();
+            assert_eq!(retrieved.status, *status);
+        }
+    }
+
+    #[test]
+    fn test_list_builder_events_bounded_chronological() {
+        let mut db = DbManager::new_in_memory().expect("in memory db");
+        db.run_migrations().expect("migrations");
+
+        db.connection()
+            .execute(
+                "INSERT INTO projects (project_id, name, repository_path, created_at, updated_at, last_opened_at)
+                 VALUES ('p1', 'Test', '/path/test', 'now', 'now', 'now')",
+                [],
+            )
+            .unwrap();
+
+        db.insert_builder_session(&crate::core::builder::BuilderSessionRecord {
+            session_id: "sess-bounded".to_string(),
+            project_id: "p1".to_string(),
+            epoch_id: "ep-1".to_string(),
+            conversation_id: None,
+            model: "m1".to_string(),
+            effort: None,
+            icarus_mode: false,
+            status: "RUNNING".to_string(),
+            prompt: "p".to_string(),
+            response_text: None,
+            error_message: None,
+            started_at: "now".to_string(),
+            completed_at: None,
+            duration_ms: 0,
+            usage: crate::core::builder::AgyUsage::default(),
+        })
+        .unwrap();
+
+        // Insert 1,050 events
+        let total_events = 1050;
+        for i in 1..=total_events {
+            let rec = crate::core::builder::BuilderEventRecord {
+                id: 0,
+                session_id: "sess-bounded".to_string(),
+                project_id: "p1".to_string(),
+                step_index: Some(i),
+                event_type: "STEP_UPDATE".to_string(),
+                state: Some("running".to_string()),
+                content: Some(format!("Step content #{}", i)),
+                details_json: None,
+                timestamp: format!(
+                    "2026-09-22T{:02}:{:02}:{:02}Z",
+                    (i / 3600) % 24,
+                    (i / 60) % 60,
+                    i % 60
+                ),
+            };
+            db.insert_builder_event(&rec).unwrap();
+        }
+
+        // Query with default limit (1,000)
+        let retrieved = db.list_builder_events("sess-bounded", None).unwrap();
+        assert_eq!(retrieved.len(), 1000);
+
+        // Verify it returned the LATEST 1,000 records (51 to 1050)
+        assert_eq!(retrieved.first().unwrap().step_index, Some(51));
+        assert_eq!(retrieved.last().unwrap().step_index, Some(1050));
+
+        // Verify chronological ascending order
+        for idx in 0..retrieved.len() - 1 {
+            assert!(retrieved[idx].id < retrieved[idx + 1].id);
+        }
     }
 }

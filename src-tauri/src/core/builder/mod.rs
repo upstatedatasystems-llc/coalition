@@ -292,19 +292,131 @@ pub fn evaluate_tool_risk(tool_name: &str, content: &str) -> (&'static str, &'st
                     "Potentially destructive shell command execution",
                 )
             } else {
-                ("HIGH", "Arbitrary command line process execution")
+                ("HIGH_RISK", "Arbitrary command line process execution")
             }
         }
-        "write_to_file" => ("MEDIUM", "File modification or creation"),
-        "replace_file_content" => ("MEDIUM", "In-place file mutation"),
-        "view_file" => ("LOW", "Read-only file inspection"),
-        "list_dir" => ("LOW", "Directory listing"),
-        "grep_search" => ("LOW", "Read-only pattern search"),
-        "find_by_name" => ("LOW", "File search"),
-        _ => ("HIGH", "External tool invocation with unclassified risk"),
+        "write_to_file" => ("MUTATING", "File modification or creation"),
+        "replace_file_content" => ("MUTATING", "In-place file mutation"),
+        "view_file" => ("READ_ONLY", "Read-only file inspection"),
+        "list_dir" => ("READ_ONLY", "Directory listing"),
+        "grep_search" => ("READ_ONLY", "Read-only pattern search"),
+        "find_by_name" => ("READ_ONLY", "File search"),
+        _ => (
+            "HIGH_RISK",
+            "External tool invocation with unclassified risk",
+        ),
     }
 }
 
+/// Redacts sensitive credentials, tokens, and authorization headers from strings before persistent logging.
+pub fn sanitize_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for word in text.split_whitespace() {
+        if word.starts_with("sk-") && word.len() > 10 {
+            out.push_str("[REDACTED_API_KEY]");
+        } else if word.starts_with("AIza") && word.len() > 20 {
+            out.push_str("[REDACTED_KEY]");
+        } else if word.to_lowercase().starts_with("bearer") && word.len() > 6 {
+            out.push_str("[REDACTED_TOKEN]");
+        } else {
+            out.push_str(word);
+        }
+        out.push(' ');
+    }
+    if !out.is_empty() {
+        out.pop();
+    }
+    out
+}
+
+pub fn sanitize_and_bound_event_record(
+    event: &AgyEvent,
+    session_id: &str,
+    project_id: &str,
+) -> BuilderEventRecord {
+    use crate::core::process::truncate_utf8_safe;
+
+    let (event_type, step_idx, state_str, content_str, details_json) = match event {
+        AgyEvent::Init {
+            conversation_id: _,
+            init,
+        } => {
+            let mut sanitized_init = init.clone();
+            sanitized_init.cwd = None; // Strip developer machine-local path!
+            let details = serde_json::to_string(&sanitized_init)
+                .ok()
+                .map(|d| truncate_utf8_safe(&d, 32 * 1024).to_string());
+            (
+                "INIT".to_string(),
+                None,
+                init.permission_mode.clone(),
+                init.model.clone(),
+                details,
+            )
+        }
+        AgyEvent::StepUpdate { step_update } => {
+            let mut bounded_step = step_update.clone();
+            let bounded_delta = bounded_step.text_delta.as_ref().map(|d| {
+                let safe = truncate_utf8_safe(d, 16 * 1024);
+                sanitize_text(safe)
+            });
+            bounded_step.text_delta = bounded_delta.clone();
+
+            let details = serde_json::to_string(&bounded_step)
+                .ok()
+                .map(|d| truncate_utf8_safe(&d, 32 * 1024).to_string());
+
+            (
+                step_update
+                    .step_type
+                    .clone()
+                    .unwrap_or_else(|| "STEP_UPDATE".to_string()),
+                step_update.step_index,
+                step_update.state.clone(),
+                bounded_delta,
+                details,
+            )
+        }
+        AgyEvent::Result { result } => {
+            let mut bounded_result = result.clone();
+            bounded_result.response = bounded_result.response.as_ref().map(|r| {
+                let safe = truncate_utf8_safe(r, 16 * 1024);
+                sanitize_text(safe)
+            });
+            bounded_result.error = bounded_result.error.as_ref().map(|e| {
+                let safe = truncate_utf8_safe(e, 16 * 1024);
+                sanitize_text(safe)
+            });
+
+            let details = serde_json::to_string(&bounded_result)
+                .ok()
+                .map(|d| truncate_utf8_safe(&d, 32 * 1024).to_string());
+
+            (
+                "RESULT".to_string(),
+                None,
+                Some(result.status.clone()),
+                bounded_result.response,
+                details,
+            )
+        }
+        AgyEvent::Unknown => ("UNKNOWN".to_string(), None, None, None, None),
+    };
+
+    BuilderEventRecord {
+        id: 0,
+        session_id: session_id.to_string(),
+        project_id: project_id.to_string(),
+        step_index: step_idx,
+        event_type,
+        state: state_str,
+        content: content_str,
+        details_json,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct AntigravityCliAdapter {
     bin_path: PathBuf,
 }
@@ -597,7 +709,13 @@ impl AntigravityCliAdapter {
                             }
                             AgyEvent::StepUpdate { step_update } => {
                                 if let Some(ref delta) = step_update.text_delta {
-                                    final_text.push_str(delta);
+                                    if final_text.len() < 5 * 1024 * 1024 {
+                                        let remaining = 5 * 1024 * 1024 - final_text.len();
+                                        let safe_slice = crate::core::process::truncate_utf8_safe(
+                                            delta, remaining,
+                                        );
+                                        final_text.push_str(safe_slice);
+                                    }
                                 }
                                 if let Some(ref u) = step_update.usage {
                                     cumulative_usage = u.clone();
@@ -610,13 +728,23 @@ impl AntigravityCliAdapter {
                                 }
                                 if let Some(ref resp) = result.response {
                                     if final_text.is_empty() {
-                                        final_text = resp.clone();
+                                        final_text = crate::core::process::truncate_utf8_safe(
+                                            resp,
+                                            5 * 1024 * 1024,
+                                        )
+                                        .to_string();
                                     }
                                 }
                                 if let Some(ref err) = result.error {
-                                    if !err.is_empty() {
-                                        stderr_buffer.push_str(err);
-                                        stderr_buffer.push('\n');
+                                    if !err.is_empty() && stderr_buffer.len() < 5 * 1024 * 1024 {
+                                        let remaining = 5 * 1024 * 1024 - stderr_buffer.len();
+                                        let safe_slice = crate::core::process::truncate_utf8_safe(
+                                            err, remaining,
+                                        );
+                                        stderr_buffer.push_str(safe_slice);
+                                        if stderr_buffer.len() < 5 * 1024 * 1024 {
+                                            stderr_buffer.push('\n');
+                                        }
                                     }
                                 }
                             }
@@ -629,8 +757,15 @@ impl AntigravityCliAdapter {
                     }
                 }
                 ProcessOutputKind::Stderr => {
-                    stderr_buffer.push_str(&out_line.line);
-                    stderr_buffer.push('\n');
+                    if stderr_buffer.len() < 5 * 1024 * 1024 {
+                        let remaining = 5 * 1024 * 1024 - stderr_buffer.len();
+                        let safe_slice =
+                            crate::core::process::truncate_utf8_safe(&out_line.line, remaining);
+                        stderr_buffer.push_str(safe_slice);
+                        if stderr_buffer.len() < 5 * 1024 * 1024 {
+                            stderr_buffer.push('\n');
+                        }
+                    }
                 }
             }
         }
@@ -645,16 +780,6 @@ impl AntigravityCliAdapter {
                 )))
             }
         };
-
-        // Enforce memory bounds on final_text and stderr_buffer
-        if final_text.len() > 5 * 1024 * 1024 {
-            final_text.truncate(5 * 1024 * 1024);
-            final_text.push_str("\n[TRUNCATED: output exceeded 5 MB]");
-        }
-        if stderr_buffer.len() > 5 * 1024 * 1024 {
-            stderr_buffer.truncate(5 * 1024 * 1024);
-            stderr_buffer.push_str("\n[TRUNCATED: stderr exceeded 5 MB]");
-        }
 
         if proc_res.canceled {
             return Ok(BuilderTurnResponse {
@@ -708,6 +833,464 @@ impl AntigravityCliAdapter {
             was_canceled: false,
             stderr: stderr_buffer,
         })
+    }
+}
+
+pub fn validate_builder_preflight(
+    db: &mut crate::db::DbManager,
+    project_id: &str,
+) -> Result<(PathBuf, String, crate::core::freeze::BuilderPacket), BuilderError> {
+    let repo_path_str: String = db
+        .connection()
+        .query_row(
+            "SELECT repository_path FROM projects WHERE project_id = ?1",
+            rusqlite::params![project_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| BuilderError::ExecutionFailed(format!("Project repository error: {}", e)))?;
+    let repo_path = PathBuf::from(repo_path_str);
+
+    if !repo_path.exists() || !repo_path.is_dir() {
+        return Err(BuilderError::ExecutionFailed(format!(
+            "Repository directory does not exist or is unavailable: {:?}",
+            repo_path
+        )));
+    }
+
+    crate::core::freeze::FreezeService::reconcile_drift_restoration(
+        &repo_path,
+        project_id,
+        db.connection_mut(),
+    )
+    .map_err(|e| {
+        BuilderError::ExecutionFailed(format!("Drift restoration recovery required: {}", e))
+    })?;
+
+    let coalition_dir = crate::core::artifacts::ArtifactManager::resolve_coalition_dir(&repo_path)
+        .map_err(|e| BuilderError::ExecutionFailed(format!("Artifact resolution error: {}", e)))?;
+
+    let project_yaml = crate::core::artifacts::ArtifactManager::read_project_yaml(
+        coalition_dir.join("project.yaml"),
+    )
+    .map_err(|e| BuilderError::ExecutionFailed(format!("Cannot read project.yaml: {}", e)))?;
+
+    if project_yaml.architecture_state != crate::core::artifacts::ArchitectureState::Frozen {
+        return Err(BuilderError::NotFrozen(format!(
+            "Project architecture state is '{}', but must be 'frozen' to execute Builder",
+            project_yaml.architecture_state
+        )));
+    }
+
+    let version = project_yaml
+        .current_architecture_version
+        .as_deref()
+        .unwrap_or("1.0")
+        .to_string();
+
+    crate::core::freeze::FreezeService::verify_snapshot_integrity(
+        &repo_path,
+        &version,
+        project_yaml.active_manifest_fingerprint.as_deref(),
+    )
+    .map_err(|e| BuilderError::ExecutionFailed(format!("Frozen snapshot corrupt: {}", e)))?;
+
+    let drift = crate::core::freeze::FreezeService::check_contract_drift(&repo_path, project_id)
+        .map_err(|e| BuilderError::ExecutionFailed(format!("Contract drift check error: {}", e)))?;
+
+    if drift.has_drift {
+        return Err(BuilderError::DriftDetected(
+            "Cannot start build: architecture contract has drifted from frozen snapshot. Restore artifacts or complete governed architecture change first.".to_string(),
+        ));
+    }
+
+    let builder_packet = crate::core::freeze::FreezeService::get_builder_packet(&repo_path, None)
+        .map_err(|e| {
+        BuilderError::ExecutionFailed(format!("Builder packet read error: {}", e))
+    })?;
+
+    Ok((repo_path, version, builder_packet))
+}
+
+pub type BuilderEventSink = Arc<dyn Fn(&str, &serde_json::Value) + Send + Sync>;
+
+pub struct BuilderService;
+
+impl BuilderService {
+    pub async fn start_governed_turn(
+        db_arc: Arc<tokio::sync::Mutex<crate::db::DbManager>>,
+        registry_arc: Arc<tokio::sync::Mutex<ActiveBuilderRegistry>>,
+        event_sink: Option<BuilderEventSink>,
+        project_id: &str,
+        model: Option<String>,
+        effort: Option<String>,
+        custom_adapter: Option<AntigravityCliAdapter>,
+    ) -> Result<BuilderTurnResponse, BuilderError> {
+        // 1. Check current workflow state: must be FROZEN, BUILDING, or CORRECTIONS_REQUIRED
+        let current_wf_state = {
+            let db = db_arc.lock().await;
+            db.connection()
+                .query_row(
+                    "SELECT state FROM workflow_state WHERE project_id = ?1",
+                    rusqlite::params![project_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .map_err(|e| {
+                    BuilderError::ExecutionFailed(format!("Workflow state not found: {}", e))
+                })?
+        };
+
+        if current_wf_state != "FROZEN"
+            && current_wf_state != "BUILDING"
+            && current_wf_state != "CORRECTIONS_REQUIRED"
+        {
+            return Err(BuilderError::ExecutionFailed(format!(
+                "Cannot start Builder turn while project is in {} state. Architecture must be FROZEN first.",
+                current_wf_state
+            )));
+        }
+
+        // 2. Perform authoritative preflights BEFORE mutating workflow state.
+        // If preflight fails (drift, snapshot corrupt, missing repo), workflow state remains untouched!
+        let (repo_path, _arch_version, builder_packet) = {
+            let mut db = db_arc.lock().await;
+            validate_builder_preflight(&mut db, project_id)?
+        };
+
+        let epoch_id = builder_packet.metadata.builder_epoch_id.clone();
+
+        // 3. Concurrency check via ActiveBuilderRegistry: strictly 1 active execution per project
+        {
+            let registry = registry_arc.lock().await;
+            if let Some(existing) = registry.get_active_execution(project_id) {
+                return Err(BuilderError::ExecutionFailed(format!(
+                    "Concurrent build forbidden: session '{}' is already actively running for project '{}'.",
+                    existing.session_id, project_id
+                )));
+            }
+        }
+
+        // 4. Preflights have succeeded. If workflow state was FROZEN or CORRECTIONS_REQUIRED, transition to BUILDING.
+        if current_wf_state == "FROZEN" || current_wf_state == "CORRECTIONS_REQUIRED" {
+            let mut db = db_arc.lock().await;
+            crate::core::workflow::apply_workflow_action(
+                db.connection_mut(),
+                project_id,
+                crate::core::workflow::WorkflowAction::StartBuild,
+                "HUMAN",
+            )
+            .map_err(|e| BuilderError::ExecutionFailed(e.to_string()))?;
+        }
+
+        // 5. Invariant: Stage 3 Builder input comes 100% from the frozen Builder Packet.
+        let turn_prompt = builder_packet.prompt.clone();
+
+        // 6. Check for existing conversation in this epoch only and Icarus state
+        let (existing_conv_id, icarus_mode) = {
+            let db = db_arc.lock().await;
+            let latest_session = db
+                .get_latest_builder_session(project_id)
+                .map_err(|e| BuilderError::ExecutionFailed(e.to_string()))?;
+            let cid = latest_session.and_then(|s| {
+                if s.epoch_id == epoch_id {
+                    s.conversation_id
+                } else {
+                    None
+                }
+            });
+            let icarus = db
+                .get_icarus_state(project_id)
+                .map_err(|e| BuilderError::ExecutionFailed(e.to_string()))?
+                .enabled;
+            (cid, icarus)
+        };
+
+        // 7. Resolve adapter
+        let adapter = if let Some(a) = custom_adapter {
+            a
+        } else {
+            AntigravityCliAdapter::discover()?
+        };
+
+        let model_name = match model {
+            Some(ref m) if !m.trim().is_empty() => m.clone(),
+            _ => {
+                let models = adapter.list_models()?;
+                match models.first() {
+                    Some(m) => m.id.clone(),
+                    None => {
+                        return Err(BuilderError::ExecutionFailed(
+                            "No models are reported available by Antigravity CLI. Please check `agy models`."
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        };
+        let effort_level = effort.clone();
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let started_at = chrono::Utc::now().to_rfc3339();
+
+        // 8. Register active execution in registry (returns per-session cancel flag)
+        let session_cancel_flag = {
+            let mut registry = registry_arc.lock().await;
+            registry.register(
+                project_id,
+                &session_id,
+                &epoch_id,
+                existing_conv_id.clone(),
+                &model_name,
+                effort_level.clone(),
+                icarus_mode,
+            )?
+        };
+
+        // 9. Insert initial session record
+        {
+            let db = db_arc.lock().await;
+            let session_rec = BuilderSessionRecord {
+                session_id: session_id.clone(),
+                project_id: project_id.to_string(),
+                epoch_id: epoch_id.clone(),
+                conversation_id: existing_conv_id.clone(),
+                model: model_name.clone(),
+                effort: effort_level.clone(),
+                icarus_mode,
+                status: STATUS_RUNNING.to_string(),
+                prompt: turn_prompt.clone(),
+                response_text: None,
+                error_message: None,
+                started_at: started_at.clone(),
+                completed_at: None,
+                duration_ms: 0,
+                usage: AgyUsage::default(),
+            };
+            db.insert_builder_session(&session_rec)
+                .map_err(|e| BuilderError::ExecutionFailed(e.to_string()))?;
+
+            let meta = serde_json::json!({
+                "session_id": session_id,
+                "epoch_id": epoch_id,
+                "model": model_name,
+                "effort": effort_level,
+                "icarus_mode": icarus_mode,
+                "conversation_id": existing_conv_id,
+            });
+            let _ = crate::core::activity::ActivityManager::record_event(
+                db.connection(),
+                project_id,
+                "BUILDER_TURN_STARTED",
+                "BUILDER",
+                &format!(
+                    "Started Builder turn with model {} (epoch: {}){}",
+                    model_name,
+                    epoch_id,
+                    if icarus_mode { " [ICARUS MODE]" } else { "" }
+                ),
+                Some(&meta),
+            );
+        }
+
+        // 10. Channel and event streaming: emit to frontend and persist to builder_events table
+        let (tx, mut rx) = mpsc::channel::<AgyEvent>(200);
+
+        let sink_clone = event_sink.clone();
+        let session_id_clone = session_id.clone();
+        let project_id_clone = project_id.to_string();
+        let db_clone = db_arc.clone();
+
+        let persist_handle = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if let Some(ref sink) = sink_clone {
+                    sink(
+                        "coalition:builder-event",
+                        &serde_json::json!({
+                            "session_id": session_id_clone,
+                            "project_id": project_id_clone,
+                            "event": event,
+                        }),
+                    );
+                }
+
+                let rec =
+                    sanitize_and_bound_event_record(&event, &session_id_clone, &project_id_clone);
+                let db = db_clone.lock().await;
+                let _ = db.insert_builder_event(&rec);
+            }
+        });
+
+        let request = BuilderTurnRequest {
+            prompt: turn_prompt,
+            conversation_id: existing_conv_id,
+            model: Some(model_name.clone()),
+            effort: effort_level,
+            icarus_mode,
+            working_dir: Some(repo_path.to_string_lossy().to_string()),
+        };
+
+        let turn_start = tokio::time::Instant::now();
+        let execution_result = adapter
+            .run_turn(request, session_cancel_flag, Some(tx))
+            .await;
+        let duration_ms = turn_start.elapsed().as_millis() as u64;
+        let completed_at = chrono::Utc::now().to_rfc3339();
+
+        // Await persistence drain before proceeding to ensure no trailing events are lost
+        let _ = persist_handle.await;
+
+        // 11. Unregister active execution from registry
+        {
+            let mut registry = registry_arc.lock().await;
+            registry.unregister(project_id, &session_id);
+        }
+
+        match execution_result {
+            Ok(resp) => {
+                let db = db_arc.lock().await;
+                let final_status = if resp.was_canceled {
+                    STATUS_CANCELLED
+                } else if resp.status == "SUCCESS" || resp.status == "COMPLETED" {
+                    STATUS_SUCCESS
+                } else if resp.status == "TIMEOUT" {
+                    STATUS_TIMEOUT
+                } else {
+                    &resp.status
+                };
+
+                let _ = db.update_builder_session_status(
+                    &session_id,
+                    final_status,
+                    Some(&resp.text_response),
+                    None,
+                    Some(&completed_at),
+                    duration_ms,
+                    &resp.cumulative_usage,
+                    resp.conversation_id.as_deref(),
+                );
+
+                let meta = serde_json::json!({
+                    "session_id": session_id,
+                    "status": final_status,
+                    "duration_ms": duration_ms,
+                    "tokens": resp.cumulative_usage.total_tokens,
+                    "conversation_id": resp.conversation_id,
+                });
+                let _ = crate::core::activity::ActivityManager::record_event(
+                    db.connection(),
+                    project_id,
+                    if resp.was_canceled {
+                        "BUILDER_TURN_CANCELED"
+                    } else {
+                        "BUILDER_TURN_COMPLETED"
+                    },
+                    "BUILDER",
+                    &format!(
+                        "Builder turn {} with status: {}",
+                        if resp.was_canceled {
+                            "canceled"
+                        } else {
+                            "completed"
+                        },
+                        final_status
+                    ),
+                    Some(&meta),
+                );
+
+                // Honest permission inspection:
+                let lower_stderr = resp.stderr.to_lowercase();
+                if lower_stderr.contains("permission denied")
+                    || lower_stderr.contains("tool execution denied")
+                    || lower_stderr.contains("confirmation rejected")
+                {
+                    let perm_rec = PermissionRecord {
+                        id: 0,
+                        project_id: project_id.to_string(),
+                        session_id: Some(session_id.clone()),
+                        tool_name: "UNCLASSIFIED_EXTERNAL_ACTION".to_string(),
+                        target: None,
+                        risk_level: "HIGH_RISK".to_string(),
+                        decision: "BLOCKED".to_string(),
+                        reason: Some(
+                            "Antigravity CLI reported a permission denial for an unclassified external action in headless mode. Review security requirements or authorize Icarus mode to grant autonomous tool execution.".to_string(),
+                        ),
+                        created_at: completed_at.clone(),
+                    };
+                    let _ = db.record_permission_history(&perm_rec);
+                }
+
+                Ok(resp)
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                let db = db_arc.lock().await;
+                let _ = db.update_builder_session_status(
+                    &session_id,
+                    STATUS_FAILED,
+                    None,
+                    Some(&err_str),
+                    Some(&completed_at),
+                    duration_ms,
+                    &AgyUsage::default(),
+                    None,
+                );
+
+                let meta = serde_json::json!({
+                    "session_id": session_id,
+                    "error": err_str,
+                    "duration_ms": duration_ms,
+                });
+                let _ = crate::core::activity::ActivityManager::record_event(
+                    db.connection(),
+                    project_id,
+                    "BUILDER_TURN_FAILED",
+                    "BUILDER",
+                    &format!("Builder turn failed: {}", err_str),
+                    Some(&meta),
+                );
+
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn cancel_turn(
+        registry_arc: Arc<tokio::sync::Mutex<ActiveBuilderRegistry>>,
+        db_arc: Arc<tokio::sync::Mutex<crate::db::DbManager>>,
+        project_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<String, BuilderError> {
+        let registry = registry_arc.lock().await;
+        let (_canceled_project_id, target_session_id) = if let Some(sid) = session_id {
+            let pid = registry.cancel_session(sid)?;
+            (pid, sid.to_string())
+        } else if let Some(pid) = project_id {
+            let sid = registry.cancel_project(pid)?;
+            (pid.to_string(), sid)
+        } else {
+            return Err(BuilderError::ExecutionFailed(
+                "Either project_id or session_id must be provided to cancel execution".to_string(),
+            ));
+        };
+        drop(registry);
+
+        let db = db_arc.lock().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Ok(Some(session)) = db.get_builder_session(&target_session_id) {
+            if session.status == STATUS_RUNNING {
+                let _ = db.update_builder_session_status(
+                    &session.session_id,
+                    STATUS_CANCELLED,
+                    None,
+                    None,
+                    Some(&now),
+                    session.duration_ms,
+                    &session.usage,
+                    session.conversation_id.as_deref(),
+                );
+            }
+        }
+
+        Ok(target_session_id)
     }
 }
 

@@ -1,6 +1,7 @@
 use coalition_lib::core::artifacts::CANONICAL_ARCHITECTURE_ARTIFACTS;
 use coalition_lib::core::builder::{
-    AgyUsage, AntigravityCliAdapter, BuilderSessionRecord, BuilderTurnRequest,
+    ActiveBuilderRegistry, AgyUsage, AntigravityCliAdapter, BuilderService, BuilderSessionRecord,
+    BuilderTurnRequest,
 };
 use coalition_lib::core::freeze::FreezeService;
 use coalition_lib::core::git::GitAdapter;
@@ -348,6 +349,8 @@ async fn test_stage3_builder_end_to_end_journey() {
         "OUTBOUND_PACKET",
         8000,
         2000,
+        1,
+        4.0,
     )
     .unwrap();
     db.record_chatgpt_usage(
@@ -356,6 +359,8 @@ async fn test_stage3_builder_end_to_end_journey() {
         "INBOUND_IMPORT",
         4000,
         1000,
+        1,
+        4.0,
     )
     .unwrap();
 
@@ -480,9 +485,7 @@ async fn test_stage3_active_builder_registry_concurrency() {
             false,
         )
         .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("Concurrent build forbidden"));
+    assert!(err.to_string().contains("Concurrent build forbidden"));
 
     // 3. Project cancel sets session cancel flag
     registry.cancel_project("proj-alpha").unwrap();
@@ -513,16 +516,24 @@ async fn test_stage3_chatgpt_usage_estimator_calibration_and_capacity() {
     let db = DbManager::open(&db_path).unwrap();
 
     // Record some usage: 8,000 chars -> initially estimated as 2,000 tokens (4.0 chars/token)
-    db.record_chatgpt_usage(&project_id, Some("pkt-1"), "OUTBOUND_PACKET", 8000, 2000)
-        .unwrap();
+    db.record_chatgpt_usage(
+        &project_id,
+        Some("pkt-1"),
+        "OUTBOUND_PACKET",
+        8000,
+        2000,
+        1,
+        4.0,
+    )
+    .unwrap();
 
     let initial_summary = db.get_chatgpt_usage_summary(&project_id).unwrap();
     assert_eq!(initial_summary.chars_per_token, 4.0);
     assert_eq!(initial_summary.estimator_version, 1);
     assert_eq!(initial_summary.sample_count, 0);
-    assert!(initial_summary.estimated_5h_capacity_pct.is_some());
-    // 2000 / 80000 = 2.5%
-    assert!((initial_summary.estimated_5h_capacity_pct.unwrap() - 2.5).abs() < 0.1);
+    // Grounded capacity indicators: hardcoded 80k/500k removed, capacity pct is None
+    assert!(initial_summary.estimated_5h_capacity_pct.is_none());
+    assert!(initial_summary.estimated_weekly_capacity_pct.is_none());
 
     // Calibrate with observed sample: 1,000 tokens for 3,000 chars (observed: 3.0 chars/token)
     let calibrated = db
@@ -537,4 +548,233 @@ async fn test_stage3_chatgpt_usage_estimator_calibration_and_capacity() {
     assert_eq!(updated_summary.estimator_version, 2);
     assert_eq!(updated_summary.sample_count, 1);
     assert!(updated_summary.last_calibrated_at.is_some());
+}
+
+#[tokio::test]
+async fn test_stage3_governed_builder_service_workflow() {
+    let (_repo_temp, db_temp, project_id, fake_agy) = setup_frozen_test_project();
+    let db_path = db_temp.path().join("stage3_test.db");
+    let db = Arc::new(tokio::sync::Mutex::new(DbManager::open(&db_path).unwrap()));
+    let registry = Arc::new(tokio::sync::Mutex::new(ActiveBuilderRegistry::new()));
+    let adapter = AntigravityCliAdapter::with_path(fake_agy);
+
+    // 1. Initial workflow state is FROZEN
+    {
+        let d = db.lock().await;
+        let st: String = d
+            .connection()
+            .query_row(
+                "SELECT state FROM workflow_state WHERE project_id = ?1",
+                rusqlite::params![project_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(st, "FROZEN");
+    }
+
+    // 2. Start governed turn
+    let resp = BuilderService::start_governed_turn(
+        db.clone(),
+        registry.clone(),
+        None,
+        &project_id,
+        Some("gemini-3.8-flash-high".to_string()),
+        Some("low".to_string()),
+        Some(adapter.clone()),
+    )
+    .await
+    .expect("governed turn should succeed");
+
+    assert_eq!(resp.status, "SUCCESS");
+
+    // 3. Workflow transitioned FROZEN -> BUILDING
+    {
+        let d = db.lock().await;
+        let st: String = d
+            .connection()
+            .query_row(
+                "SELECT state FROM workflow_state WHERE project_id = ?1",
+                rusqlite::params![project_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(st, "BUILDING");
+
+        // Session was persisted and status is SUCCESS
+        let session = d.get_latest_builder_session(&project_id).unwrap().unwrap();
+        assert_eq!(session.status, "SUCCESS");
+        assert_eq!(session.model, "gemini-3.8-flash-high");
+        assert!(!session.icarus_mode);
+        assert!(session.response_text.is_some());
+
+        // Event persistence drain: verify events were drained and inserted into SQLite
+        let events = d.list_builder_events(&session.session_id, None).unwrap();
+        assert!(!events.is_empty(), "Events should be persisted and drained");
+    }
+
+    // 4. Epoch conversation reuse: start a 2nd turn in the same epoch
+    let resp2 = BuilderService::start_governed_turn(
+        db.clone(),
+        registry.clone(),
+        None,
+        &project_id,
+        Some("gemini-3.8-flash-high".to_string()),
+        Some("low".to_string()),
+        Some(adapter.clone()),
+    )
+    .await
+    .expect("second governed turn should succeed");
+
+    assert_eq!(resp2.status, "SUCCESS");
+    {
+        let d = db.lock().await;
+        let sessions = d.list_builder_sessions(&project_id, 10).unwrap();
+        assert_eq!(sessions.len(), 2);
+        // Epoch IDs match
+        assert_eq!(sessions[0].epoch_id, sessions[1].epoch_id);
+    }
+}
+
+#[tokio::test]
+async fn test_stage3_governed_builder_service_drift_fail_closed() {
+    let (repo_temp, db_temp, project_id, fake_agy) = setup_frozen_test_project();
+    let db_path = db_temp.path().join("stage3_test.db");
+    let db = Arc::new(tokio::sync::Mutex::new(DbManager::open(&db_path).unwrap()));
+    let registry = Arc::new(tokio::sync::Mutex::new(ActiveBuilderRegistry::new()));
+    let adapter = AntigravityCliAdapter::with_path(fake_agy);
+
+    // Corrupt an artifact to introduce contract drift
+    let vision_path = repo_temp
+        .path()
+        .join(".coalition")
+        .join("design")
+        .join("product-vision.md");
+    fs::write(
+        &vision_path,
+        "# Corrupted Vision\nDrifted from frozen snapshot!\n",
+    )
+    .unwrap();
+
+    // Governed turn must FAIL before mutating workflow state
+    let err = BuilderService::start_governed_turn(
+        db.clone(),
+        registry.clone(),
+        None,
+        &project_id,
+        Some("gemini-3.8-flash-high".to_string()),
+        None,
+        Some(adapter),
+    )
+    .await;
+
+    assert!(err.is_err(), "Must fail on contract drift");
+    let d = db.lock().await;
+    let st: String = d
+        .connection()
+        .query_row(
+            "SELECT state FROM workflow_state WHERE project_id = ?1",
+            rusqlite::params![project_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    // Workflow MUST still be FROZEN (no mutation on preflight failure!)
+    assert_eq!(st, "FROZEN");
+}
+
+#[tokio::test]
+async fn test_stage3_governed_builder_service_single_active_run_concurrency() {
+    let (_repo_temp, db_temp, project_id, fake_agy) = setup_frozen_test_project();
+    let db_path = db_temp.path().join("stage3_test.db");
+    let db = Arc::new(tokio::sync::Mutex::new(DbManager::open(&db_path).unwrap()));
+    let registry = Arc::new(tokio::sync::Mutex::new(ActiveBuilderRegistry::new()));
+    let adapter = AntigravityCliAdapter::with_path(fake_agy);
+
+    // Manually register an active session in registry
+    {
+        let mut reg = registry.lock().await;
+        reg.register(
+            &project_id,
+            "sess-active-1",
+            "epoch-1",
+            None,
+            "gemini-3.8-flash-high",
+            None,
+            false,
+        )
+        .unwrap();
+    }
+
+    // Attempt to start a governed turn -> must reject with concurrency error
+    let err = BuilderService::start_governed_turn(
+        db.clone(),
+        registry.clone(),
+        None,
+        &project_id,
+        Some("gemini-3.8-flash-high".to_string()),
+        None,
+        Some(adapter),
+    )
+    .await;
+
+    assert!(err.is_err());
+    let err_msg = err.err().unwrap().to_string();
+    assert!(err_msg.contains("Concurrent build forbidden"));
+}
+
+#[tokio::test]
+async fn test_stage3_governed_builder_service_cancellation_isolation() {
+    let (_repo_temp1, db_temp1, project_id1, _) = setup_frozen_test_project();
+    let (_repo_temp2, _db_temp2, project_id2, _) = setup_frozen_test_project();
+    let db_path = db_temp1.path().join("stage3_test.db");
+    let db = Arc::new(tokio::sync::Mutex::new(DbManager::open(&db_path).unwrap()));
+    let registry = Arc::new(tokio::sync::Mutex::new(ActiveBuilderRegistry::new()));
+
+    // Register active sessions for both projects
+    let flag1 = {
+        let mut reg = registry.lock().await;
+        let f1 = reg
+            .register(
+                &project_id1,
+                "sess-p1",
+                "ep-1",
+                None,
+                "model-1",
+                None,
+                false,
+            )
+            .unwrap();
+        let _f2 = reg
+            .register(
+                &project_id2,
+                "sess-p2",
+                "ep-2",
+                None,
+                "model-2",
+                None,
+                false,
+            )
+            .unwrap();
+        f1
+    };
+
+    // Cancel project 1
+    let canceled_sid =
+        BuilderService::cancel_turn(registry.clone(), db.clone(), Some(&project_id1), None)
+            .await
+            .expect("cancellation should succeed");
+    assert_eq!(canceled_sid, "sess-p1");
+
+    // Project 1 flag is canceled
+    assert!(flag1.load(std::sync::atomic::Ordering::SeqCst));
+
+    // Project 2 is still active and uncanceled
+    {
+        let reg = registry.lock().await;
+        let active2 = reg.get_active_execution(&project_id2);
+        assert!(active2.is_some());
+        assert!(!active2
+            .unwrap()
+            .cancel_flag
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
 }
