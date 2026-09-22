@@ -616,4 +616,84 @@ describe('BuilderControlPlaneView', () => {
 
     expect(screen.getByText('TIMEOUT')).toBeInTheDocument();
   });
+
+  it('shows terminating state when Cancel is pressed and disables duplicate cancellation', async () => {
+    let resolveTurnPromise: (val: unknown) => void;
+    const pendingTurnPromise = new Promise((resolve) => {
+      resolveTurnPromise = resolve;
+    });
+
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'start_builder_turn') return pendingTurnPromise;
+      if (cmd === 'cancel_builder_turn') return Promise.resolve('sess-cancelling');
+      if (cmd === 'list_builder_models') return Promise.resolve(mockModels);
+      if (cmd === 'get_builder_packet') return Promise.resolve(mockBuilderPacket);
+      if (cmd === 'get_contract_drift') return Promise.resolve(mockCleanDriftReport);
+      if (cmd === 'get_icarus_state') return Promise.resolve(mockIcarusInactive);
+      if (cmd === 'get_usage_telemetry') return Promise.resolve(mockTelemetry);
+      if (cmd === 'get_permission_history') return Promise.resolve([]);
+      if (cmd === 'list_builder_sessions') return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    await act(async () => {
+      render(
+        <BuilderControlPlaneView
+          projectId="proj-stage3"
+          projectName="Stage3 Test Project"
+          workflowState="FROZEN"
+          onRefreshProject={onRefreshProject}
+        />
+      );
+    });
+
+    // Start turn
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('run-turn-btn'));
+    });
+
+    // Verify turn is running and cancel button is visible
+    const cancelBtn = screen.getByTestId('cancel-turn-btn');
+    expect(cancelBtn).toBeInTheDocument();
+    expect(cancelBtn).not.toBeDisabled();
+
+    // Click cancel
+    await act(async () => {
+      fireEvent.click(cancelBtn);
+    });
+
+    // Assert button enters terminating state and becomes disabled
+    expect(cancelBtn).toHaveTextContent('Cancellation requested / terminating…');
+    expect(cancelBtn).toBeDisabled();
+
+    // Verify cancel_builder_turn was invoked
+    expect(mockInvoke).toHaveBeenCalledWith('cancel_builder_turn', {
+      projectId: 'proj-stage3',
+      sessionId: null,
+    });
+
+    // Resolve the turn
+    await act(async () => {
+      resolveTurnPromise!({
+        session_id: 'sess-cancelling',
+        conversation_id: 'conv-1',
+        status: 'CANCELLED',
+        text_response: 'Turn was cancelled',
+        cumulative_usage: {
+          input_tokens: 100,
+          output_tokens: 10,
+          thinking_tokens: 0,
+          cache_read_tokens: 0,
+          total_tokens: 110,
+        },
+        was_canceled: true,
+        stderr: '',
+      });
+    });
+
+    // After resolution, cancel button disappears and run button is ready
+    expect(screen.queryByTestId('cancel-turn-btn')).not.toBeInTheDocument();
+    expect(screen.getByTestId('run-turn-btn')).not.toBeDisabled();
+  });
 });
+

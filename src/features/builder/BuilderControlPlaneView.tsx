@@ -49,6 +49,7 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
 
   // Execution & Live Output
   const [isRunning, setIsRunning] = useState<boolean>(false);
+  const [isCancelling, setIsCancelling] = useState<boolean>(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [activeRunIcarus, setActiveRunIcarus] = useState<boolean | null>(null);
   const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
@@ -324,27 +325,29 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
       });
     } finally {
       setIsRunning(false);
+      setIsCancelling(false);
       setActiveSessionId(null);
       setActiveRunIcarus(null);
     }
   };
 
   const handleCancelTurn = async () => {
+    if (isCancelling || !isRunning) return;
+    setIsCancelling(true);
     try {
       setTerminalLogs((prev) => {
-        const next = [...prev, `🛑 Cancellation requested by user...`];
+        const next = [...prev, `🛑 Cancellation requested / terminating…`];
         return next.length > 1000 ? next.slice(next.length - 1000) : next;
       });
       await invoke('cancel_builder_turn', {
         projectId,
         sessionId: activeSessionId,
       });
-      setIsRunning(false);
-      setActiveSessionId(null);
-      setActiveRunIcarus(null);
-      await loadSessions();
+      // Do NOT clear isRunning, activeSessionId, or activeRunIcarus here!
+      // They remain active until the running start_builder_turn invocation actually resolves in handleRunTurn.
     } catch (err: unknown) {
       console.error('Failed to cancel turn:', err);
+      setIsCancelling(false);
     }
   };
 
@@ -607,9 +610,10 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
                 <button
                   className="danger-btn cancel-turn-btn"
                   onClick={handleCancelTurn}
+                  disabled={isCancelling}
                   data-testid="cancel-turn-btn"
                 >
-                  ⏹ Cancel Turn
+                  {isCancelling ? '⏳ Cancellation requested / terminating…' : '⏹ Cancel Turn'}
                 </button>
               )}
 

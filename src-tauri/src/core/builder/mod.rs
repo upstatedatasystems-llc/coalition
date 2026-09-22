@@ -309,22 +309,265 @@ pub fn evaluate_tool_risk(tool_name: &str, content: &str) -> (&'static str, &'st
 }
 
 /// Redacts sensitive credentials, tokens, and authorization headers from strings before persistent logging.
+/// Supported patterns include:
+/// - `Authorization: Bearer <token>` and `Bearer <token>`
+/// - OpenAI-style `sk-[A-Za-z0-9_-]{15,}`
+/// - Google-style `AIza[A-Za-z0-9_-]{20,}`
+/// - JSON/quoted sensitive keys (`"api_key"`, `"token"`, `"authorization"`, etc.)
+/// - Key-value assignments (`api_key=...`, `token=...`, `password=...`, etc.)
 pub fn sanitize_text(text: &str) -> String {
+    let step1 = redact_bearer_headers(text);
+    let step2 = redact_quoted_key_values(&step1);
+    let step3 = redact_assignments(&step2);
+    redact_standalone_tokens(&step3)
+}
+
+fn redact_bearer_headers(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for word in text.split_whitespace() {
-        if word.starts_with("sk-") && word.len() > 10 {
-            out.push_str("[REDACTED_API_KEY]");
-        } else if word.starts_with("AIza") && word.len() > 20 {
-            out.push_str("[REDACTED_KEY]");
-        } else if word.to_lowercase().starts_with("bearer") && word.len() > 6 {
-            out.push_str("[REDACTED_TOKEN]");
-        } else {
-            out.push_str(word);
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+
+    while i < len {
+        if i + 7 <= len && text[i..i + 7].eq_ignore_ascii_case("bearer ") {
+            let prev_char = text[..i].chars().last();
+            let is_boundary = prev_char
+                .map(|c| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(true);
+
+            if is_boundary {
+                out.push_str(&text[i..i + 7]);
+                i += 7;
+                while i < len && bytes[i] == b' ' {
+                    out.push(' ');
+                    i += 1;
+                }
+                let token_start = i;
+                while i < len
+                    && !bytes[i].is_ascii_whitespace()
+                    && bytes[i] != b'"'
+                    && bytes[i] != b'\''
+                    && bytes[i] != b';'
+                    && bytes[i] != b','
+                    && bytes[i] != b'}'
+                    && bytes[i] != b']'
+                {
+                    i += 1;
+                }
+                if i - token_start >= 8 {
+                    out.push_str("[REDACTED]");
+                } else {
+                    out.push_str(&text[token_start..i]);
+                }
+                continue;
+            }
         }
-        out.push(' ');
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
     }
-    if !out.is_empty() {
-        out.pop();
+    out
+}
+
+const SENSITIVE_KEYS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "access_token",
+    "auth_token",
+    "authorization",
+    "secret",
+    "password",
+    "private_key",
+    "token",
+];
+
+fn redact_quoted_key_values(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let len = text.len();
+
+    while i < len {
+        let ch = text[i..].chars().next().unwrap();
+        if ch == '"' || ch == '\'' {
+            let quote = ch;
+            let key_start = i + 1;
+            if let Some(rel_quote) = text[key_start..].find(quote) {
+                let key_end = key_start + rel_quote;
+                let potential_key = &text[key_start..key_end];
+                let is_sensitive = SENSITIVE_KEYS
+                    .iter()
+                    .any(|k| potential_key.eq_ignore_ascii_case(k));
+
+                if is_sensitive {
+                    let after_key = key_end + 1;
+                    let rest = &text[after_key..];
+                    let trimmed = rest.trim_start();
+                    if let Some(stripped) = trimmed.strip_prefix(':') {
+                        let after_colon = stripped.trim_start();
+                        if let Some(val_quote) = after_colon.chars().next() {
+                            if val_quote == '"' || val_quote == '\'' {
+                                let val_quote_idx = text.len() - after_colon.len();
+                                let val_content_start = val_quote_idx + val_quote.len_utf8();
+                                if let Some(val_end_rel) = text[val_content_start..].find(val_quote)
+                                {
+                                    let val_content_end = val_content_start + val_end_rel;
+                                    let raw_val = &text[val_content_start..val_content_end];
+
+                                    out.push_str(&text[i..val_content_start]);
+                                    if raw_val.to_lowercase().starts_with("bearer ") {
+                                        out.push_str("Bearer [REDACTED]");
+                                    } else {
+                                        out.push_str("[REDACTED]");
+                                    }
+                                    out.push(val_quote);
+                                    i = val_content_end + val_quote.len_utf8();
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn redact_assignments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let len = text.len();
+
+    while i < len {
+        let prev_char = if i > 0 {
+            text[..i].chars().last()
+        } else {
+            None
+        };
+        let is_boundary = prev_char
+            .map(|c| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(true);
+
+        if is_boundary {
+            let mut matched_key_len = None;
+            for key in SENSITIVE_KEYS {
+                if i + key.len() <= len && text[i..i + key.len()].eq_ignore_ascii_case(key) {
+                    matched_key_len = Some(key.len());
+                    break;
+                }
+            }
+
+            if let Some(klen) = matched_key_len {
+                let after_key = i + klen;
+                let rest = &text[after_key..];
+                let trimmed = rest.trim_start();
+                if let Some(stripped) = trimmed.strip_prefix('=') {
+                    let after_eq = stripped.trim_start();
+                    let prefix_len = (after_key - i)
+                        + (rest.len() - trimmed.len())
+                        + 1
+                        + (stripped.len() - after_eq.len());
+                    out.push_str(&text[i..i + prefix_len]);
+                    let val_start = i + prefix_len;
+
+                    if let Some(quote) = after_eq.chars().next() {
+                        if quote == '"' || quote == '\'' {
+                            let content_start = val_start + 1;
+                            if let Some(rel_close) = text[content_start..].find(quote) {
+                                out.push(quote);
+                                out.push_str("[REDACTED]");
+                                out.push(quote);
+                                i = content_start + rel_close + 1;
+                                continue;
+                            }
+                        }
+                    }
+
+                    let mut val_end = val_start;
+                    let bytes = text.as_bytes();
+                    while val_end < len
+                        && !bytes[val_end].is_ascii_whitespace()
+                        && bytes[val_end] != b'&'
+                        && bytes[val_end] != b';'
+                        && bytes[val_end] != b','
+                        && bytes[val_end] != b'}'
+                        && bytes[val_end] != b']'
+                    {
+                        val_end += 1;
+                    }
+                    if val_end > val_start {
+                        out.push_str("[REDACTED]");
+                        i = val_end;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn redact_standalone_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let len = text.len();
+    let bytes = text.as_bytes();
+
+    while i < len {
+        let prev_char = if i > 0 {
+            text[..i].chars().last()
+        } else {
+            None
+        };
+        let is_boundary = prev_char
+            .map(|c| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(true);
+
+        if is_boundary {
+            // OpenAI sk-...
+            if i + 3 <= len && &bytes[i..i + 3] == b"sk-" {
+                let mut end = i + 3;
+                while end < len
+                    && (bytes[end].is_ascii_alphanumeric()
+                        || bytes[end] == b'_'
+                        || bytes[end] == b'-')
+                {
+                    end += 1;
+                }
+                if end - i >= 15 {
+                    out.push_str("sk-[REDACTED]");
+                    i = end;
+                    continue;
+                }
+            }
+
+            // Google AIza...
+            if i + 4 <= len && &bytes[i..i + 4] == b"AIza" {
+                let mut end = i + 4;
+                while end < len
+                    && (bytes[end].is_ascii_alphanumeric()
+                        || bytes[end] == b'_'
+                        || bytes[end] == b'-')
+                {
+                    end += 1;
+                }
+                if end - i >= 20 {
+                    out.push_str("AIza[REDACTED]");
+                    i = end;
+                    continue;
+                }
+            }
+        }
+
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -345,7 +588,7 @@ pub fn sanitize_and_bound_event_record(
             sanitized_init.cwd = None; // Strip developer machine-local path!
             let details = serde_json::to_string(&sanitized_init)
                 .ok()
-                .map(|d| truncate_utf8_safe(&d, 32 * 1024).to_string());
+                .map(|d| sanitize_text(truncate_utf8_safe(&d, 32 * 1024)));
             (
                 "INIT".to_string(),
                 None,
@@ -364,7 +607,7 @@ pub fn sanitize_and_bound_event_record(
 
             let details = serde_json::to_string(&bounded_step)
                 .ok()
-                .map(|d| truncate_utf8_safe(&d, 32 * 1024).to_string());
+                .map(|d| sanitize_text(truncate_utf8_safe(&d, 32 * 1024)));
 
             (
                 step_update
@@ -390,7 +633,7 @@ pub fn sanitize_and_bound_event_record(
 
             let details = serde_json::to_string(&bounded_result)
                 .ok()
-                .map(|d| truncate_utf8_safe(&d, 32 * 1024).to_string());
+                .map(|d| sanitize_text(truncate_utf8_safe(&d, 32 * 1024)));
 
             (
                 "RESULT".to_string(),
@@ -1115,8 +1358,10 @@ impl BuilderService {
                 let rec =
                     sanitize_and_bound_event_record(&event, &session_id_clone, &project_id_clone);
                 let db = db_clone.lock().await;
-                let _ = db.insert_builder_event(&rec);
+                db.insert_builder_event(&rec)
+                    .map_err(|e| format!("Failed to insert builder event: {}", e))?;
             }
+            Ok::<(), String>(())
         });
 
         let request = BuilderTurnRequest {
@@ -1136,7 +1381,13 @@ impl BuilderService {
         let completed_at = chrono::Utc::now().to_rfc3339();
 
         // Await persistence drain before proceeding to ensure no trailing events are lost
-        let _ = persist_handle.await;
+        let persist_res = persist_handle.await.map_err(|e| {
+            BuilderError::Database(format!(
+                "Builder event persistence task panicked or failed to join: {}",
+                e
+            ))
+        })?;
+        persist_res.map_err(BuilderError::Database)?;
 
         // 11. Unregister active execution from registry
         {
@@ -1157,7 +1408,7 @@ impl BuilderService {
                     &resp.status
                 };
 
-                let _ = db.update_builder_session_status(
+                db.update_builder_session_status(
                     &session_id,
                     final_status,
                     Some(&resp.text_response),
@@ -1166,7 +1417,13 @@ impl BuilderService {
                     duration_ms,
                     &resp.cumulative_usage,
                     resp.conversation_id.as_deref(),
-                );
+                )
+                .map_err(|e| {
+                    BuilderError::Database(format!(
+                        "Failed to update builder session status: {}",
+                        e
+                    ))
+                })?;
 
                 let meta = serde_json::json!({
                     "session_id": session_id,
@@ -1175,6 +1432,7 @@ impl BuilderService {
                     "tokens": resp.cumulative_usage.total_tokens,
                     "conversation_id": resp.conversation_id,
                 });
+                // Policy: Activity log records are best-effort informational audit records; failures do not abort the governed turn.
                 let _ = crate::core::activity::ActivityManager::record_event(
                     db.connection(),
                     project_id,
@@ -1223,7 +1481,7 @@ impl BuilderService {
             Err(e) => {
                 let err_str = e.to_string();
                 let db = db_arc.lock().await;
-                let _ = db.update_builder_session_status(
+                db.update_builder_session_status(
                     &session_id,
                     STATUS_FAILED,
                     None,
@@ -1232,13 +1490,20 @@ impl BuilderService {
                     duration_ms,
                     &AgyUsage::default(),
                     None,
-                );
+                )
+                .map_err(|e| {
+                    BuilderError::Database(format!(
+                        "Failed to update builder session status on failure: {}",
+                        e
+                    ))
+                })?;
 
                 let meta = serde_json::json!({
                     "session_id": session_id,
                     "error": err_str,
                     "duration_ms": duration_ms,
                 });
+                // Policy: Activity log records are best-effort informational audit records; failures do not abort the governed turn.
                 let _ = crate::core::activity::ActivityManager::record_event(
                     db.connection(),
                     project_id,
@@ -1255,7 +1520,6 @@ impl BuilderService {
 
     pub async fn cancel_turn(
         registry_arc: Arc<tokio::sync::Mutex<ActiveBuilderRegistry>>,
-        db_arc: Arc<tokio::sync::Mutex<crate::db::DbManager>>,
         project_id: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<String, BuilderError> {
@@ -1271,25 +1535,10 @@ impl BuilderService {
                 "Either project_id or session_id must be provided to cancel execution".to_string(),
             ));
         };
-        drop(registry);
-
-        let db = db_arc.lock().await;
-        let now = chrono::Utc::now().to_rfc3339();
-        if let Ok(Some(session)) = db.get_builder_session(&target_session_id) {
-            if session.status == STATUS_RUNNING {
-                let _ = db.update_builder_session_status(
-                    &session.session_id,
-                    STATUS_CANCELLED,
-                    None,
-                    None,
-                    Some(&now),
-                    session.duration_ms,
-                    &session.usage,
-                    session.conversation_id.as_deref(),
-                );
-            }
-        }
-
+        // Authoritative invariant: cancel_turn requests cancellation of the active execution
+        // via the registry, but does NOT independently finalize the database session.
+        // start_governed_turn remains the single authoritative owner of final session status
+        // after ProcessRunner terminates the process tree and returns.
         Ok(target_session_id)
     }
 }
@@ -1423,10 +1672,11 @@ mod tests {
             .await
             .expect("run turn on fake-agy");
 
-        assert_eq!(
-            response.conversation_id,
-            Some("fake-conv-uuid-12345".to_string())
-        );
+        assert!(response
+            .conversation_id
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("fake-conv-uuid"));
         assert_eq!(response.status, "SUCCESS");
         assert_eq!(response.cumulative_usage.total_tokens, 550);
         assert!(!response.was_canceled);
@@ -1529,5 +1779,114 @@ mod tests {
 
         assert!(res.status == STATUS_FAILED || res.status == "ERROR");
         assert!(res.stderr.contains("permission denied"));
+    }
+
+    #[test]
+    fn test_harden_secret_redaction() {
+        let sample = r#"
+Authorization: Bearer secret-token-12345
+Bearer my-special-jwt-bearer-token
+Here is an openai key: sk-abcdef1234567890abcdef and google key AIzaSyD1234567890abcdef1234567890
+In json: {"api_key": "sk-abcdef1234567890", "token": "jwt-secret", "authorization": "Bearer my-auth-token", "other": "safe"}
+CLI flag: --api_key=mysecretpass123 --token="quoted-secret" password=my-pass; next=ok
+"#;
+
+        let res = sanitize_text(sample);
+        assert!(
+            !res.contains("secret-token-12345"),
+            "Bearer token must be redacted"
+        );
+        assert!(
+            !res.contains("my-special-jwt-bearer-token"),
+            "Standalone bearer token must be redacted"
+        );
+        assert!(
+            !res.contains("sk-abcdef1234567890abcdef"),
+            "OpenAI key must be redacted"
+        );
+        assert!(
+            !res.contains("AIzaSyD1234567890abcdef1234567890"),
+            "Google key must be redacted"
+        );
+        assert!(
+            !res.contains("sk-abcdef1234567890"),
+            "JSON api_key value must be redacted"
+        );
+        assert!(
+            !res.contains("jwt-secret"),
+            "JSON token value must be redacted"
+        );
+        assert!(
+            !res.contains("my-auth-token"),
+            "JSON authorization token value must be redacted"
+        );
+        assert!(
+            !res.contains("mysecretpass123"),
+            "CLI api_key flag value must be redacted"
+        );
+        assert!(
+            !res.contains("quoted-secret"),
+            "CLI quoted token value must be redacted"
+        );
+        assert!(
+            !res.contains("my-pass"),
+            "Assignment password value must be redacted"
+        );
+        assert!(
+            res.contains(r#""other": "safe""#),
+            "Non-sensitive JSON fields must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_secret_never_survives_persisted_event() {
+        let secret_key = "sk-live12345678901234567890";
+        let secret_token = "my-bearer-secret-credential";
+        let step_event = AgyEvent::StepUpdate {
+            step_update: AgyStepUpdateData {
+                conversation_id: Some("conv-1".to_string()),
+                step_index: Some(1),
+                step_type: Some("agent_response".to_string()),
+                state: Some("DONE".to_string()),
+                text_delta: Some(format!(
+                    "Using key {} with Authorization: Bearer {}",
+                    secret_key, secret_token
+                )),
+                duration_seconds: Some(0.5),
+                usage: None,
+            },
+        };
+
+        let rec = sanitize_and_bound_event_record(&step_event, "sess-1", "proj-1");
+
+        // Verify content_str does not contain any secret
+        let content = rec.content.expect("content must be present");
+        assert!(
+            !content.contains(secret_key),
+            "Secret key must not survive in content_str"
+        );
+        assert!(
+            !content.contains(secret_token),
+            "Secret token must not survive in content_str"
+        );
+        assert!(
+            content.contains("[REDACTED]"),
+            "Content must contain redaction placeholder"
+        );
+
+        // Verify details_json does not contain any secret
+        let details = rec.details_json.expect("details must be present");
+        assert!(
+            !details.contains(secret_key),
+            "Secret key must not survive in details_json"
+        );
+        assert!(
+            !details.contains(secret_token),
+            "Secret token must not survive in details_json"
+        );
+        assert!(
+            details.contains("[REDACTED]"),
+            "Details JSON must contain redaction placeholder"
+        );
     }
 }

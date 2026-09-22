@@ -38,7 +38,7 @@ function main() {
   const conversationIndex = args.indexOf('--conversation');
   const conversationId = conversationIndex !== -1 && args[conversationIndex + 1] 
     ? args[conversationIndex + 1] 
-    : 'fake-conv-uuid-12345';
+    : 'fake-conv-uuid-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8);
 
   const modelIndex = args.indexOf('--model');
   const modelName = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'gemini-3.8-flash-high';
@@ -133,6 +133,12 @@ function main() {
       } catch (_) {}
 
       const promptContent = inputMsg.message?.content || '';
+
+      if (promptContent.includes('trigger_hang')) {
+        // Hang indefinitely to simulate a long-running turn for cancellation tests
+        setInterval(() => {}, 10000);
+        return;
+      }
 
       if (promptContent.includes('trigger_permission_denial')) {
         const errResult = {

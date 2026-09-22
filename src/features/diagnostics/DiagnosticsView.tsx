@@ -91,13 +91,6 @@ export const DiagnosticsView: React.FC = () => {
     }
   };
 
-  const handleCancelTurn = async () => {
-    try {
-      await invoke('cancel_builder_turn');
-    } catch (err: unknown) {
-      console.error('Failed to cancel turn:', err);
-    }
-  };
 
   const handleClipboardWrite = async () => {
     try {
@@ -221,13 +214,7 @@ export const DiagnosticsView: React.FC = () => {
           >
             {isExecuting ? 'Executing...' : 'Execute Turn'}
           </button>
-          <button
-            className="secondary-btn"
-            disabled={!isExecuting}
-            onClick={handleCancelTurn}
-          >
-            Cancel Active Turn
-          </button>
+
           <button
             className="secondary-btn"
             onClick={() => setEventLogs([])}

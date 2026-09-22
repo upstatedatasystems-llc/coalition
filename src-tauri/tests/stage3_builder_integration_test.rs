@@ -726,7 +726,7 @@ async fn test_stage3_governed_builder_service_cancellation_isolation() {
     let (_repo_temp1, db_temp1, project_id1, _) = setup_frozen_test_project();
     let (_repo_temp2, _db_temp2, project_id2, _) = setup_frozen_test_project();
     let db_path = db_temp1.path().join("stage3_test.db");
-    let db = Arc::new(tokio::sync::Mutex::new(DbManager::open(&db_path).unwrap()));
+    let _db = Arc::new(tokio::sync::Mutex::new(DbManager::open(&db_path).unwrap()));
     let registry = Arc::new(tokio::sync::Mutex::new(ActiveBuilderRegistry::new()));
 
     // Register active sessions for both projects
@@ -758,10 +758,9 @@ async fn test_stage3_governed_builder_service_cancellation_isolation() {
     };
 
     // Cancel project 1
-    let canceled_sid =
-        BuilderService::cancel_turn(registry.clone(), db.clone(), Some(&project_id1), None)
-            .await
-            .expect("cancellation should succeed");
+    let canceled_sid = BuilderService::cancel_turn(registry.clone(), Some(&project_id1), None)
+        .await
+        .expect("cancellation should succeed");
     assert_eq!(canceled_sid, "sess-p1");
 
     // Project 1 flag is canceled
@@ -776,5 +775,204 @@ async fn test_stage3_governed_builder_service_cancellation_isolation() {
             .unwrap()
             .cancel_flag
             .load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn test_stage3_chatgpt_usage_calibrated_provenance_persisted() {
+    let (_repo_temp, db_temp, project_id, _) = setup_frozen_test_project();
+    let db_path = db_temp.path().join("stage3_test.db");
+    let db = DbManager::open(&db_path).unwrap();
+
+    // 1. Initial state has default version 1, 4.0
+    let initial_summary = db.get_chatgpt_usage_summary(&project_id).unwrap();
+    assert_eq!(initial_summary.estimator_version, 1);
+    assert_eq!(initial_summary.chars_per_token, 4.0);
+
+    // 2. Calibrate estimator to version 2 with ratio 3.5 (1000 tokens, 3500 chars)
+    let updated_estimator = db
+        .calibrate_chatgpt_estimator(&project_id, 1000, 3500)
+        .unwrap();
+    assert_eq!(updated_estimator.version, 2);
+    assert!((updated_estimator.chars_per_token - 3.5).abs() < 1e-4);
+
+    // Also verify get_chatgpt_usage_summary reflects the new version and ratio
+    let summary_after_cal = db.get_chatgpt_usage_summary(&project_id).unwrap();
+    assert_eq!(summary_after_cal.estimator_version, 2);
+    assert!((summary_after_cal.chars_per_token - 3.5).abs() < 1e-4);
+
+    // 3. Record outbound and inbound usage simulating copy/import commands
+    let char_count_out = 7000;
+    let tokens_out = (char_count_out as f64 / updated_estimator.chars_per_token).round() as usize;
+    db.record_chatgpt_usage(
+        &project_id,
+        Some("pkt-cal-1"),
+        "OUTBOUND_PACKET",
+        char_count_out,
+        tokens_out,
+        updated_estimator.version,
+        updated_estimator.chars_per_token,
+    )
+    .unwrap();
+
+    let char_count_in = 3500;
+    let tokens_in = (char_count_in as f64 / updated_estimator.chars_per_token).round() as usize;
+    db.record_chatgpt_usage(
+        &project_id,
+        Some("pkt-cal-1"),
+        "INBOUND_IMPORT",
+        char_count_in,
+        tokens_in,
+        updated_estimator.version,
+        updated_estimator.chars_per_token,
+    )
+    .unwrap();
+
+    // 4. Assert records in chatgpt_usage_records have exact calibrated version and ratio
+    let mut stmt = db
+        .connection()
+        .prepare("SELECT direction, estimator_version, chars_per_token, estimated_tokens FROM chatgpt_usage_records WHERE project_id = ?1 ORDER BY id ASC")
+        .unwrap();
+    let rows = stmt
+        .query_map(rusqlite::params![project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "OUTBOUND_PACKET");
+    assert_eq!(
+        rows[0].1, 2,
+        "Outbound record must persist estimator version 2"
+    );
+    assert!(
+        (rows[0].2 - 3.5).abs() < 1e-4,
+        "Outbound record must persist ratio 3.5"
+    );
+    assert_eq!(rows[0].3, 2000);
+
+    assert_eq!(rows[1].0, "INBOUND_IMPORT");
+    assert_eq!(
+        rows[1].1, 2,
+        "Inbound record must persist estimator version 2"
+    );
+    assert!(
+        (rows[1].2 - 3.5).abs() < 1e-4,
+        "Inbound record must persist ratio 3.5"
+    );
+    assert_eq!(rows[1].3, 1000);
+}
+
+#[tokio::test]
+async fn test_stage3_service_cancellation_with_hanging_fake_agy() {
+    let (repo_temp, db_temp, project_id, fake_agy) = setup_frozen_test_project();
+    let repo_path = repo_temp.path();
+    let db_path = db_temp.path().join("stage3_test.db");
+    let db = Arc::new(tokio::sync::Mutex::new(DbManager::open(&db_path).unwrap()));
+    let registry = Arc::new(tokio::sync::Mutex::new(ActiveBuilderRegistry::new()));
+    let adapter = AntigravityCliAdapter::with_path(fake_agy);
+
+    // Inject trigger_hang into the frozen builder-packet.json so fake-agy hangs on execution
+    let packet_path = repo_path
+        .join(".coalition")
+        .join("contract")
+        .join("builder-packet.json");
+    if packet_path.exists() {
+        let packet_content = fs::read_to_string(&packet_path).unwrap();
+        let modified = packet_content.replace("\"goals\": [", "\"goals\": [\"trigger_hang\", ");
+        fs::write(&packet_path, modified).unwrap();
+    }
+
+    // Spawn the governed turn in a background task
+    let db_for_turn = db.clone();
+    let registry_for_turn = registry.clone();
+    let proj_for_turn = project_id.clone();
+    let adapter_for_turn = adapter.clone();
+
+    let turn_handle = tokio::spawn(async move {
+        BuilderService::start_governed_turn(
+            db_for_turn,
+            registry_for_turn,
+            None,
+            &proj_for_turn,
+            Some("gemini-3.8-flash-high".to_string()),
+            None,
+            Some(adapter_for_turn),
+        )
+        .await
+    });
+
+    // Wait until the turn is registered as running in the registry
+    let mut session_id = None;
+    for _ in 0..50 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let reg = registry.lock().await;
+        if let Some(active) = reg.get_active_execution(&project_id) {
+            session_id = Some(active.session_id.clone());
+            break;
+        }
+    }
+    let sid = session_id.expect("Turn must register in ActiveBuilderRegistry");
+
+    // Request cancellation authoritative via BuilderService::cancel_turn
+    let canceled_sid = BuilderService::cancel_turn(registry.clone(), Some(&project_id), None)
+        .await
+        .expect("Cancellation request must succeed");
+    assert_eq!(canceled_sid, sid);
+
+    // Await the turn handle
+    let turn_result = turn_handle.await.expect("Turn task must join cleanly");
+    let resp = turn_result.expect("Turn response must return Ok with canceled status");
+
+    // Assert cancellation invariants
+    assert!(resp.was_canceled, "Response was_canceled must be true");
+    assert_eq!(resp.status, "CANCELLED");
+
+    // Assert database session is updated to CANCELLED
+    {
+        let db_lock = db.lock().await;
+        let session = db_lock
+            .get_builder_session(&sid)
+            .unwrap()
+            .expect("Session must exist");
+        assert_eq!(
+            session.status, "CANCELLED",
+            "Authoritative DB session must be CANCELLED"
+        );
+    }
+
+    // Assert registry is cleaned up
+    {
+        let reg = registry.lock().await;
+        assert!(
+            reg.get_active_execution(&project_id).is_none(),
+            "Registry must be cleared after turn finishes"
+        );
+    }
+
+    // Assert another project can register without interference
+    let (_repo_temp2, _db_temp2, project_id2, _) = setup_frozen_test_project();
+    {
+        let mut reg = registry.lock().await;
+        let f2 = reg.register(
+            &project_id2,
+            "sess-p2",
+            "ep-2",
+            None,
+            "model-2",
+            None,
+            false,
+        );
+        assert!(
+            f2.is_ok(),
+            "Second project registration must succeed without interference"
+        );
     }
 }

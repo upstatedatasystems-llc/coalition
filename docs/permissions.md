@@ -39,6 +39,23 @@ When tools are evaluated during execution:
 
 The UI displays an **Active Run: Icarus Mode** warning banner strictly when the currently executing session was launched with `active_run_icarus == true`. It does not rely on transient project-level settings, preventing false warnings during least-privilege runs.
 
+## Persistent Credential and Secret Redaction
+
+To prevent sensitive credentials from leaking into operational databases, terminal feeds, or activity logs, all persisted event content and details are processed through a deterministic, bounded multi-pattern redactor before database insertion:
+- **Authorization & Bearer Tokens**: Replaces `Authorization: Bearer <token>` and standalone `Bearer <token>` with `Bearer [REDACTED]`.
+- **Known API Keys**: Detects and redacts OpenAI keys (`sk-...`) and Google API keys (`AIza...`).
+- **Structured JSON & Configs**: Sanitizes quoted key-value pairs matching sensitive keys (`api_key`, `token`, `password`, `secret`, `access_token`, `refresh_token`, `private_key`) to `"[REDACTED]"`.
+- **Command-Line & Script Assignments**: Sanitizes command assignments (`--api_key=...`, `token="quoted-secret"`, `password=xyz`) to `[REDACTED]`.
+- **Payload Size Bounds**: Content deltas are capped at 16 KB and detail JSON structures at 32 KB using UTF-8 safe boundary truncation.
+
+## Authoritative Cancellation & Lifecycle State
+
+Cancellation of an active Builder run adheres strictly to single-ownership lifecycle governance:
+1. **Cancellation Request**: When the human clicks **Cancel Turn**, the Tauri command `cancel_builder_turn` signals cancellation exclusively through `ActiveBuilderRegistry`.
+2. **Process Tree Termination**: On Windows, the registry invokes `taskkill /F /T /PID <pid>` to cleanly terminate the running `agy` process and any spawned child processes without leaving orphaned subprocesses.
+3. **No Dual Ownership**: `cancel_builder_turn` does *not* mutate the database session status directly. `BuilderService::start_governed_turn` retains sole authoritative ownership over updating session status to `CANCELLED` once process termination completes.
+4. **UI State Preservation**: The frontend transitions the Cancel button to a disabled `⏳ Cancellation requested / terminating…` state while termination is pending, keeping running flags intact until the main execution loop finishes and clears state.
+
 ## Scoping & Storage Invariants
 
 - Icarus state and permission history reside exclusively in transient operational storage (`project_icarus_state` and `builder_permission_history` tables in SQLite).

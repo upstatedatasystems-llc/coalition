@@ -763,12 +763,8 @@ pub struct StartBuilderTurnPayload {
 #[tauri::command]
 pub async fn list_builder_models(
     state: State<'_, AppState>,
-    use_fake_agy: Option<bool>,
 ) -> Result<Vec<ModelInfo>, CommandError> {
-    let adapter = if use_fake_agy.unwrap_or(false) {
-        let fake_path = get_fake_agy_path()?;
-        AntigravityCliAdapter::with_path(fake_path)
-    } else {
+    let adapter = {
         let lock = state.agy.lock().await;
         if let Some(ref a) = *lock {
             AntigravityCliAdapter::with_path(a.binary_path())
@@ -857,7 +853,6 @@ pub async fn cancel_builder_turn(
 ) -> Result<String, CommandError> {
     crate::core::builder::BuilderService::cancel_turn(
         state.active_builder_registry.clone(),
-        state.db.clone(),
         project_id.as_deref(),
         session_id.as_deref(),
     )
@@ -1132,7 +1127,9 @@ pub async fn copy_relay_packet_to_clipboard(
     let char_count = prompt.len();
     let db = state.db.lock().await;
     let summary = db.get_chatgpt_usage_summary(&project_id).ok();
-    let chars_per_token = summary.map(|s| s.chars_per_token).unwrap_or(4.0);
+    let (estimator_version, chars_per_token) = summary
+        .map(|s| (s.estimator_version, s.chars_per_token))
+        .unwrap_or((1, 4.0));
     let estimated_tokens = if chars_per_token > 0.0 {
         (char_count as f64 / chars_per_token).round() as usize
     } else {
@@ -1145,7 +1142,7 @@ pub async fn copy_relay_packet_to_clipboard(
         "OUTBOUND_PACKET",
         char_count,
         estimated_tokens,
-        1,
+        estimator_version,
         chars_per_token,
     );
 
@@ -1166,7 +1163,9 @@ pub async fn import_from_clipboard(
 
     let char_count = clipboard_text.len();
     let summary = db.get_chatgpt_usage_summary(&project_id).ok();
-    let chars_per_token = summary.map(|s| s.chars_per_token).unwrap_or(4.0);
+    let (estimator_version, chars_per_token) = summary
+        .map(|s| (s.estimator_version, s.chars_per_token))
+        .unwrap_or((1, 4.0));
     let estimated_tokens = if chars_per_token > 0.0 {
         (char_count as f64 / chars_per_token).round() as usize
     } else {
@@ -1179,7 +1178,7 @@ pub async fn import_from_clipboard(
         "INBOUND_IMPORT",
         char_count,
         estimated_tokens,
-        1,
+        estimator_version,
         chars_per_token,
     );
 

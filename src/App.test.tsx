@@ -70,7 +70,7 @@ describe('Coalition Phase 0 Diagnostics App', () => {
     // Verify diagnostic buttons exist
     expect(screen.getByRole('button', { name: 'Run SQLite Migration Proof' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Execute Turn' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Cancel Active Turn' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Clear Stream Logs' })).toBeInTheDocument();
   });
 
   it('maintains exactly one stream event listener under React StrictMode and logs events without duplication', async () => {
