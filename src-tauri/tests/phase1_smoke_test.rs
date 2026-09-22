@@ -334,13 +334,14 @@ fn test_phase1_complete_desktop_lifecycle_smoke() {
             repo_path,
             &durable_project_id,
             &git,
+            db.connection(),
         )
         .unwrap();
 
         let freeze_res = coalition_lib::core::freeze::FreezeService::confirm_freeze(
             repo_path,
             &durable_project_id,
-            &preview,
+            &preview.preview_id,
             &git,
             db.connection_mut(),
         )

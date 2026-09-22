@@ -196,6 +196,30 @@ impl DbManager {
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_frozen_boundaries_proj_ver ON frozen_boundaries(project_id, architecture_version);",
             ),
+            (
+                6,
+                "006_stage2_freeze_previews_and_drift_journals",
+                "CREATE TABLE IF NOT EXISTS freeze_previews (
+                    preview_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    target_version TEXT NOT NULL,
+                    readiness_policy_version INTEGER NOT NULL,
+                    preview_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_freeze_previews_proj_status ON freeze_previews(project_id, status);
+                CREATE TABLE IF NOT EXISTS drift_restoration_journals (
+                    journal_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    architecture_version TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    operations_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_drift_journal_project ON drift_restoration_journals(project_id);",
+            ),
         ];
 
         let mut applied = Vec::new();
@@ -262,12 +286,13 @@ mod tests {
     fn test_sqlite_in_memory_migrations_and_proof() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let result = db.run_proof().expect("run proof");
-        assert_eq!(result.applied_migrations.len(), 5);
+        assert_eq!(result.applied_migrations.len(), 6);
         assert_eq!(result.applied_migrations[0].version, 1);
         assert_eq!(result.applied_migrations[1].version, 2);
         assert_eq!(result.applied_migrations[2].version, 3);
         assert_eq!(result.applied_migrations[3].version, 4);
         assert_eq!(result.applied_migrations[4].version, 5);
+        assert_eq!(result.applied_migrations[5].version, 6);
         assert_eq!(result.test_record_id, 1);
         assert_eq!(result.total_records, 1);
 
@@ -325,10 +350,12 @@ mod tests {
 
         let mut db = DbManager { conn };
         let applied = db.run_migrations().expect("run forward migrations");
-        assert_eq!(applied.len(), 4);
+        assert_eq!(applied.len(), 5);
         assert_eq!(applied[0].version, 2);
         assert_eq!(applied[1].version, 3);
         assert_eq!(applied[2].version, 4);
+        assert_eq!(applied[3].version, 5);
+        assert_eq!(applied[4].version, 6);
         assert_eq!(applied[3].version, 5);
 
         // Verify Phase 0 data preserved
@@ -365,7 +392,7 @@ mod tests {
     fn test_migrations_already_migrated_is_idempotent() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let applied1 = db.run_migrations().expect("first migration run");
-        assert_eq!(applied1.len(), 5);
+        assert_eq!(applied1.len(), 6);
 
         let applied2 = db.run_migrations().expect("second migration run");
         assert_eq!(applied2.len(), 0);

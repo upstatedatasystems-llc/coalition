@@ -733,6 +733,10 @@ describe('ArchitectureWorkspaceView', () => {
       fireEvent.click(authorizeBtn);
     });
 
+    expect(mockInvoke).toHaveBeenCalledWith('confirm_architecture_freeze', {
+      projectId: 'test-proj-1',
+      previewId: 'prev-123',
+    });
     expect(screen.getByText('✓ Architecture Frozen Successfully')).toBeInTheDocument();
     expect(screen.getAllByText(/v1\.0/).length).toBeGreaterThan(0);
   });

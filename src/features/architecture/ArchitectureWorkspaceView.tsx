@@ -331,7 +331,7 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
     try {
       const result = await invoke<FreezeResult>('confirm_architecture_freeze', {
         projectId,
-        preview: freezePreview,
+        previewId: freezePreview.preview_id,
       });
       setIsFreezeSuccess(result);
       setIsFreezeModalOpen(false);

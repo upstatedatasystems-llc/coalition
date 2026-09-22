@@ -353,29 +353,77 @@ impl ArtifactManager {
     }
 
     /// Cleans up any stale .staging-v* directories in .coalition/architecture-versions/ from crashed freeze transactions.
-    pub fn clean_stale_freeze_staging(coalition_dir: &Path) {
+    /// Fails closed if cleanup cannot establish a known-safe state.
+    pub fn clean_stale_freeze_staging(coalition_dir: &Path) -> Result<(), ArtifactError> {
         let arch_versions = coalition_dir.join("architecture-versions");
-        if let Ok(entries) = fs::read_dir(&arch_versions) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(".staging-v") {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let _ = fs::remove_dir_all(&path);
-                    }
+        if !arch_versions.exists() {
+            return Ok(());
+        }
+        let entries = match fs::read_dir(&arch_versions) {
+            Ok(e) => e,
+            Err(e) => {
+                return Err(ArtifactError::RecoveryRequired(format!(
+                    "Failed to read architecture-versions directory {:?}: {}",
+                    arch_versions, e
+                )));
+            }
+        };
+
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                ArtifactError::RecoveryRequired(format!(
+                    "Failed to read entry in architecture-versions: {}",
+                    e
+                ))
+            })?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".staging-v") {
+                let path = entry.path();
+                if path.is_dir() {
+                    fs::remove_dir_all(&path).map_err(|e| {
+                        ArtifactError::RecoveryRequired(format!(
+                            "Failed to clean stale freeze staging directory {:?}: {}",
+                            path, e
+                        ))
+                    })?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Quarantines an unexpected added file into .coalition/recovery/quarantine-<timestamp>-<uuid>/
     /// ensuring user data is never destroyed during drift restoration.
+    /// Strictly validates that the path is an allowed architecture contract artifact,
+    /// contains no path traversal (..), is not absolute, and cannot escape .coalition/.
     pub fn quarantine_added_artifact<P: AsRef<Path>>(
         repo_root: P,
         relative_path: &str,
     ) -> Result<PathBuf, ArtifactError> {
+        let root = repo_root.as_ref();
         let normalized = relative_path.replace('\\', "/");
-        let coalition_dir = Self::resolve_coalition_dir(repo_root.as_ref())?;
+
+        // 1. Reject path traversal, absolute paths, and drive letters
+        if normalized.starts_with('/')
+            || normalized.contains("..")
+            || Path::new(&normalized).is_absolute()
+            || (normalized.len() >= 2 && normalized.as_bytes()[1] == b':')
+        {
+            return Err(ArtifactError::PathTraversal {
+                path: relative_path.to_string(),
+                root: root.to_string_lossy().to_string(),
+            });
+        }
+
+        // 2. Reject anything outside the managed architecture artifact package (e.g. project.yaml, .git/config, unmanaged files)
+        if !Self::is_valid_architecture_artifact_path(&normalized) {
+            return Err(ArtifactError::PathTraversal {
+                path: relative_path.to_string(),
+                root: root.to_string_lossy().to_string(),
+            });
+        }
+
+        let coalition_dir = Self::resolve_coalition_dir(root)?;
         let target_path = coalition_dir.join(&normalized);
 
         if !target_path.exists() {
@@ -385,7 +433,7 @@ impl ArtifactManager {
             )));
         }
 
-        Self::validate_safe_path(repo_root.as_ref(), &target_path)?;
+        Self::validate_safe_path(root, &target_path)?;
 
         let recovery_dir = coalition_dir.join("recovery");
         let quarantine_id = format!(
@@ -400,6 +448,7 @@ impl ArtifactManager {
             fs::create_dir_all(parent).map_err(|e| {
                 ArtifactError::Io(format!("Failed to create quarantine parent dir: {}", e))
             })?;
+            Self::validate_safe_path(root, parent)?;
         }
 
         if let Err(e) = fs::rename(&target_path, &dest_file_path) {
@@ -409,8 +458,15 @@ impl ArtifactManager {
                     target_path, dest_file_path, e, ce
                 ))
             })?;
-            let _ = fs::remove_file(&target_path);
+            fs::remove_file(&target_path).map_err(|re| {
+                ArtifactError::Io(format!(
+                    "Failed to remove source artifact after copy quarantine: {}",
+                    re
+                ))
+            })?;
         }
+
+        Self::validate_safe_path(root, &dest_file_path)?;
 
         Ok(dest_file_path)
     }
@@ -2006,5 +2062,72 @@ mod tests {
             let read_res = ArtifactManager::read_artifact(dir.path(), bad);
             assert!(read_res.is_err(), "read_artifact must reject: {}", bad);
         }
+    }
+
+    #[test]
+    fn test_quarantine_added_artifact_rejections() {
+        let dir = tempfile::tempdir().unwrap();
+        ArtifactManager::initialize_new_project(dir.path(), "test-quarantine").unwrap();
+
+        // Create some unmanaged or target files
+        fs::write(dir.path().join("README.md"), "root readme").unwrap();
+        fs::create_dir_all(dir.path().join(".coalition").join("design")).unwrap();
+        fs::write(
+            dir.path()
+                .join(".coalition")
+                .join("design")
+                .join("unmanaged.txt"),
+            "unmanaged file",
+        )
+        .unwrap();
+
+        let malicious_paths = &[
+            "../README.md",
+            "../../outside",
+            "project.yaml",
+            ".git/config",
+            "/etc/passwd",
+            "C:\\windows\\system32\\cmd.exe",
+            "design/unmanaged.txt",
+            "design/notes.md",
+        ];
+
+        for &bad in malicious_paths {
+            let res = ArtifactManager::quarantine_added_artifact(dir.path(), bad);
+            assert!(
+                res.is_err(),
+                "quarantine_added_artifact must reject malicious/unmanaged path '{}'",
+                bad
+            );
+        }
+
+        // Verify valid managed architecture artifact CAN be quarantined
+        let valid_added = "design/open-questions.md";
+        fs::write(
+            dir.path()
+                .join(".coalition")
+                .join("design")
+                .join("open-questions.md"),
+            "# Open Questions\nSome content",
+        )
+        .unwrap();
+        let quarantined = ArtifactManager::quarantine_added_artifact(dir.path(), valid_added);
+        assert!(
+            quarantined.is_ok(),
+            "Valid managed architecture file must be quarantinable"
+        );
+        assert!(
+            !dir.path()
+                .join(".coalition")
+                .join("design")
+                .join("open-questions.md")
+                .exists(),
+            "Source file must be moved out of active directory"
+        );
+        let dest = quarantined.unwrap();
+        assert!(
+            dest.exists(),
+            "Quarantined destination file must exist in recovery"
+        );
     }
 }

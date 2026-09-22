@@ -473,6 +473,10 @@ impl ProjectService {
             conn,
         )?;
 
+        // Re-query authoritative workflow state and durable project descriptor post-reconciliation
+        let workflow_record = workflow::get_workflow_state(conn, &project_record.project_id)?;
+        let project_yaml = ArtifactManager::read_project_yaml(&canonical_yaml_path)?;
+
         // 9. Query live Git state
         let git_info = git.inspect_repo(&repo_root).ok();
 
@@ -832,13 +836,17 @@ mod tests {
         )
         .unwrap();
 
-        let preview =
-            crate::core::freeze::FreezeService::prepare_freeze_preview(repo_dir.path(), &pid, &git)
-                .unwrap();
+        let preview = crate::core::freeze::FreezeService::prepare_freeze_preview(
+            repo_dir.path(),
+            &pid,
+            &git,
+            db1.connection(),
+        )
+        .unwrap();
         crate::core::freeze::FreezeService::confirm_freeze(
             repo_dir.path(),
             &pid,
-            &preview,
+            &preview.preview_id,
             &git,
             db1.connection_mut(),
         )
@@ -855,6 +863,125 @@ mod tests {
             rehydrated.workflow_state.state,
             WorkflowState::Frozen,
             "Rehydration must respect durable frozen state"
+        );
+    }
+
+    #[test]
+    fn test_post_reconciliation_project_state_immediately_returns_frozen() {
+        let git = GitAdapter::new().unwrap();
+        let repo_dir = tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        let project =
+            ArtifactManager::initialize_new_project(repo_dir.path(), "post-reconcile-test")
+                .unwrap();
+        let pid = project.project_id;
+
+        // Populate ready artifacts
+        let files = [
+            (
+                "design/product-vision.md",
+                "# Product Vision\n\nSubstantive product vision content for test project.",
+            ),
+            (
+                "design/requirements.md",
+                "# Requirements\n\nSubstantive requirements content for test project.",
+            ),
+            (
+                "design/architecture.md",
+                "# Architecture\n\nSubstantive architecture content for test project.",
+            ),
+            (
+                "design/constraints.md",
+                "# Constraints\n\nSubstantive constraints content for test project.",
+            ),
+            (
+                "design/interfaces.md",
+                "# Interfaces\n\nSubstantive interfaces content for test project.",
+            ),
+            (
+                "design/security.md",
+                "# Security\n\nSubstantive security content for test project.",
+            ),
+            (
+                "implementation/implementation-plan.md",
+                "# Implementation Plan\n\nSubstantive implementation plan content.",
+            ),
+            (
+                "implementation/acceptance-criteria.yaml",
+                "schema_version: 1\ncriteria:\n  - id: AC-1\n    description: Must pass tests\n",
+            ),
+            (
+                "implementation/test-plan.md",
+                "# Test Plan\n\nSubstantive test plan content.",
+            ),
+            (
+                "design/open-questions.md",
+                "# Open Questions\n\nAll questions addressed.",
+            ),
+        ];
+        for (rel, content) in files {
+            ArtifactManager::write_artifact_atomic(repo_dir.path(), rel, content).unwrap();
+        }
+
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+        ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+            .unwrap();
+
+        workflow::apply_workflow_action(
+            db.connection_mut(),
+            &pid,
+            workflow::WorkflowAction::StartArchitecting,
+            "HUMAN",
+        )
+        .unwrap();
+        workflow::apply_workflow_action(
+            db.connection_mut(),
+            &pid,
+            workflow::WorkflowAction::MarkReadyToFreeze,
+            "HUMAN",
+        )
+        .unwrap();
+
+        let preview = crate::core::freeze::FreezeService::prepare_freeze_preview(
+            repo_dir.path(),
+            &pid,
+            &git,
+            db.connection(),
+        )
+        .unwrap();
+
+        // Simulate crash right after project.yaml is committed as FROZEN, before SQLite is updated
+        crate::core::freeze::INJECTED_FREEZE_SEAM
+            .with(|c| c.set(crate::core::freeze::InjectedFreezeSeam::PostCommitPreDb));
+        let freeze_res = crate::core::freeze::FreezeService::confirm_freeze(
+            repo_dir.path(),
+            &pid,
+            &preview.preview_id,
+            &git,
+            db.connection_mut(),
+        );
+        crate::core::freeze::INJECTED_FREEZE_SEAM
+            .with(|c| c.set(crate::core::freeze::InjectedFreezeSeam::None));
+        assert!(freeze_res.is_err(), "Injected seam must fail freeze");
+
+        // Verify SQLite workflow_state is currently still lagging as READY_TO_FREEZE
+        let current_wf = workflow::get_workflow_state(db.connection(), &pid).unwrap();
+        assert_eq!(current_wf.state, WorkflowState::ReadyToFreeze);
+
+        // Reopen project: must reconcile AND return post-reconciliation state FROZEN immediately!
+        let reopened =
+            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+                .unwrap();
+        assert_eq!(
+            reopened.workflow_state.state,
+            WorkflowState::Frozen,
+            "register_or_open_project must return post-reconciliation FROZEN state immediately, not stale READY_TO_FREEZE"
+        );
+        assert_eq!(
+            reopened.artifact.unwrap().architecture_state,
+            ArchitectureState::Frozen
         );
     }
 

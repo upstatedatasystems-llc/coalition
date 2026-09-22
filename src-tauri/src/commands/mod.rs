@@ -1029,15 +1029,20 @@ pub async fn prepare_architecture_freeze(
     }
     let git = git_lock.as_ref().unwrap();
 
-    crate::core::freeze::FreezeService::prepare_freeze_preview(&repo_path, &project_id, git)
-        .map_err(CommandError::from)
+    crate::core::freeze::FreezeService::prepare_freeze_preview(
+        &repo_path,
+        &project_id,
+        git,
+        db.connection(),
+    )
+    .map_err(CommandError::from)
 }
 
 #[tauri::command]
 pub async fn confirm_architecture_freeze(
     state: State<'_, AppState>,
     project_id: String,
-    preview: crate::core::freeze::FreezePreview,
+    preview_id: String,
 ) -> Result<crate::core::freeze::FreezeResult, CommandError> {
     let mut db = state.db.lock().await;
     let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
@@ -1051,7 +1056,7 @@ pub async fn confirm_architecture_freeze(
     crate::core::freeze::FreezeService::confirm_freeze(
         &repo_path,
         &project_id,
-        &preview,
+        &preview_id,
         git,
         db.connection_mut(),
     )
@@ -1077,7 +1082,7 @@ pub async fn get_drift_diff(
 ) -> Result<crate::core::freeze::DriftDiff, CommandError> {
     let db = state.db.lock().await;
     let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
-    crate::core::freeze::FreezeService::get_drift_diff(&repo_path, &artifact_path)
+    crate::core::freeze::FreezeService::get_drift_diff(&repo_path, &project_id, &artifact_path)
         .map_err(CommandError::from)
 }
 
@@ -1087,12 +1092,13 @@ pub async fn restore_drifted_artifact(
     project_id: String,
     artifact_path: String,
 ) -> Result<crate::core::freeze::DriftReport, CommandError> {
-    let db = state.db.lock().await;
+    let mut db = state.db.lock().await;
     let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
     crate::core::freeze::FreezeService::restore_drifted_artifact(
         &repo_path,
         &project_id,
         &artifact_path,
+        db.connection_mut(),
     )
     .map_err(CommandError::from)
 }
@@ -1102,10 +1108,14 @@ pub async fn restore_all_drifted_artifacts(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<crate::core::freeze::DriftReport, CommandError> {
-    let db = state.db.lock().await;
+    let mut db = state.db.lock().await;
     let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
-    crate::core::freeze::FreezeService::restore_all_drifted_artifacts(&repo_path, &project_id)
-        .map_err(CommandError::from)
+    crate::core::freeze::FreezeService::restore_all_drifted_artifacts(
+        &repo_path,
+        &project_id,
+        db.connection_mut(),
+    )
+    .map_err(CommandError::from)
 }
 
 #[tauri::command]

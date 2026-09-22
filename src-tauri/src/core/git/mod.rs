@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
@@ -21,6 +22,19 @@ pub struct GitStatusCounts {
     pub unstaged: usize,
     pub untracked: usize,
     pub is_clean: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitDetailedDirtyState {
+    pub is_clean: bool,
+    pub staged_count: usize,
+    pub unstaged_count: usize,
+    pub untracked_count: usize,
+    pub raw_porcelain: String,
+    pub unstaged_diff_hash: String,
+    pub staged_diff_hash: String,
+    pub untracked_fingerprint: String,
+    pub composite_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +260,97 @@ impl GitAdapter {
             is_clean,
         }
     }
+
+    /// Captures an authoritative, multi-factor, deterministic working-tree fingerprint.
+    /// Incorporates:
+    /// - Full raw porcelain status with path details (-uall).
+    /// - Unstaged diff content identity (SHA-256).
+    /// - Staged / cached diff content identity (SHA-256).
+    /// - Untracked file path + content identities (SHA-256).
+    pub fn compute_detailed_dirty_state<P: AsRef<Path>>(
+        &self,
+        working_dir: P,
+    ) -> Result<GitDetailedDirtyState, GitError> {
+        let dir = working_dir.as_ref();
+
+        // 1. Porcelain status with all untracked individual files listed (-uall)
+        let status_output = Command::new(&self.git_bin)
+            .args(["status", "--porcelain=v1", "-uall"])
+            .current_dir(dir)
+            .output()?;
+
+        let raw_porcelain = String::from_utf8_lossy(&status_output.stdout).to_string();
+        let counts = Self::parse_porcelain_status(&raw_porcelain);
+
+        // 2. Unstaged diff hash
+        let unstaged_diff = Command::new(&self.git_bin)
+            .args(["diff"])
+            .current_dir(dir)
+            .output()?;
+        let mut hasher = Sha256::new();
+        hasher.update(&unstaged_diff.stdout);
+        let unstaged_diff_hash = format!("{:x}", hasher.finalize());
+
+        // 3. Staged / cached diff hash
+        let staged_diff = Command::new(&self.git_bin)
+            .args(["diff", "--cached"])
+            .current_dir(dir)
+            .output()?;
+        let mut hasher = Sha256::new();
+        hasher.update(&staged_diff.stdout);
+        let staged_diff_hash = format!("{:x}", hasher.finalize());
+
+        // 4. Untracked files path + content fingerprints
+        let mut untracked_entries = Vec::new();
+        for line in raw_porcelain.lines() {
+            if let Some(rel_path_raw) = line.strip_prefix("?? ") {
+                let rel_path = rel_path_raw.trim().trim_matches('"');
+                let full_path = dir.join(rel_path);
+                if full_path.is_file() {
+                    let content_bytes = std::fs::read(&full_path).unwrap_or_default();
+                    let mut file_hasher = Sha256::new();
+                    file_hasher.update(&content_bytes);
+                    let file_hash = format!("{:x}", file_hasher.finalize());
+                    untracked_entries.push(format!("{}:{}", rel_path, file_hash));
+                } else {
+                    untracked_entries.push(format!("{}:exists", rel_path));
+                }
+            }
+        }
+        untracked_entries.sort();
+        let untracked_joined = untracked_entries.join("\n");
+        let mut hasher = Sha256::new();
+        hasher.update(untracked_joined.as_bytes());
+        let untracked_fingerprint = format!("{:x}", hasher.finalize());
+
+        // 5. Composite dirty fingerprint
+        let composite_fingerprint = if counts.is_clean {
+            "CLEAN".to_string()
+        } else {
+            let composite_input = format!(
+                "porcelain:\n{}\nunstaged:{}\nstaged:{}\nuntracked:{}",
+                raw_porcelain.trim(),
+                unstaged_diff_hash,
+                staged_diff_hash,
+                untracked_fingerprint
+            );
+            let mut hasher = Sha256::new();
+            hasher.update(composite_input.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+
+        Ok(GitDetailedDirtyState {
+            is_clean: counts.is_clean,
+            staged_count: counts.staged,
+            unstaged_count: counts.unstaged,
+            untracked_count: counts.untracked,
+            raw_porcelain,
+            unstaged_diff_hash,
+            staged_diff_hash,
+            untracked_fingerprint,
+            composite_fingerprint,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -362,5 +467,84 @@ mod tests {
             .unwrap();
         let space_resolved = adapter.resolve_repo_root(&space_repo).unwrap();
         assert_eq!(space_resolved, space_repo.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_compute_detailed_dirty_state_untracked_and_diff_changes() {
+        let adapter = GitAdapter::new().unwrap();
+        let dir = tempdir().unwrap();
+        let repo_path = dir.path();
+
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        // 1. Initial commit
+        fs::write(repo_path.join("committed.txt"), "v1").unwrap();
+        Command::new("git")
+            .args(["add", "committed.txt"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        let clean_state = adapter.compute_detailed_dirty_state(repo_path).unwrap();
+        assert!(clean_state.is_clean);
+        assert_eq!(clean_state.composite_fingerprint, "CLEAN");
+
+        // 2. Untracked file added
+        let untracked_path = repo_path.join("untracked.txt");
+        fs::write(&untracked_path, "initial untracked content").unwrap();
+
+        let state_untracked1 = adapter.compute_detailed_dirty_state(repo_path).unwrap();
+        assert!(!state_untracked1.is_clean);
+        assert_eq!(state_untracked1.untracked_count, 1);
+        assert_ne!(state_untracked1.composite_fingerprint, "CLEAN");
+
+        // 3. Untracked file content changed (same filename, different content)
+        fs::write(&untracked_path, "modified untracked content").unwrap();
+        let state_untracked2 = adapter.compute_detailed_dirty_state(repo_path).unwrap();
+        assert_ne!(
+            state_untracked1.composite_fingerprint, state_untracked2.composite_fingerprint,
+            "Changing content of an untracked file must produce a different composite fingerprint"
+        );
+
+        // 4. Tracked file unstaged edit
+        fs::write(repo_path.join("committed.txt"), "v2 unstaged").unwrap();
+        let state_unstaged = adapter.compute_detailed_dirty_state(repo_path).unwrap();
+        assert_eq!(state_unstaged.unstaged_count, 1);
+        assert_ne!(
+            state_unstaged.composite_fingerprint,
+            state_untracked2.composite_fingerprint
+        );
+
+        // 5. Staged file edit
+        Command::new("git")
+            .args(["add", "committed.txt"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        let state_staged = adapter.compute_detailed_dirty_state(repo_path).unwrap();
+        assert_eq!(state_staged.staged_count, 1);
+        assert_ne!(
+            state_staged.composite_fingerprint,
+            state_unstaged.composite_fingerprint
+        );
     }
 }
