@@ -289,7 +289,22 @@ impl GitAdapter {
         }
 
         let raw_porcelain = String::from_utf8_lossy(&status_output.stdout).to_string();
-        let counts = Self::parse_porcelain_status(&raw_porcelain);
+        let filtered_porcelain: String = raw_porcelain
+            .lines()
+            .filter(|line| {
+                if let Some(path) = line.get(3..) {
+                    let norm = path.trim().trim_matches('"').replace('\\', "/");
+                    !norm.starts_with(".coalition/architecture-versions")
+                        && !norm.starts_with(".coalition/recovery")
+                        && !norm.contains(".staging-")
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let counts = Self::parse_porcelain_status(&filtered_porcelain);
 
         // 2. Unstaged diff hash
         let unstaged_diff = Command::new(&self.git_bin)
@@ -331,7 +346,7 @@ impl GitAdapter {
 
         // 4. Untracked files path + content fingerprints
         let mut untracked_entries = Vec::new();
-        for line in raw_porcelain.lines() {
+        for line in filtered_porcelain.lines() {
             if let Some(rel_path_raw) = line.strip_prefix("?? ") {
                 let rel_path = rel_path_raw.trim().trim_matches('"');
                 let full_path = dir.join(rel_path);
@@ -368,8 +383,10 @@ impl GitAdapter {
             "CLEAN".to_string()
         } else {
             let composite_input = format!(
-                "porcelain:\n{}\nunstaged:{}\nstaged:{}\nuntracked:{}",
-                raw_porcelain.trim(),
+                "counts:staged={},unstaged={},untracked={};unstaged_diff={};staged_diff={};untracked={}",
+                counts.staged,
+                counts.unstaged,
+                counts.untracked,
                 unstaged_diff_hash,
                 staged_diff_hash,
                 untracked_fingerprint
@@ -384,7 +401,7 @@ impl GitAdapter {
             staged_count: counts.staged,
             unstaged_count: counts.unstaged,
             untracked_count: counts.untracked,
-            raw_porcelain,
+            raw_porcelain: filtered_porcelain,
             unstaged_diff_hash,
             staged_diff_hash,
             untracked_fingerprint,

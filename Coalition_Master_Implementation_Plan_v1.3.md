@@ -1629,20 +1629,14 @@ At the time of this roadmap revision:
 
 ```text
 Stage 1 — Foundation                         COMPLETE
-Stage 2 — Architecture Contract              IN PROGRESS
-  Relay + Architecture Workspace             COMPLETE
-  Architecture Freeze + Git Boundaries       NEXT
-Stage 3 — Builder Control Plane              NOT STARTED
+Stage 2 — Architecture Contract              COMPLETE
+Stage 3 — Builder Control Plane              NEXT
 Stage 4 — Governed Development Loop          NOT STARTED
 Stage 5 — V1 Completion and Windows Release  NOT STARTED
 V1.1 — macOS Platform Support                POST-V1
 ```
 
-The current repository baseline includes the completed Stage 1 foundation and the completed Stage 2 ChatGPT Relay and Architecture Workspace work, including governed architecture editing, per-project readiness applicability, strict relay envelopes, crash-safe batch import recovery, stale-preview protection, relay lifecycle/idempotency, authoritative readiness transitions, and global relay/import shortcuts.
-
-There is no Architecture Freeze implementation in the current baseline. The next implementation work is therefore the remaining Stage 2 internal checkpoint: **Architecture Freeze and Git Boundaries**.
-
-This remains part of the existing Stage 2 assignment. Do not create or require a separately prompted “Stage 2B” phase.
+The current repository baseline includes the completed Stage 1 foundation and the completed Stage 2 Architecture Contract (ChatGPT Relay, Architecture Workspace, Architecture Freeze, and Git Boundaries). The next implementation work is therefore **Stage 3 — Builder Control Plane**.
 
 Future stages must follow the one-assignment-per-stage execution contract above.
 

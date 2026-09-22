@@ -528,6 +528,67 @@ pub async fn get_project_activity(
         .map_err(|e| CommandError::new("DATABASE_ERROR", e.to_string()))
 }
 
+pub fn apply_workflow_action_impl(
+    db: &mut DbManager,
+    project_id: &str,
+    action: WorkflowAction,
+) -> Result<WorkflowStateRecord, CommandError> {
+    // Invariant: Builder execution cannot start if repository resolution, restoration reconciliation,
+    // frozen snapshot integrity, or contract drift checks fail.
+    if action == WorkflowAction::StartBuild {
+        let repo_path = get_repo_path_for_project_sync(db, project_id)?;
+        if !repo_path.exists() || !repo_path.is_dir() {
+            return Err(CommandError::new(
+                "REPOSITORY_UNAVAILABLE",
+                format!(
+                    "Repository directory does not exist or is unavailable: {:?}",
+                    repo_path
+                ),
+            ));
+        }
+
+        crate::core::freeze::FreezeService::reconcile_drift_restoration(
+            &repo_path,
+            project_id,
+            db.connection_mut(),
+        )
+        .map_err(CommandError::from)?;
+
+        let coalition_dir =
+            crate::core::artifacts::ArtifactManager::resolve_coalition_dir(&repo_path)
+                .map_err(CommandError::from)?;
+        let project_yaml = crate::core::artifacts::ArtifactManager::read_project_yaml(
+            coalition_dir.join("project.yaml"),
+        )
+        .map_err(CommandError::from)?;
+        let version = project_yaml
+            .current_architecture_version
+            .as_deref()
+            .unwrap_or("1.0");
+
+        crate::core::freeze::FreezeService::verify_snapshot_integrity(
+            &repo_path,
+            version,
+            project_yaml.active_manifest_fingerprint.as_deref(),
+        )
+        .map_err(CommandError::from)?;
+
+        let drift =
+            crate::core::freeze::FreezeService::check_contract_drift(&repo_path, project_id)
+                .map_err(CommandError::from)?;
+        if drift.has_drift {
+            return Err(CommandError::with_details(
+                "FROZEN_CONTRACT_DRIFT_DETECTED",
+                "Cannot start build: architecture contract has drifted from frozen snapshot. Restore artifacts or complete governed architecture change first.",
+                serde_json::to_value(&drift).unwrap_or_default(),
+            ));
+        }
+    }
+
+    workflow::apply_workflow_action(db.connection_mut(), project_id, action, "HUMAN")
+        .map_err(CommandError::from)
+}
+
 #[tauri::command]
 pub async fn apply_workflow_action(
     state: State<'_, AppState>,
@@ -535,32 +596,7 @@ pub async fn apply_workflow_action(
     action: WorkflowAction,
 ) -> Result<WorkflowStateRecord, CommandError> {
     let mut db = state.db.lock().await;
-
-    // Invariant: Builder execution cannot start if frozen architecture contract has drifted or has unresolved restoration
-    if action == WorkflowAction::StartBuild {
-        if let Ok(repo_path) = get_repo_path_for_project_sync(&db, &project_id) {
-            crate::core::freeze::FreezeService::reconcile_drift_restoration(
-                &repo_path,
-                &project_id,
-                db.connection_mut(),
-            )
-            .map_err(CommandError::from)?;
-
-            let drift =
-                crate::core::freeze::FreezeService::check_contract_drift(&repo_path, &project_id)
-                    .map_err(CommandError::from)?;
-            if drift.has_drift {
-                return Err(CommandError::with_details(
-                    "FROZEN_CONTRACT_DRIFT_DETECTED",
-                    "Cannot start build: architecture contract has drifted from frozen snapshot. Restore artifacts or complete governed architecture change first.",
-                    serde_json::to_value(&drift).unwrap_or_default(),
-                ));
-            }
-        }
-    }
-
-    workflow::apply_workflow_action(db.connection_mut(), &project_id, action, "HUMAN")
-        .map_err(CommandError::from)
+    apply_workflow_action_impl(&mut db, &project_id, action)
 }
 
 #[tauri::command]
@@ -1152,4 +1188,210 @@ pub async fn get_builder_packet(
     }
     crate::core::freeze::FreezeService::get_builder_packet(&repo_path, version.as_deref())
         .map_err(CommandError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::artifacts::ArtifactManager;
+    use crate::core::freeze::FreezeService;
+    use crate::core::git::GitAdapter;
+    use crate::db::DbManager;
+    use rusqlite::params;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn setup_test_git_repo(path: &std::path::Path) {
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(path)
+            .output()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(path)
+            .output()
+            .expect("git config user.name");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(path)
+            .output()
+            .expect("git config user.email");
+        fs::write(path.join("README.md"), "# Init").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "Initial"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+    }
+
+    fn populate_artifacts(root: &std::path::Path) {
+        for path in crate::core::artifacts::CANONICAL_ARCHITECTURE_ARTIFACTS {
+            let full = root.join(".coalition").join(path);
+            if let Some(p) = full.parent() {
+                fs::create_dir_all(p).unwrap();
+            }
+            if path.ends_with(".yaml") {
+                fs::write(&full, "version: 1\nschema_version: 1\nitems: []\n").unwrap();
+            } else {
+                fs::write(
+                    &full,
+                    format!("# {}\n\nSubstantive content for {}\n", path, path),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_start_build_fails_on_missing_project() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+
+        let err =
+            apply_workflow_action_impl(&mut db, "non-existent-proj", WorkflowAction::StartBuild)
+                .unwrap_err();
+        assert_eq!(err.code, "PROJECT_NOT_FOUND");
+    }
+
+    #[test]
+    fn test_start_build_fails_on_unavailable_repo_path() {
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+
+        db.connection().execute(
+            "INSERT INTO projects (project_id, name, repository_path, created_at, updated_at, last_opened_at)
+             VALUES ('proj-1', 'Test', 'C:/non_existent_dir_99999', '2026-01-01', '2026-01-01', '2026-01-01')",
+            [],
+        ).unwrap();
+
+        let err =
+            apply_workflow_action_impl(&mut db, "proj-1", WorkflowAction::StartBuild).unwrap_err();
+        assert_eq!(err.code, "REPOSITORY_UNAVAILABLE");
+    }
+
+    #[test]
+    fn test_start_build_fails_on_corrupt_frozen_snapshot_and_drift() {
+        let dir = tempdir().unwrap();
+        setup_test_git_repo(dir.path());
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+
+        let py = ArtifactManager::initialize_new_project(dir.path(), "start-build-test").unwrap();
+        let proj_id = &py.project_id;
+
+        db.connection().execute(
+            "INSERT INTO projects (project_id, name, repository_path, created_at, updated_at, last_opened_at)
+             VALUES (?1, ?2, ?3, '2026-01-01', '2026-01-01', '2026-01-01')",
+            params![proj_id, "Test", dir.path().to_string_lossy().to_string()],
+        ).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO workflow_state (project_id, state, revision, updated_at)
+             VALUES (?1, 'READY_TO_FREEZE', 1, '2026-01-01')",
+                params![proj_id],
+            )
+            .unwrap();
+
+        populate_artifacts(dir.path());
+
+        let git = GitAdapter::new().unwrap();
+        let preview =
+            FreezeService::prepare_freeze_preview(dir.path(), proj_id, &git, db.connection())
+                .unwrap();
+
+        FreezeService::confirm_freeze(
+            dir.path(),
+            proj_id,
+            &preview.preview_id,
+            &git,
+            db.connection_mut(),
+        )
+        .unwrap();
+
+        // Workflow state is now FROZEN.
+        // 1. Mutate contract artifact -> drift detected -> StartBuild fails closed!
+        ArtifactManager::write_artifact_atomic(
+            dir.path(),
+            "design/product-vision.md",
+            "# Tampered Content\n",
+        )
+        .unwrap();
+
+        let drift_err =
+            apply_workflow_action_impl(&mut db, proj_id, WorkflowAction::StartBuild).unwrap_err();
+        assert_eq!(drift_err.code, "FROZEN_CONTRACT_DRIFT_DETECTED");
+
+        // 2. Corrupt frozen snapshot -> StartBuild fails closed!
+        let manifest_path = dir
+            .path()
+            .join(".coalition")
+            .join("architecture-versions")
+            .join("v1.0")
+            .join("contract-manifest.yaml");
+        fs::write(&manifest_path, "corrupt yaml: [}").unwrap();
+
+        let corrupt_err =
+            apply_workflow_action_impl(&mut db, proj_id, WorkflowAction::StartBuild).unwrap_err();
+        assert_eq!(corrupt_err.code, "FROZEN_SNAPSHOT_CORRUPT");
+    }
+
+    #[test]
+    fn test_start_build_fails_on_unresolved_restoration_journal() {
+        let dir = tempdir().unwrap();
+        setup_test_git_repo(dir.path());
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+
+        let py = ArtifactManager::initialize_new_project(dir.path(), "start-build-journal-test")
+            .unwrap();
+        let proj_id = &py.project_id;
+
+        db.connection().execute(
+            "INSERT INTO projects (project_id, name, repository_path, created_at, updated_at, last_opened_at)
+             VALUES (?1, ?2, ?3, '2026-01-01', '2026-01-01', '2026-01-01')",
+            params![proj_id, "Test", dir.path().to_string_lossy().to_string()],
+        ).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO workflow_state (project_id, state, revision, updated_at)
+             VALUES (?1, 'READY_TO_FREEZE', 1, '2026-01-01')",
+                params![proj_id],
+            )
+            .unwrap();
+
+        populate_artifacts(dir.path());
+
+        let git = GitAdapter::new().unwrap();
+        let preview =
+            FreezeService::prepare_freeze_preview(dir.path(), proj_id, &git, db.connection())
+                .unwrap();
+
+        FreezeService::confirm_freeze(
+            dir.path(),
+            proj_id,
+            &preview.preview_id,
+            &git,
+            db.connection_mut(),
+        )
+        .unwrap();
+
+        // Place a corrupt/unresolvable journal on disk
+        let rec_dir = dir.path().join(".coalition").join("recovery");
+        fs::create_dir_all(&rec_dir).unwrap();
+        fs::write(
+            rec_dir.join("drift-restoration-journal.json"),
+            "{ invalid json",
+        )
+        .unwrap();
+
+        let err =
+            apply_workflow_action_impl(&mut db, proj_id, WorkflowAction::StartBuild).unwrap_err();
+        assert_eq!(err.code, "DRIFT_RESTORATION_RECOVERY_REQUIRED");
+    }
 }

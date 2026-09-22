@@ -392,6 +392,46 @@ impl ArtifactManager {
         Ok(())
     }
 
+    /// Cleans up any stale .staging-restore-* directories in .coalition/recovery/ from interrupted restorations.
+    /// Fails closed if cleanup cannot establish a known-safe state.
+    pub fn clean_stale_restore_staging(coalition_dir: &Path) -> Result<(), ArtifactError> {
+        let recovery_dir = coalition_dir.join("recovery");
+        if !recovery_dir.exists() {
+            return Ok(());
+        }
+        let entries = match fs::read_dir(&recovery_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                return Err(ArtifactError::RecoveryRequired(format!(
+                    "Failed to read recovery directory {:?}: {}",
+                    recovery_dir, e
+                )));
+            }
+        };
+
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                ArtifactError::RecoveryRequired(format!(
+                    "Failed to read entry in recovery dir: {}",
+                    e
+                ))
+            })?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".staging-restore-") {
+                let path = entry.path();
+                if path.is_dir() {
+                    fs::remove_dir_all(&path).map_err(|e| {
+                        ArtifactError::RecoveryRequired(format!(
+                            "Failed to clean stale restore staging directory {:?}: {}",
+                            path, e
+                        ))
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Quarantines an unexpected added file into .coalition/recovery/quarantine-<timestamp>-<uuid>/
     /// ensuring user data is never destroyed during drift restoration.
     /// Strictly validates that the path is an allowed architecture contract artifact,
