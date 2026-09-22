@@ -24,16 +24,22 @@ Coalition never fakes interactive stdin prompts or silently mutates global Antig
    - Can be toggled on or off for subsequent turns at any time.
 
 ### Honest Permission Evaluation vs. Generic Runtime Errors
-When `agy` encounters a tool block or permission denial in headless execution without Icarus, it emits an execution refusal in stderr. Coalition inspects this output and classifies the target action (`READ_ONLY`, `MUTATING`, `HIGH_RISK`, `CRITICAL`, or `UNCLASSIFIED_EXTERNAL_ACTION`) using `evaluate_tool_risk`. Coalition strictly avoids misclassifying generic runtime compilation, build, or script errors as permission denials.
+
+In headless streaming mode, when official `agy` encounters a tool block or permission denial without `--dangerously-skip-permissions`, it emits an execution refusal in stderr without emitting a structured tool-call request or awaiting interactive stdin. 
+
+Coalition inspects this output honestly:
+- Because the CLI's generic headless refusal payload does not expose structured tool call parameters, Coalition records the refusal as `tool_name: "UNCLASSIFIED_EXTERNAL_ACTION"` with `risk_level: "HIGH_RISK"` and decision `"BLOCKED"`.
+- Coalition does *not* invent fictitious specific tool invocations or guess unprovided targets. `evaluate_tool_risk()` is reserved for structured tool events where explicit tool names and targets are provided by the engine.
+- Coalition strictly avoids misclassifying ordinary build, compilation, test, or runtime script failures as permission refusals; only genuine execution refusal patterns trigger permission history entries.
 
 ## Risk Classification
 
-When tools are evaluated during execution:
+The system defines the following canonical risk tiers:
 - **`READ_ONLY`**: Non-mutating inspections and queries (`view_file`, `list_dir`, `grep_search`). Safe under all policies.
 - **`MUTATING`**: Workspace file creation and modifications (`write_to_file`, `replace_file_content`).
 - **`HIGH_RISK`**: Arbitrary command execution (`run_command`, subagent orchestration, external network actions).
 - **`CRITICAL`**: Sensitive system modifications or credential operations.
-- **`UNCLASSIFIED_EXTERNAL_ACTION`**: External tool invocations where the specific sub-command cannot be deterministically inferred from the engine's refusal payload.
+- **`UNCLASSIFIED_EXTERNAL_ACTION`**: External tool invocations where specific tool metadata cannot be deterministically inferred from the engine's refusal payload in headless mode.
 
 ## Active-Run Visual Indicators
 
@@ -41,7 +47,9 @@ The UI displays an **Active Run: Icarus Mode** warning banner strictly when the 
 
 ## Persistent Credential and Secret Redaction
 
-To prevent sensitive credentials from leaking into operational databases, terminal feeds, or activity logs, all persisted event content and details are processed through a deterministic, bounded multi-pattern redactor before database insertion:
+To prevent sensitive credentials from leaking into operational databases or activity history, all persisted text derived from external engine execution is processed through a deterministic, bounded multi-pattern redactor before database insertion:
+- **Persistent Text Scope**: Applied to `builder_events` (content and details JSON), `builder_sessions.response_text`, `builder_sessions.error_message`, and `activity_events` metadata and failure messages.
+- **Live Terminal Feeds**: Live streaming terminal output in the desktop UI is ephemeral process stdout/stderr held in-memory and capped at the most recent 1,000 lines to prevent DOM bloat; persistent records in SQLite are strictly sanitized.
 - **Authorization & Bearer Tokens**: Replaces `Authorization: Bearer <token>` and standalone `Bearer <token>` with `Bearer [REDACTED]`.
 - **Known API Keys**: Detects and redacts OpenAI keys (`sk-...`) and Google API keys (`AIza...`).
 - **Structured JSON & Configs**: Sanitizes quoted key-value pairs matching sensitive keys (`api_key`, `token`, `password`, `secret`, `access_token`, `refresh_token`, `private_key`) to `"[REDACTED]"`.

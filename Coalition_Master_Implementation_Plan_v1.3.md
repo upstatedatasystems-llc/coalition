@@ -32,11 +32,11 @@ The most important post-v0.2 decisions incorporated here are:
 4. Coalition must expose Antigravity model selection and reasoning effort where supported by the CLI.
 5. Coalition must display Antigravity usage/quota/context information where supported.
 6. Coalition must provide an approximate ChatGPT usage indicator, clearly labeled as an estimate rather than provider-reported truth.
-7. Builder permissions must support:
-   - deny;
-   - allow once;
-   - allow and remember;
-   - Icarus mode, which auto-approves everything for the active project/run.
+7. Builder permissions and governance (V1 Approved Resolution):
+   - In headless streaming mode, official `agy` does not provide an interactive stdin protocol for runtime Allow Once / Always Allow prompts. Coalition does not fake interactive prompts or mutate undocumented global configuration.
+   - Least-privilege mode executes without `--dangerously-skip-permissions`, surfacing blocked actions honestly (classified as `UNCLASSIFIED_EXTERNAL_ACTION` when the engine's generic refusal does not expose structured tool metadata);
+   - Explicit Icarus mode auto-approves tool actions for the active project/run via `--dangerously-skip-permissions` with persistent high-visibility warning indicators;
+   - All permission refusals and decisions are audited in project permission history.
 8. Coalition-owned validation is configurable and may be disabled entirely.
 9. When enabled, Coalition validation must be independently runnable from Builder activity, visible in real time, stoppable, restartable, and fully logged.
 10. Validation results are primarily diagnostic evidence for the Builder, Architect, Reviewer, and human. A project may configure which checks, if any, are required gates.
@@ -844,22 +844,13 @@ Routine known-safe project activity should be able to proceed automatically.
 
 Unknown, out-of-scope, or dangerous activity should pause for a human decision.
 
-## 14.1 Permission Decisions
+## 14.1 Permission Decisions (V1 Approved Resolution)
 
-Present:
+In official Google Antigravity CLI (`agy` v1.1.27) running in headless streaming mode (`--input-format stream-json --output-format stream-json`), the engine does not provide a bidirectional stdin protocol for runtime Allow Once / Always Allow prompts. If a tool action requires approval and `--dangerously-skip-permissions` is omitted, the CLI immediately rejects the action with an execution refusal and terminates.
 
-```text
-Deny
-Allow Once
-Always Allow This
-Enable Icarus
-```
-
-For appropriate events also permit:
-
-```text
-Always Deny This
-```
+Coalition does not fake interactive prompts or mutate undocumented global configuration. Instead:
+- **Least-Privilege Mode (Default)**: Executes without `--dangerously-skip-permissions`. Engine tool execution refusals are captured honestly from stderr. When structured tool metadata is absent, the denial is recorded as `UNCLASSIFIED_EXTERNAL_ACTION` with `HIGH_RISK` and decision `BLOCKED` in project permission history with actionable retry guidance. Specific action classification is used only when supported metadata actually identifies the action.
+- **Icarus Mode (Full Autonomous Execution)**: Explicitly enabled by the human for the active project. Passes `--dangerously-skip-permissions` to permit autonomous tool execution, accompanied by persistent high-visibility warning indicators in the UI.
 
 ## 14.2 Scope
 
@@ -918,21 +909,16 @@ Strong deny candidates:
 - destructive commands outside project;
 - commands matching explicit user deny rules.
 
-## 14.5 Headless Antigravity Integration Spike
+## 14.5 Headless Antigravity Integration Spike & V1 Resolution
 
-The Stage 1 technical-proof checkpoint must determine the cleanest supported mechanism for applying Coalition decisions to project-scoped Antigravity permissions in headless mode.
+The Stage 1 technical-proof checkpoint determined that official Google Antigravity CLI (`agy` v1.1.27) running headlessly does not support dynamic interactive Allow Once / Always Allow stdin prompts.
 
-Do not make final architecture depend on unsafe global configuration mutation.
-
-Acceptable final implementation must:
-
-- preserve project scoping;
-- avoid leaking approvals between projects;
-- log every policy mutation;
-- remove temporary "allow once" rules after their intended scope;
-- survive interrupted processes without leaving accidental broad permissions behind.
-
-If the CLI cannot support dynamic one-time approval cleanly, report an Architecture Concern before designing an undocumented workaround.
+In accordance with Section 14.5 and the Master Invariants:
+- Coalition does not synthesize fake interactive stdin prompts or mutate undocumented global configuration files.
+- Least-privilege mode executes without `--dangerously-skip-permissions`, capturing tool execution refusals in stderr and auditing them in project permission history as `UNCLASSIFIED_EXTERNAL_ACTION` with `HIGH_RISK` when structured tool metadata is absent.
+- Specific action classification is used only when supported metadata actually identifies the action.
+- Explicit Icarus mode (`--dangerously-skip-permissions`) is the approved full-autonomy mechanism.
+- All permission history and Icarus toggle state reside strictly in transient operational SQLite tables, preserving project scoping without leaking across repositories.
 
 ---
 
@@ -2050,32 +2036,25 @@ Acceptance:
 
 Implement based on the documented Stage 1 technical-proof permission findings:
 
-- permission policy evaluator;
-- routine project-safe auto-allow patterns;
-- human permission decision UI;
-- Deny;
-- Allow Once;
-- Always Allow This;
-- Always Deny This;
-- project-local remembered rules;
-- permission history;
-- temporary-rule cleanup;
-- Icarus enable/disable;
-- persistent high-visibility Icarus warning;
-- restart reconciliation.
+- least-privilege headless execution mode;
+- honest refusal capture from engine output;
+- unclassified action fallback (`UNCLASSIFIED_EXTERNAL_ACTION`) when refusal metadata is generic;
+- specific tool risk evaluation when structured tool metadata is provided;
+- project-scoped permission history in SQLite;
+- human permission audit UI in Builder Control Plane;
+- explicit Icarus mode enable/disable (`--dangerously-skip-permissions`);
+- persistent high-visibility Icarus warning banner;
+- active-run Icarus immutability;
+- restart session reconciliation.
 
 Acceptance:
-
-- unknown or out-of-policy command prompts;
-- allow-once does not persist beyond intended scope;
-- remembered project rule works on later matching actions;
-- unrelated project does not inherit the rule;
-- higher-risk actions remain visible/escalated;
-- Icarus bypasses prompts within its explicit project/run scope;
+- least-privilege mode executes without auto-approval, capturing and logging refused actions;
+- generic headless refusals without structured tool metadata are honestly recorded as `UNCLASSIFIED_EXTERNAL_ACTION`;
+- Icarus auto-approves tool actions within its explicit project/run scope;
 - Icarus is never enabled by default;
-- Icarus active state is impossible to miss;
-- all permission decisions are logged;
-- no undocumented global Antigravity permission mutation is used.
+- Icarus active state is impossible to miss via prominent UI indicators;
+- all permission decisions and refusals are logged in SQLite audit history;
+- no undocumented global Antigravity configuration mutation or synthetic stdin prompts are used.
 
 **Internal checkpoint rule:** Verify and commit this checkpoint, then continue directly to Usage and Capacity within the same Stage 3 assignment unless a stopping condition from Section 28.1 applies.
 

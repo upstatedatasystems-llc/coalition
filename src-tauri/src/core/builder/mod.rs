@@ -771,6 +771,59 @@ impl ActiveBuilderRegistry {
     }
 }
 
+pub struct ActiveExecutionGuard {
+    registry: Arc<tokio::sync::Mutex<ActiveBuilderRegistry>>,
+    project_id: String,
+    session_id: String,
+    active: bool,
+}
+
+impl ActiveExecutionGuard {
+    pub fn new(
+        registry: Arc<tokio::sync::Mutex<ActiveBuilderRegistry>>,
+        project_id: &str,
+        session_id: &str,
+    ) -> Self {
+        Self {
+            registry,
+            project_id: project_id.to_string(),
+            session_id: session_id.to_string(),
+            active: true,
+        }
+    }
+
+    pub async fn unregister(&mut self) {
+        if self.active {
+            let mut reg = self.registry.lock().await;
+            reg.unregister(&self.project_id, &self.session_id);
+            self.active = false;
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+impl Drop for ActiveExecutionGuard {
+    fn drop(&mut self) {
+        if self.active {
+            if let Ok(mut reg) = self.registry.try_lock() {
+                reg.unregister(&self.project_id, &self.session_id);
+                self.active = false;
+            } else {
+                let reg_arc = self.registry.clone();
+                let pid = self.project_id.clone();
+                let sid = self.session_id.clone();
+                tokio::spawn(async move {
+                    let mut reg = reg_arc.lock().await;
+                    reg.unregister(&pid, &sid);
+                });
+            }
+        }
+    }
+}
+
 impl AntigravityCliAdapter {
     pub fn discover() -> Result<Self, BuilderError> {
         // 1. PATH lookup for 'agy'
@@ -1287,9 +1340,11 @@ impl BuilderService {
                 icarus_mode,
             )?
         };
+        let mut exec_guard =
+            ActiveExecutionGuard::new(registry_arc.clone(), project_id, &session_id);
 
         // 9. Insert initial session record
-        {
+        let insert_res = {
             let db = db_arc.lock().await;
             let session_rec = BuilderSessionRecord {
                 session_id: session_id.clone(),
@@ -1308,30 +1363,39 @@ impl BuilderService {
                 duration_ms: 0,
                 usage: AgyUsage::default(),
             };
-            db.insert_builder_session(&session_rec)
-                .map_err(|e| BuilderError::ExecutionFailed(e.to_string()))?;
+            let res = db.insert_builder_session(&session_rec);
+            if res.is_ok() {
+                let meta = serde_json::json!({
+                    "session_id": session_id,
+                    "epoch_id": epoch_id,
+                    "model": model_name,
+                    "effort": effort_level,
+                    "icarus_mode": icarus_mode,
+                    "conversation_id": existing_conv_id,
+                });
+                let _ = crate::core::activity::ActivityManager::record_event(
+                    db.connection(),
+                    project_id,
+                    "BUILDER_TURN_STARTED",
+                    "BUILDER",
+                    &format!(
+                        "Started Builder turn with model {} (epoch: {}){}",
+                        model_name,
+                        epoch_id,
+                        if icarus_mode { " [ICARUS MODE]" } else { "" }
+                    ),
+                    Some(&meta),
+                );
+            }
+            res
+        };
 
-            let meta = serde_json::json!({
-                "session_id": session_id,
-                "epoch_id": epoch_id,
-                "model": model_name,
-                "effort": effort_level,
-                "icarus_mode": icarus_mode,
-                "conversation_id": existing_conv_id,
-            });
-            let _ = crate::core::activity::ActivityManager::record_event(
-                db.connection(),
-                project_id,
-                "BUILDER_TURN_STARTED",
-                "BUILDER",
-                &format!(
-                    "Started Builder turn with model {} (epoch: {}){}",
-                    model_name,
-                    epoch_id,
-                    if icarus_mode { " [ICARUS MODE]" } else { "" }
-                ),
-                Some(&meta),
-            );
+        if let Err(e) = insert_res {
+            exec_guard.unregister().await;
+            return Err(BuilderError::Database(format!(
+                "Failed to insert builder session: {}",
+                e
+            )));
         }
 
         // 10. Channel and event streaming: emit to frontend and persist to builder_events table
@@ -1375,25 +1439,60 @@ impl BuilderService {
 
         let turn_start = tokio::time::Instant::now();
         let execution_result = adapter
-            .run_turn(request, session_cancel_flag, Some(tx))
+            .run_turn(request, session_cancel_flag.clone(), Some(tx))
             .await;
         let duration_ms = turn_start.elapsed().as_millis() as u64;
         let completed_at = chrono::Utc::now().to_rfc3339();
 
         // Await persistence drain before proceeding to ensure no trailing events are lost
-        let persist_res = persist_handle.await.map_err(|e| {
-            BuilderError::Database(format!(
+        let persist_join_res = persist_handle.await;
+        let persistence_failed = match &persist_join_res {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(format!("Builder event persistence error: {}", e)),
+            Err(e) => Some(format!(
                 "Builder event persistence task panicked or failed to join: {}",
                 e
-            ))
-        })?;
-        persist_res.map_err(BuilderError::Database)?;
+            )),
+        };
 
-        // 11. Unregister active execution from registry
-        {
-            let mut registry = registry_arc.lock().await;
-            registry.unregister(project_id, &session_id);
+        if let Some(persist_err) = persistence_failed {
+            // Terminate/finish the governed process safely if still running
+            session_cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Unregister execution from registry
+            exec_guard.unregister().await;
+
+            let sanitized_err = sanitize_text(&persist_err);
+            {
+                let db = db_arc.lock().await;
+                let _ = db.update_builder_session_status(
+                    &session_id,
+                    STATUS_FAILED,
+                    None,
+                    Some(&sanitized_err),
+                    Some(&completed_at),
+                    duration_ms,
+                    &AgyUsage::default(),
+                    None,
+                );
+                let meta = serde_json::json!({
+                    "session_id": session_id,
+                    "error": sanitized_err,
+                    "duration_ms": duration_ms,
+                });
+                let _ = crate::core::activity::ActivityManager::record_event(
+                    db.connection(),
+                    project_id,
+                    "BUILDER_TURN_FAILED",
+                    "BUILDER",
+                    &format!("Builder turn failed: {}", sanitized_err),
+                    Some(&meta),
+                );
+            }
+            return Err(BuilderError::Database(persist_err));
         }
+
+        // Unregister active execution from registry
+        exec_guard.unregister().await;
 
         match execution_result {
             Ok(resp) => {
@@ -1408,10 +1507,11 @@ impl BuilderService {
                     &resp.status
                 };
 
+                let sanitized_response = sanitize_text(&resp.text_response);
                 db.update_builder_session_status(
                     &session_id,
                     final_status,
-                    Some(&resp.text_response),
+                    Some(&sanitized_response),
                     None,
                     Some(&completed_at),
                     duration_ms,
@@ -1480,12 +1580,13 @@ impl BuilderService {
             }
             Err(e) => {
                 let err_str = e.to_string();
+                let sanitized_err = sanitize_text(&err_str);
                 let db = db_arc.lock().await;
                 db.update_builder_session_status(
                     &session_id,
                     STATUS_FAILED,
                     None,
-                    Some(&err_str),
+                    Some(&sanitized_err),
                     Some(&completed_at),
                     duration_ms,
                     &AgyUsage::default(),
@@ -1500,7 +1601,7 @@ impl BuilderService {
 
                 let meta = serde_json::json!({
                     "session_id": session_id,
-                    "error": err_str,
+                    "error": sanitized_err,
                     "duration_ms": duration_ms,
                 });
                 // Policy: Activity log records are best-effort informational audit records; failures do not abort the governed turn.
@@ -1509,7 +1610,7 @@ impl BuilderService {
                     project_id,
                     "BUILDER_TURN_FAILED",
                     "BUILDER",
-                    &format!("Builder turn failed: {}", err_str),
+                    &format!("Builder turn failed: {}", sanitized_err),
                     Some(&meta),
                 );
 
@@ -1888,5 +1989,23 @@ CLI flag: --api_key=mysecretpass123 --token="quoted-secret" password=my-pass; ne
             details.contains("[REDACTED]"),
             "Details JSON must contain redaction placeholder"
         );
+    }
+
+    #[test]
+    fn test_secret_redacted_in_session_response_and_errors() {
+        let raw_response = "Finished task. Used Authorization: Bearer secret-token-xyz and sk-abcdef1234567890abcdef";
+        let raw_error = "Execution failed with key AIzaSyD1234567890abcdef1234567890 while executing --api_key=mysecret";
+
+        let sanitized_resp = sanitize_text(raw_response);
+        assert!(!sanitized_resp.contains("secret-token-xyz"));
+        assert!(!sanitized_resp.contains("sk-abcdef1234567890abcdef"));
+        assert!(sanitized_resp.contains("Bearer [REDACTED]"));
+        assert!(sanitized_resp.contains("[REDACTED]"));
+
+        let sanitized_err = sanitize_text(raw_error);
+        assert!(!sanitized_err.contains("AIzaSyD1234567890abcdef1234567890"));
+        assert!(!sanitized_err.contains("mysecret"));
+        assert!(sanitized_err.contains("AIza[REDACTED]"));
+        assert!(sanitized_err.contains("[REDACTED]"));
     }
 }

@@ -1136,7 +1136,7 @@ pub async fn copy_relay_packet_to_clipboard(
         char_count / 4
     };
 
-    let _ = db.record_chatgpt_usage(
+    db.record_chatgpt_usage(
         &project_id,
         Some(&packet_id),
         "OUTBOUND_PACKET",
@@ -1144,7 +1144,16 @@ pub async fn copy_relay_packet_to_clipboard(
         estimated_tokens,
         estimator_version,
         chars_per_token,
-    );
+    )
+    .map_err(|e| {
+        CommandError::new(
+            "TELEMETRY_PERSISTENCE_FAILED",
+            format!(
+                "Relay packet copied to clipboard successfully, but failed to record usage telemetry: {}",
+                e
+            ),
+        )
+    })?;
 
     Ok(())
 }
@@ -1172,7 +1181,7 @@ pub async fn import_from_clipboard(
         char_count / 4
     };
 
-    let _ = db.record_chatgpt_usage(
+    db.record_chatgpt_usage(
         &project_id,
         Some(&preview.packet_id),
         "INBOUND_IMPORT",
@@ -1180,7 +1189,16 @@ pub async fn import_from_clipboard(
         estimated_tokens,
         estimator_version,
         chars_per_token,
-    );
+    )
+    .map_err(|e| {
+        CommandError::new(
+            "TELEMETRY_PERSISTENCE_FAILED",
+            format!(
+                "Relay response imported successfully, but failed to record usage telemetry: {}",
+                e
+            ),
+        )
+    })?;
 
     Ok(preview)
 }

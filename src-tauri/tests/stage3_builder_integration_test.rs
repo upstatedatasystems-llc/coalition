@@ -789,6 +789,21 @@ async fn test_stage3_chatgpt_usage_calibrated_provenance_persisted() {
     assert_eq!(initial_summary.estimator_version, 1);
     assert_eq!(initial_summary.chars_per_token, 4.0);
 
+    // Record default usage under uncalibrated settings
+    let char_count_default = 4000;
+    let tokens_default =
+        (char_count_default as f64 / initial_summary.chars_per_token).round() as usize;
+    db.record_chatgpt_usage(
+        &project_id,
+        Some("pkt-default-1"),
+        "OUTBOUND_PACKET",
+        char_count_default,
+        tokens_default,
+        initial_summary.estimator_version,
+        initial_summary.chars_per_token,
+    )
+    .unwrap();
+
     // 2. Calibrate estimator to version 2 with ratio 3.5 (1000 tokens, 3500 chars)
     let updated_estimator = db
         .calibrate_chatgpt_estimator(&project_id, 1000, 3500)
@@ -801,7 +816,7 @@ async fn test_stage3_chatgpt_usage_calibrated_provenance_persisted() {
     assert_eq!(summary_after_cal.estimator_version, 2);
     assert!((summary_after_cal.chars_per_token - 3.5).abs() < 1e-4);
 
-    // 3. Record outbound and inbound usage simulating copy/import commands
+    // 3. Record outbound and inbound usage simulating copy/import commands under calibrated settings
     let char_count_out = 7000;
     let tokens_out = (char_count_out as f64 / updated_estimator.chars_per_token).round() as usize;
     db.record_chatgpt_usage(
@@ -828,46 +843,73 @@ async fn test_stage3_chatgpt_usage_calibrated_provenance_persisted() {
     )
     .unwrap();
 
-    // 4. Assert records in chatgpt_usage_records have exact calibrated version and ratio
+    // 4. Assert records in chatgpt_usage_records have exact expected columns, version, and ratio
     let mut stmt = db
         .connection()
-        .prepare("SELECT direction, estimator_version, chars_per_token, estimated_tokens FROM chatgpt_usage_records WHERE project_id = ?1 ORDER BY id ASC")
+        .prepare(
+            "SELECT project_id, packet_id, direction, char_count, estimated_tokens, estimator_version, chars_per_token 
+             FROM chatgpt_usage_records WHERE project_id = ?1 ORDER BY id ASC",
+        )
         .unwrap();
     let rows = stmt
         .query_map(rusqlite::params![project_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, u32>(1)?,
-                row.get::<_, f64>(2)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
                 row.get::<_, u64>(3)?,
+                row.get::<_, u64>(4)?,
+                row.get::<_, u32>(5)?,
+                row.get::<_, f64>(6)?,
             ))
         })
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].0, "OUTBOUND_PACKET");
+    assert_eq!(rows.len(), 3);
+
+    // Row 0: default record
+    assert_eq!(rows[0].0, project_id);
+    assert_eq!(rows[0].1.as_deref(), Some("pkt-default-1"));
+    assert_eq!(rows[0].2, "OUTBOUND_PACKET");
+    assert_eq!(rows[0].3, 4000);
+    assert_eq!(rows[0].4, 1000);
+    assert_eq!(rows[0].5, 1, "Default record must have estimator version 1");
+    assert!(
+        (rows[0].6 - 4.0).abs() < 1e-4,
+        "Default record must have ratio 4.0"
+    );
+
+    // Row 1: calibrated outbound record
+    assert_eq!(rows[1].0, project_id);
+    assert_eq!(rows[1].1.as_deref(), Some("pkt-cal-1"));
+    assert_eq!(rows[1].2, "OUTBOUND_PACKET");
+    assert_eq!(rows[1].3, 7000);
+    assert_eq!(rows[1].4, 2000);
     assert_eq!(
-        rows[0].1, 2,
+        rows[1].5, 2,
         "Outbound record must persist estimator version 2"
     );
     assert!(
-        (rows[0].2 - 3.5).abs() < 1e-4,
+        (rows[1].6 - 3.5).abs() < 1e-4,
         "Outbound record must persist ratio 3.5"
     );
-    assert_eq!(rows[0].3, 2000);
 
-    assert_eq!(rows[1].0, "INBOUND_IMPORT");
+    // Row 2: calibrated inbound record
+    assert_eq!(rows[2].0, project_id);
+    assert_eq!(rows[2].1.as_deref(), Some("pkt-cal-1"));
+    assert_eq!(rows[2].2, "INBOUND_IMPORT");
+    assert_eq!(rows[2].3, 3500);
+    assert_eq!(rows[2].4, 1000);
     assert_eq!(
-        rows[1].1, 2,
+        rows[2].5, 2,
         "Inbound record must persist estimator version 2"
     );
     assert!(
-        (rows[1].2 - 3.5).abs() < 1e-4,
+        (rows[2].6 - 3.5).abs() < 1e-4,
         "Inbound record must persist ratio 3.5"
     );
-    assert_eq!(rows[1].3, 1000);
 }
 
 #[tokio::test]
@@ -973,6 +1015,151 @@ async fn test_stage3_service_cancellation_with_hanging_fake_agy() {
         assert!(
             f2.is_ok(),
             "Second project registration must succeed without interference"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_stage3_registry_cleanup_on_injected_persistence_and_session_failures() {
+    let (_repo_temp, db_temp, project_id, fake_agy) = setup_frozen_test_project();
+    let db_path = db_temp.path().join("stage3_test.db");
+    let db = Arc::new(tokio::sync::Mutex::new(DbManager::open(&db_path).unwrap()));
+    let registry = Arc::new(tokio::sync::Mutex::new(ActiveBuilderRegistry::new()));
+    let adapter = AntigravityCliAdapter::with_path(fake_agy);
+
+    // 1. Injected persistence failure: Create a trigger that fails inserts into builder_events
+    {
+        let db_lock = db.lock().await;
+        db_lock
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_events_trigger BEFORE INSERT ON builder_events
+                 BEGIN
+                     SELECT RAISE(FAIL, 'injected persistence failure');
+                 END;",
+            )
+            .unwrap();
+    }
+
+    let turn_res = BuilderService::start_governed_turn(
+        db.clone(),
+        registry.clone(),
+        None,
+        &project_id,
+        Some("gemini-3.8-flash-high".to_string()),
+        None,
+        Some(adapter.clone()),
+    )
+    .await;
+
+    // Assert that the turn failed with Database error
+    assert!(turn_res.is_err());
+    let err_str = turn_res.err().unwrap().to_string();
+    assert!(
+        err_str.contains("injected persistence failure")
+            || err_str.contains("Builder event persistence"),
+        "Error must reflect persistence failure: {}",
+        err_str
+    );
+
+    // Assert registry is completely cleaned up (NOT stuck active)
+    {
+        let reg = registry.lock().await;
+        assert!(
+            reg.get_active_execution(&project_id).is_none(),
+            "ActiveBuilderRegistry must be cleaned up on persistence failure"
+        );
+    }
+
+    // Assert session status is FAILED (NOT left RUNNING)
+    {
+        let db_lock = db.lock().await;
+        let session = db_lock
+            .get_latest_builder_session(&project_id)
+            .unwrap()
+            .expect("Session must have been created");
+        assert_eq!(
+            session.status, "FAILED",
+            "Operational session must be marked FAILED on persistence failure"
+        );
+        assert!(session
+            .error_message
+            .as_ref()
+            .map(|e| e.contains("persistence"))
+            .unwrap_or(false));
+    }
+
+    // 2. Drop the trigger, now inject session insert failure
+    {
+        let db_lock = db.lock().await;
+        db_lock
+            .connection()
+            .execute_batch(
+                "DROP TRIGGER fail_events_trigger;
+                 CREATE TRIGGER fail_sessions_trigger BEFORE INSERT ON builder_sessions
+                 BEGIN
+                     SELECT RAISE(FAIL, 'injected session insert failure');
+                 END;",
+            )
+            .unwrap();
+    }
+
+    let turn_res2 = BuilderService::start_governed_turn(
+        db.clone(),
+        registry.clone(),
+        None,
+        &project_id,
+        Some("gemini-3.8-flash-high".to_string()),
+        None,
+        Some(adapter.clone()),
+    )
+    .await;
+
+    // Assert that the turn failed with Database error
+    assert!(turn_res2.is_err());
+    let err_str2 = turn_res2.err().unwrap().to_string();
+    assert!(
+        err_str2.contains("injected session insert failure")
+            || err_str2.contains("Failed to insert builder session"),
+        "Error must reflect session insertion failure: {}",
+        err_str2
+    );
+
+    // Assert registry is completely cleaned up again
+    {
+        let reg = registry.lock().await;
+        assert!(
+            reg.get_active_execution(&project_id).is_none(),
+            "ActiveBuilderRegistry must be cleaned up on session insertion failure"
+        );
+    }
+
+    // 3. Drop trigger and verify a subsequent turn can run without CONCURRENT_BUILD_FORBIDDEN
+    {
+        let db_lock = db.lock().await;
+        db_lock
+            .connection()
+            .execute_batch("DROP TRIGGER fail_sessions_trigger;")
+            .unwrap();
+    }
+
+    let turn_res3 = BuilderService::start_governed_turn(
+        db.clone(),
+        registry.clone(),
+        None,
+        &project_id,
+        Some("gemini-3.8-flash-high".to_string()),
+        None,
+        Some(adapter),
+    )
+    .await;
+
+    assert!(turn_res3.is_ok(), "Subsequent turn must succeed cleanly");
+    {
+        let reg = registry.lock().await;
+        assert!(
+            reg.get_active_execution(&project_id).is_none(),
+            "ActiveBuilderRegistry must be cleaned up after successful turn"
         );
     }
 }
