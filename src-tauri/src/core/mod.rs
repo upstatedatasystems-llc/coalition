@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod artifacts;
 pub mod builder;
+pub mod freeze;
 pub mod git;
 pub mod process;
 pub mod projects;

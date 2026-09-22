@@ -165,6 +165,37 @@ impl DbManager {
                 CREATE INDEX IF NOT EXISTS idx_relay_imports_proj_decision ON relay_imports(project_id, decision);
                 CREATE INDEX IF NOT EXISTS idx_relay_history_proj ON relay_history(project_id, id);",
             ),
+            (
+                5,
+                "005_stage2_freeze_and_builder_epochs",
+                "CREATE TABLE IF NOT EXISTS builder_epochs (
+                    epoch_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    architecture_version TEXT NOT NULL,
+                    git_commit TEXT,
+                    git_branch TEXT,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_builder_epochs_proj ON builder_epochs(project_id, architecture_version);
+                CREATE TABLE IF NOT EXISTS frozen_boundaries (
+                    boundary_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    architecture_version TEXT NOT NULL,
+                    git_commit TEXT,
+                    git_branch TEXT,
+                    is_clean INTEGER NOT NULL,
+                    staged_count INTEGER NOT NULL,
+                    unstaged_count INTEGER NOT NULL,
+                    untracked_count INTEGER NOT NULL,
+                    dirty_fingerprint TEXT NOT NULL,
+                    snapshot_path TEXT NOT NULL,
+                    manifest_fingerprint TEXT NOT NULL,
+                    frozen_at TEXT NOT NULL,
+                    frozen_by TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_frozen_boundaries_proj_ver ON frozen_boundaries(project_id, architecture_version);",
+            ),
         ];
 
         let mut applied = Vec::new();
@@ -199,9 +230,8 @@ impl DbManager {
     pub fn run_proof(&mut self) -> Result<ProofResult, DbError> {
         let applied_migrations = self.run_migrations()?;
 
-        let now = chrono::Utc::now().to_rfc3339();
-        let test_message = format!("Phase 0 SQLite Proof executed at {}", now);
-
+        // Perform operational test write
+        let test_message = format!("Proof write at {}", chrono::Utc::now().to_rfc3339());
         self.conn.execute(
             "INSERT INTO operational_proof_records (message) VALUES (?1)",
             params![test_message],
@@ -232,11 +262,12 @@ mod tests {
     fn test_sqlite_in_memory_migrations_and_proof() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let result = db.run_proof().expect("run proof");
-        assert_eq!(result.applied_migrations.len(), 4);
+        assert_eq!(result.applied_migrations.len(), 5);
         assert_eq!(result.applied_migrations[0].version, 1);
         assert_eq!(result.applied_migrations[1].version, 2);
         assert_eq!(result.applied_migrations[2].version, 3);
         assert_eq!(result.applied_migrations[3].version, 4);
+        assert_eq!(result.applied_migrations[4].version, 5);
         assert_eq!(result.test_record_id, 1);
         assert_eq!(result.total_records, 1);
 
@@ -294,10 +325,11 @@ mod tests {
 
         let mut db = DbManager { conn };
         let applied = db.run_migrations().expect("run forward migrations");
-        assert_eq!(applied.len(), 3);
+        assert_eq!(applied.len(), 4);
         assert_eq!(applied[0].version, 2);
         assert_eq!(applied[1].version, 3);
         assert_eq!(applied[2].version, 4);
+        assert_eq!(applied[3].version, 5);
 
         // Verify Phase 0 data preserved
         let count: i64 = db
@@ -333,7 +365,7 @@ mod tests {
     fn test_migrations_already_migrated_is_idempotent() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let applied1 = db.run_migrations().expect("first migration run");
-        assert_eq!(applied1.len(), 4);
+        assert_eq!(applied1.len(), 5);
 
         let applied2 = db.run_migrations().expect("second migration run");
         assert_eq!(applied2.len(), 0);

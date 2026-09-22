@@ -184,3 +184,42 @@ Importing multi-file architect proposals follows a durable journal protocol:
    - If interrupted in `COMMITTING`, rolls back to pre-import state using the `.bak.<uuid>` files.
    - If interrupted in `COMMITTED`, cleans up backups and updates operational database state.
 5. **Governed Manual Editing**: Saves verify expected SHA-256 fingerprints to guard against external disk modifications and prevent concurrency conflicts.
+
+## Stage 2B: Architecture Freeze, Git Boundaries & Builder Packets
+
+### Human-Authorized Initial Architecture Freeze
+
+In Coalition, freezing an architecture version is an explicit human action. AI agents and Builder workflows cannot self-authorize a freeze.
+- **Readiness Gate**: The project must be in state `READY_TO_FREEZE` with substantive content across all required architecture artifacts.
+- **Git Commit Boundary**: A valid Git HEAD commit is strictly required. Unborn repositories (0 commits) fail with typed `NO_HEAD_COMMIT`.
+- **Preflight Freeze Preview**: Generates an authoritative `FreezePreview` containing exact SHA-256 baseline fingerprints for all active contract artifacts, live Git boundary info (commit, branch, dirty fingerprint, uncommitted counts), and Builder packet summaries.
+- **Stale Preview Guard**: Upon human confirmation, baselines and Git status are rechecked against disk. Any concurrent modification rejects confirmation with typed `STALE_FREEZE_PREVIEW`.
+
+### Crash-Safe Multi-Resource Freeze Transaction
+
+Freezing coordinates multiple filesystem resources and SQLite records:
+1. **Isolated Staging**: Artifacts and metadata are staged under `.coalition/architecture-versions/.staging-v1.0-<uuid>/`. Raw contract files live under `.staging-v1.0-<uuid>/contract/`, alongside `contract-manifest.yaml` and `builder-packet.json`.
+2. **Atomic Directory Finalization**: Staging directory is atomically promoted to `.coalition/architecture-versions/v1.0/`.
+3. **Durable Commit Point**: `.coalition/project.yaml` is updated via platform-native atomic replacement with:
+   - `architecture_state: frozen`
+   - `current_architecture_version: "1.0"`
+   - `active_manifest_fingerprint: <sha256_of_contract_manifest>`
+4. **SQLite Operational Synchronization**: In a single transaction, workflow state advances to `FROZEN`, `frozen_boundaries` stores the Git commit boundary and manifest hash, and a `PENDING` epoch is recorded in `builder_epochs`.
+5. **Durable Rehydration**: If SQLite is deleted, reopening the repository rehydrates the frozen state and builder epoch directly from `.coalition/project.yaml` and `contract-manifest.yaml`.
+
+### Immutable Snapshot Integrity & Non-Destructive Drift Detection
+
+- **Self-Integrity Verification**: Before drift comparison or artifact restoration, snapshot integrity is verified against `active_manifest_fingerprint` and manifest hashes. Corrupt snapshots trigger typed `FROZEN_SNAPSHOT_CORRUPT` and block restoration.
+- **Continuous Drift Detection**: Active files in `.coalition/` are compared against `v1.0/contract/`:
+  - `MODIFIED`: Active file SHA-256 differs from snapshot hash. Restored atomically from snapshot.
+  - `DELETED`: Active file missing. Recreated atomically from snapshot.
+  - `ADDED`: Extraneous file present. Non-destructively quarantined into `.coalition/recovery/quarantine-<timestamp>-<uuid>/` rather than deleted.
+- **Workflow Invariant**: Builder execution (`StartBuild`) is strictly blocked if contract drift is detected (`FROZEN_CONTRACT_DRIFT_DETECTED`).
+- **Human Authority Boundary**: Drift handling presents an informative "Architecture Change Required" notice, but does not transition into `ARCHITECTURE_CHANGE` during Stage 2.
+
+### Bounded Builder Implementation Packet
+
+The Builder Packet (`builder-packet.json`) is derived strictly from the frozen snapshot:
+- **Explicit Context Budget**: Capped at 200 KB (`BUILDER_PACKET_MAX_BYTES`).
+- **Self-Contained Instruction Context**: Contains system summary, core invariants, Builder rules, and truncated artifact entries if budget is exceeded with `is_truncated: true`.
+- **Zero API Dependency**: Available via UI inspection and IPC command `get_builder_packet` without external network calls.

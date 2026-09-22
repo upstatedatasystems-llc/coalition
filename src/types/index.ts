@@ -252,3 +252,101 @@ export interface WorkspaceState {
   readiness: ReadinessReport;
   history: RelayHistoryItem[];
 }
+
+// Stage 2B Architecture Freeze & Git Boundaries Types
+export interface FrozenGitBoundary {
+  head_commit: string;
+  branch: string | null;
+  is_detached: boolean;
+  is_clean: boolean;
+  staged_count: number;
+  unstaged_count: number;
+  untracked_count: number;
+  dirty_fingerprint: string;
+  porcelain_status: string;
+}
+
+export interface BuilderPacketSummary {
+  total_artifacts: number;
+  total_characters: number;
+  estimated_tokens: number;
+  is_truncated: boolean;
+}
+
+export interface FreezePreview {
+  preview_id: string;
+  project_id: string;
+  target_version: string;
+  readiness_policy_version: number;
+  ready_required_count: number;
+  total_required_count: number;
+  unresolved_open_questions_count: number;
+  artifact_baselines: Record<string, string>;
+  git_boundary: FrozenGitBoundary;
+  builder_packet_summary: BuilderPacketSummary;
+  created_at: string;
+}
+
+export interface BuilderPacketMetadata {
+  schema_version: number;
+  packet_id: string;
+  project_id: string;
+  project_name: string;
+  architecture_version: string;
+  builder_epoch_id: string;
+  created_at: string;
+  manifest_fingerprint: string;
+  git_head_commit: string;
+  git_branch: string | null;
+}
+
+export interface BuilderPacketArtifact {
+  path: string;
+  title: string;
+  content: string;
+  fingerprint: string;
+}
+
+export interface BuilderPacket {
+  metadata: BuilderPacketMetadata;
+  summary: string;
+  builder_rules: string;
+  artifacts: BuilderPacketArtifact[];
+  is_truncated: boolean;
+  prompt: string;
+}
+
+export interface FreezeResult {
+  project_id: string;
+  architecture_version: string;
+  epoch_id: string;
+  frozen_at: string;
+  manifest_fingerprint: string;
+  git_boundary: FrozenGitBoundary;
+  snapshot_path: string;
+  builder_packet: BuilderPacket;
+}
+
+export type DriftType = 'MODIFIED' | 'DELETED' | 'ADDED';
+
+export interface DriftedArtifact {
+  path: string;
+  drift_type: DriftType;
+  frozen_fingerprint: string | null;
+  active_fingerprint: string | null;
+}
+
+export interface DriftReport {
+  has_drift: boolean;
+  is_frozen: boolean;
+  architecture_version: string | null;
+  drifted_artifacts: DriftedArtifact[];
+  checked_at: string;
+}
+
+export interface DriftDiff {
+  path: string;
+  drift_type: DriftType;
+  frozen_content: string | null;
+  active_content: string | null;
+}

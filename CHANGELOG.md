@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added - Stage 2 (Architecture Freeze and Git Boundaries)
+- Explicit human-only architecture freeze: readiness-gated transition (`READY_TO_FREEZE` -> `FROZEN`) requiring all required contract artifacts to be substantively complete with zero machine bypass.
+- Authoritative `FreezePreview` preflight with exact SHA-256 baseline fingerprints for all active contract artifacts, Git HEAD boundary, dirty working tree status, and Builder packet summary.
+- Stale preview rejection: revalidates disk state upon human confirmation and rejects stale state with typed `STALE_FREEZE_PREVIEW`.
+- Multi-resource crash-safe freeze transaction: isolated staging in `.coalition/architecture-versions/.staging-v1.0-<uuid>/`, atomic directory promotion to `architecture-versions/v1.0/`, durable commit point updating `project.yaml` (`architecture_state: frozen`, `current_architecture_version: "1.0"`, `active_manifest_fingerprint: <sha256>`), and operational synchronization of `workflow_state`, `frozen_boundaries`, and `builder_epochs`.
+- Self-integrity verification: snapshot verified against `active_manifest_fingerprint` and manifest hashes before drift check or restore; corrupt snapshot yields typed `FROZEN_SNAPSHOT_CORRUPT`.
+- Non-destructive drift remediation: active files checked against `v1.0/contract/`; `MODIFIED` and `DELETED` restored atomically from frozen snapshot; `ADDED` extraneous files quarantined to `.coalition/recovery/quarantine-<timestamp>-<uuid>/`.
+- Builder workflow gate: `StartBuild` transition strictly blocked when contract drift is detected (`FROZEN_CONTRACT_DRIFT_DETECTED`).
+- Precise Git commit boundary: strictly requires a valid HEAD commit (`NO_HEAD_COMMIT` on unborn repos); captures commit hash, branch, clean/dirty state, and dirty status fingerprint into `frozen_boundaries`.
+- Bounded Builder implementation packet: derived strictly from frozen snapshot with 200 KB context budget, invariants, rules, and truncation flag (`is_truncated: true`).
+- Desktop UI controls: Freeze Architecture button gated by readiness, Freeze Confirmation Modal, Frozen status banner, Builder Packet viewer modal, and Drift Alert panel with Diff Inspector and Restore actions.
+- SQLite wipe rehydration: full operational state, frozen boundary, and builder epoch restored from durable `.coalition/project.yaml` and `contract-manifest.yaml`.
+
 ### Added - Stage 1 Final Durability and Identity Closure
 - Authoritative backup preservation on failed promotion: removed source deletion from low-level failed `MoveFileExW` destination-absent path so that authoritative recovery backups (`project.yaml.bak.*`) remain byte-for-byte intact if promotion fails.
 - Deferred stale-temp cleanup: artifact inspection remains strictly non-mutating through SQLite identity reconciliation, deferring stale temporary file cleanup until project open and layout validation are fully authorized and preventing identity conflicts from purging recovery evidence.

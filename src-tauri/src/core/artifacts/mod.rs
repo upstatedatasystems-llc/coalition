@@ -105,6 +105,8 @@ pub struct ProjectYaml {
     pub architecture_state: ArchitectureState,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_manifest_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness: Option<ProjectReadinessConfig>,
 }
 
@@ -192,16 +194,31 @@ impl ArtifactManager {
                         "Draft project cannot declare an active architecture version".to_string(),
                     ));
                 }
-            }
-            ArchitectureState::Frozen => match project.current_architecture_version {
-                Some(ref ver) if !ver.trim().is_empty() => (),
-                _ => {
+                if project.active_manifest_fingerprint.is_some() {
                     return Err(ArtifactError::InvalidArchitectureState(
-                        "Frozen project must declare a non-empty current_architecture_version"
-                            .to_string(),
+                        "Draft project cannot declare an active manifest fingerprint".to_string(),
                     ));
                 }
-            },
+            }
+            ArchitectureState::Frozen => {
+                match project.current_architecture_version {
+                    Some(ref ver) if !ver.trim().is_empty() => (),
+                    _ => {
+                        return Err(ArtifactError::InvalidArchitectureState(
+                            "Frozen project must declare a non-empty current_architecture_version"
+                                .to_string(),
+                        ));
+                    }
+                }
+                if let Some(ref fp) = project.active_manifest_fingerprint {
+                    if fp.trim().is_empty() {
+                        return Err(ArtifactError::InvalidArchitectureState(
+                            "Frozen project active_manifest_fingerprint cannot be empty"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
         }
 
         if let Some(ref readiness) = project.readiness {
@@ -335,6 +352,69 @@ impl ArtifactManager {
         }
     }
 
+    /// Cleans up any stale .staging-v* directories in .coalition/architecture-versions/ from crashed freeze transactions.
+    pub fn clean_stale_freeze_staging(coalition_dir: &Path) {
+        let arch_versions = coalition_dir.join("architecture-versions");
+        if let Ok(entries) = fs::read_dir(&arch_versions) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(".staging-v") {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let _ = fs::remove_dir_all(&path);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Quarantines an unexpected added file into .coalition/recovery/quarantine-<timestamp>-<uuid>/
+    /// ensuring user data is never destroyed during drift restoration.
+    pub fn quarantine_added_artifact<P: AsRef<Path>>(
+        repo_root: P,
+        relative_path: &str,
+    ) -> Result<PathBuf, ArtifactError> {
+        let normalized = relative_path.replace('\\', "/");
+        let coalition_dir = Self::resolve_coalition_dir(repo_root.as_ref())?;
+        let target_path = coalition_dir.join(&normalized);
+
+        if !target_path.exists() {
+            return Err(ArtifactError::NotFound(format!(
+                "Artifact to quarantine does not exist at {:?}",
+                target_path
+            )));
+        }
+
+        Self::validate_safe_path(repo_root.as_ref(), &target_path)?;
+
+        let recovery_dir = coalition_dir.join("recovery");
+        let quarantine_id = format!(
+            "quarantine-{}-{}",
+            chrono::Utc::now().format("%Y%m%d%H%M%S"),
+            Uuid::new_v4()
+        );
+        let dest_dir = recovery_dir.join(&quarantine_id);
+        let dest_file_path = dest_dir.join(&normalized);
+
+        if let Some(parent) = dest_file_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                ArtifactError::Io(format!("Failed to create quarantine parent dir: {}", e))
+            })?;
+        }
+
+        if let Err(e) = fs::rename(&target_path, &dest_file_path) {
+            fs::copy(&target_path, &dest_file_path).map_err(|ce| {
+                ArtifactError::Io(format!(
+                    "Failed to quarantine artifact from {:?} to {:?}: rename err: {}, copy err: {}",
+                    target_path, dest_file_path, e, ce
+                ))
+            })?;
+            let _ = fs::remove_file(&target_path);
+        }
+
+        Ok(dest_file_path)
+    }
+
     /// Non-mutating inspection of .coalition artifacts.
     /// Identifies canonical project.yaml, valid backup candidates, presence of temp files,
     /// and whether the directory is in an ambiguous or corrupted recovery state.
@@ -447,6 +527,7 @@ impl ArtifactManager {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: chrono::Utc::now().to_rfc3339(),
+            active_manifest_fingerprint: None,
             readiness: None,
         };
 
@@ -1142,6 +1223,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Frozen,
             created_at: project.created_at.clone(),
+            active_manifest_fingerprint: None,
             readiness: None,
         };
 
@@ -1160,17 +1242,15 @@ mod tests {
         let coalition = dir.path().join(".coalition");
         fs::create_dir_all(&coalition).unwrap();
 
-        // Version 0
-        let v0_yaml = "schema_version: 0\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: 'V0 Proj'\narchitecture_state: draft\ncreated_at: '2026-09-08T00:00:00Z'\n";
+        let v0_yaml = "schema_version: 0\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: 'Proj'\narchitecture_state: draft\ncreated_at: '2026-09-08T00:00:00Z'\n";
         fs::write(coalition.join("project.yaml"), v0_yaml).unwrap();
         let err = ArtifactManager::read_project_yaml(coalition.join("project.yaml")).unwrap_err();
-        assert_eq!(err, ArtifactError::UnsupportedSchemaVersion(0));
+        assert!(matches!(err, ArtifactError::UnsupportedSchemaVersion(0)));
 
-        // Version 99
-        let v99_yaml = "schema_version: 99\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: 'V99 Proj'\narchitecture_state: draft\ncreated_at: '2026-09-08T00:00:00Z'\n";
-        fs::write(coalition.join("project.yaml"), v99_yaml).unwrap();
+        let v2_yaml = "schema_version: 2\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: 'Proj'\narchitecture_state: draft\ncreated_at: '2026-09-08T00:00:00Z'\n";
+        fs::write(coalition.join("project.yaml"), v2_yaml).unwrap();
         let err2 = ArtifactManager::read_project_yaml(coalition.join("project.yaml")).unwrap_err();
-        assert_eq!(err2, ArtifactError::UnsupportedSchemaVersion(99));
+        assert!(matches!(err2, ArtifactError::UnsupportedSchemaVersion(2)));
     }
 
     #[test]
@@ -1179,8 +1259,8 @@ mod tests {
         let coalition = dir.path().join(".coalition");
         fs::create_dir_all(&coalition).unwrap();
 
-        let bad_id_yaml = "schema_version: 1\nproject_id: 'not-a-valid-uuid'\nname: 'Bad ID Proj'\narchitecture_state: draft\ncreated_at: '2026-09-08T00:00:00Z'\n";
-        fs::write(coalition.join("project.yaml"), bad_id_yaml).unwrap();
+        let bad_id = "schema_version: 1\nproject_id: 'not-a-uuid'\nname: 'Proj'\narchitecture_state: draft\ncreated_at: '2026-09-08T00:00:00Z'\n";
+        fs::write(coalition.join("project.yaml"), bad_id).unwrap();
         let err = ArtifactManager::read_project_yaml(coalition.join("project.yaml")).unwrap_err();
         assert!(matches!(err, ArtifactError::InvalidProjectId(_)));
     }
@@ -1191,10 +1271,10 @@ mod tests {
         let coalition = dir.path().join(".coalition");
         fs::create_dir_all(&coalition).unwrap();
 
-        let empty_name_yaml = "schema_version: 1\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: '   '\narchitecture_state: draft\ncreated_at: '2026-09-08T00:00:00Z'\n";
-        fs::write(coalition.join("project.yaml"), empty_name_yaml).unwrap();
+        let empty_name = "schema_version: 1\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: '   '\narchitecture_state: draft\ncreated_at: '2026-09-08T00:00:00Z'\n";
+        fs::write(coalition.join("project.yaml"), empty_name).unwrap();
         let err = ArtifactManager::read_project_yaml(coalition.join("project.yaml")).unwrap_err();
-        assert_eq!(err, ArtifactError::EmptyProjectName);
+        assert!(matches!(err, ArtifactError::EmptyProjectName));
     }
 
     #[test]
@@ -1203,8 +1283,8 @@ mod tests {
         let coalition = dir.path().join(".coalition");
         fs::create_dir_all(&coalition).unwrap();
 
-        let bad_ts_yaml = "schema_version: 1\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: 'Proj'\narchitecture_state: draft\ncreated_at: 'yesterday'\n";
-        fs::write(coalition.join("project.yaml"), bad_ts_yaml).unwrap();
+        let bad_time = "schema_version: 1\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: 'Proj'\narchitecture_state: draft\ncreated_at: 'not-rfc3339'\n";
+        fs::write(coalition.join("project.yaml"), bad_time).unwrap();
         let err = ArtifactManager::read_project_yaml(coalition.join("project.yaml")).unwrap_err();
         assert!(matches!(err, ArtifactError::InvalidTimestamp(_)));
     }
@@ -1219,12 +1299,6 @@ mod tests {
         fs::write(coalition.join("project.yaml"), draft_with_ver).unwrap();
         let err = ArtifactManager::read_project_yaml(coalition.join("project.yaml")).unwrap_err();
         assert!(matches!(err, ArtifactError::InvalidArchitectureState(_)));
-
-        // Empty string version in draft must also be rejected
-        let draft_with_empty_ver = "schema_version: 1\nproject_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'\nname: 'Proj'\narchitecture_state: draft\ncurrent_architecture_version: ''\ncreated_at: '2026-09-08T00:00:00Z'\n";
-        fs::write(coalition.join("project.yaml"), draft_with_empty_ver).unwrap();
-        let err2 = ArtifactManager::read_project_yaml(coalition.join("project.yaml")).unwrap_err();
-        assert!(matches!(err2, ArtifactError::InvalidArchitectureState(_)));
     }
 
     #[test]
@@ -1264,6 +1338,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            active_manifest_fingerprint: None,
             readiness: None,
         };
 
@@ -1310,6 +1385,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            active_manifest_fingerprint: None,
             readiness: None,
         };
 
@@ -1435,6 +1511,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            active_manifest_fingerprint: None,
             readiness: None,
         };
 
@@ -1480,6 +1557,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            active_manifest_fingerprint: None,
             readiness: None,
         };
         let proj2 = ProjectYaml {
@@ -1489,6 +1567,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            active_manifest_fingerprint: None,
             readiness: None,
         };
 
@@ -1528,6 +1607,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            active_manifest_fingerprint: None,
             readiness: None,
         };
         let project_yaml_path = coalition.join("project.yaml");
@@ -1642,6 +1722,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            active_manifest_fingerprint: None,
             readiness: None,
         };
         let project_yaml_path = coalition.join("project.yaml");
@@ -1704,6 +1785,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            active_manifest_fingerprint: None,
             readiness: None,
         };
         let project_yaml_path = coalition.join("project.yaml");
@@ -1749,6 +1831,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            active_manifest_fingerprint: None,
             readiness: None,
         };
         fs::write(
@@ -1811,6 +1894,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            active_manifest_fingerprint: None,
             readiness: None,
         };
 

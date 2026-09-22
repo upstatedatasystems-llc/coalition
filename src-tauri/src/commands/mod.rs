@@ -321,6 +321,41 @@ impl From<RelayError> for CommandError {
     }
 }
 
+impl From<crate::core::freeze::FreezeError> for CommandError {
+    fn from(e: crate::core::freeze::FreezeError) -> Self {
+        use crate::core::freeze::FreezeError;
+        match e {
+            FreezeError::ReadinessIncomplete(msg) => Self::new("READINESS_INCOMPLETE", msg),
+            FreezeError::IllegalWorkflowState { current } => Self::with_details(
+                "ILLEGAL_WORKFLOW_STATE",
+                format!("Illegal workflow state for freeze: {}", current),
+                serde_json::json!({ "current": current }),
+            ),
+            FreezeError::NoHeadCommit => Self::new(
+                "NO_HEAD_COMMIT",
+                "Repository has no valid HEAD commit (unborn repository). A valid Git commit boundary is required before freezing architecture",
+            ),
+            FreezeError::StaleFreezePreview(msg) => Self::new("STALE_FREEZE_PREVIEW", msg),
+            FreezeError::VersionAlreadyExists(v) => Self::with_details(
+                "ARCHITECTURE_VERSION_ALREADY_EXISTS",
+                format!("Architecture version '{}' already exists and is immutable", v),
+                serde_json::json!({ "version": v }),
+            ),
+            FreezeError::FrozenSnapshotCorrupt { version, reason } => Self::with_details(
+                "FROZEN_SNAPSHOT_CORRUPT",
+                format!("Frozen snapshot for version '{}' is corrupt: {}", version, reason),
+                serde_json::json!({ "version": version, "reason": reason }),
+            ),
+            FreezeError::FreezeRecoveryRequired(msg) => Self::new("FREEZE_RECOVERY_REQUIRED", msg),
+            FreezeError::Artifact(msg) => Self::new("ARTIFACT_ERROR", msg),
+            FreezeError::Git(msg) => Self::new("GIT_ERROR", msg),
+            FreezeError::Workflow(msg) => Self::new("WORKFLOW_ERROR", msg),
+            FreezeError::Database(msg) => Self::new("DATABASE_ERROR", msg),
+            FreezeError::Io(msg) => Self::new("IO_ERROR", msg),
+        }
+    }
+}
+
 impl From<String> for CommandError {
     fn from(msg: String) -> Self {
         Self::new("GENERAL_ERROR", msg)
@@ -492,6 +527,23 @@ pub async fn apply_workflow_action(
     action: WorkflowAction,
 ) -> Result<WorkflowStateRecord, CommandError> {
     let mut db = state.db.lock().await;
+
+    // Invariant: Builder execution cannot start if frozen architecture contract has drifted
+    if action == WorkflowAction::StartBuild {
+        if let Ok(repo_path) = get_repo_path_for_project_sync(&db, &project_id) {
+            let drift =
+                crate::core::freeze::FreezeService::check_contract_drift(&repo_path, &project_id)
+                    .map_err(CommandError::from)?;
+            if drift.has_drift {
+                return Err(CommandError::with_details(
+                    "FROZEN_CONTRACT_DRIFT_DETECTED",
+                    "Cannot start build: architecture contract has drifted from frozen snapshot. Restore artifacts or complete governed architecture change first.",
+                    serde_json::to_value(&drift).unwrap_or_default(),
+                ));
+            }
+        }
+    }
+
     workflow::apply_workflow_action(db.connection_mut(), &project_id, action, "HUMAN")
         .map_err(CommandError::from)
 }
@@ -957,4 +1009,113 @@ pub async fn set_project_artifact_applicability(
         applicability,
     )
     .map_err(CommandError::from)
+}
+
+// ----------------------------------------------------------------------------
+// Stage 2B Architecture Freeze & Git Boundaries Commands
+// ----------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn prepare_architecture_freeze(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<crate::core::freeze::FreezePreview, CommandError> {
+    let db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+
+    let mut git_lock = state.git.lock().await;
+    if git_lock.is_none() {
+        *git_lock = Some(GitAdapter::new().map_err(CommandError::from)?);
+    }
+    let git = git_lock.as_ref().unwrap();
+
+    crate::core::freeze::FreezeService::prepare_freeze_preview(&repo_path, &project_id, git)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn confirm_architecture_freeze(
+    state: State<'_, AppState>,
+    project_id: String,
+    preview: crate::core::freeze::FreezePreview,
+) -> Result<crate::core::freeze::FreezeResult, CommandError> {
+    let mut db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+
+    let mut git_lock = state.git.lock().await;
+    if git_lock.is_none() {
+        *git_lock = Some(GitAdapter::new().map_err(CommandError::from)?);
+    }
+    let git = git_lock.as_ref().unwrap();
+
+    crate::core::freeze::FreezeService::confirm_freeze(
+        &repo_path,
+        &project_id,
+        &preview,
+        git,
+        db.connection_mut(),
+    )
+    .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_contract_drift(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<crate::core::freeze::DriftReport, CommandError> {
+    let db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    crate::core::freeze::FreezeService::check_contract_drift(&repo_path, &project_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_drift_diff(
+    state: State<'_, AppState>,
+    project_id: String,
+    artifact_path: String,
+) -> Result<crate::core::freeze::DriftDiff, CommandError> {
+    let db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    crate::core::freeze::FreezeService::get_drift_diff(&repo_path, &artifact_path)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn restore_drifted_artifact(
+    state: State<'_, AppState>,
+    project_id: String,
+    artifact_path: String,
+) -> Result<crate::core::freeze::DriftReport, CommandError> {
+    let db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    crate::core::freeze::FreezeService::restore_drifted_artifact(
+        &repo_path,
+        &project_id,
+        &artifact_path,
+    )
+    .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn restore_all_drifted_artifacts(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<crate::core::freeze::DriftReport, CommandError> {
+    let db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    crate::core::freeze::FreezeService::restore_all_drifted_artifacts(&repo_path, &project_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_builder_packet(
+    state: State<'_, AppState>,
+    project_id: String,
+    version: Option<String>,
+) -> Result<crate::core::freeze::BuilderPacket, CommandError> {
+    let db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    crate::core::freeze::FreezeService::get_builder_packet(&repo_path, version.as_deref())
+        .map_err(CommandError::from)
 }

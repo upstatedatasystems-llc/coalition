@@ -88,3 +88,21 @@ Authored and enforced authoritatively in Rust across 19 explicit states:
   - Coalition flushes replacement data before invoking the native replacement primitive. On Windows it uses `ReplaceFileW` with a same-directory backup, reconciles documented failure states, and never authorizes recovery candidate promotion until project identity has been validated.
 - **Non-Mutating Inspection & Identity-Before-Promotion**: On project inspection (`inspect_project_artifacts`), valid canonical `project.yaml` takes precedence and stale temp files are cleaned. If canonical `project.yaml` is missing, recovery candidates (`project.yaml.bak.*`) are inspected in a strictly non-mutating manner and are never promoted until `ProjectService` validates project identity against SQLite registration history. Conflicting identities, ambiguous/multiple backups, or orphaned temp files return typed errors (`PROJECT_IDENTITY_CONFLICT`, `ARTIFACT_RECOVERY_REQUIRED`) with zero durable mutations.
 - **Hierarchy & Layout Validation**: All standard `.coalition/` subdirectories (`design`, `implementation`, `decisions`, `architecture-versions`, `changes`, `reviews`, `evidence`) and `project.yaml` are validated against path traversal (`..`) and Windows junction / symlink reparse points escaping the repository root.
+
+## 8. Architecture Freeze, Git Boundaries & Builder Packet Generation
+
+- **Human-Governed Architecture Freeze**: Architecture freeze is gated by substantive completeness across all required contract artifacts (`READY_TO_FREEZE`) and requires explicit human confirmation. AI agents cannot self-authorize a freeze.
+- **Preflight Freeze Preview & Stale Rejection**: Preflight inspects live disk artifacts and Git working tree. The preview records SHA-256 baselines and Git HEAD/dirty fingerprints. Confirmation strictly revalidates disk state; any external modification or commit change rejects freeze with typed `STALE_FREEZE_PREVIEW`.
+- **Git Commit Boundary**: A valid Git HEAD commit is strictly required. Unborn repositories (0 commits) fail with `NO_HEAD_COMMIT`. The boundary records commit hash, branch name, clean/dirty state, and status fingerprint into `frozen_boundaries`.
+- **Multi-Resource Freeze Transaction**:
+  1. Staged into `.coalition/architecture-versions/.staging-v1.0-<uuid>/contract/` alongside `contract-manifest.yaml` and `builder-packet.json`.
+  2. Atomically promoted to `.coalition/architecture-versions/v1.0/`.
+  3. Durable commit point via atomic `project.yaml` update (`architecture_state: frozen`, `current_architecture_version: "1.0"`, `active_manifest_fingerprint: <sha256>`).
+  4. Operational SQLite update in a single transaction (`workflow_state`, `frozen_boundaries`, `builder_epochs`).
+- **Snapshot Self-Integrity & Drift Remediation**:
+  - Snapshots are verified against `active_manifest_fingerprint` and manifest hashes. Corrupt snapshots fail closed with `FROZEN_SNAPSHOT_CORRUPT`.
+  - Continuous drift detection flags active contract modifications (`MODIFIED`), deletions (`DELETED`), or additions (`ADDED`).
+  - Restoring drifts replaces modified/deleted files atomically from the frozen snapshot. Added extraneous files are quarantined into `.coalition/recovery/quarantine-<timestamp>-<uuid>/` rather than deleted.
+  - Builder start (`StartBuild`) is strictly blocked if contract drift is detected (`FROZEN_CONTRACT_DRIFT_DETECTED`).
+- **Bounded Builder Implementation Packet**: Generated strictly from the frozen snapshot under a 200 KB context budget (`BUILDER_PACKET_MAX_BYTES`), embedding system summary, human rules, invariants, and truncated artifacts (`is_truncated: true`) if the budget is exceeded. Available to the Builder without network API dependencies.
+

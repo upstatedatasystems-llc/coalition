@@ -2,15 +2,15 @@
 
 **Status:** Implementation-ready master plan  
 **Product:** Coalition  
-**Plan Version:** 1.1  
+**Plan Version:** 1.3  
 **Design Baseline:** Coalition Product & Technical Design Draft v0.2  
-**Date:** September 8, 2026  
+**Date:** September 22, 2026  
 **Target Repository:** `upstatedatasystems-llc/coalition`  
 **Repository Visibility:** Public  
 **Primary Implementation Environment:** Windows 10/11  
 **Post-V1 Target:** macOS (V1.1)  
 **Future Target:** Linux
-**Roadmap Model:** Five V1 product stages with bounded internal implementation checkpoints  
+**Roadmap Model:** Five V1 product stages; one human-issued implementation assignment per stage, with internal verification/commit checkpoints  
 
 ---
 
@@ -20,7 +20,7 @@ This document is the master implementation plan for Coalition V1.
 
 It is intended to be handed directly to Google Antigravity as the authoritative implementation package for the initial public repository.
 
-**Roadmap revision in Plan v1.1:** the original Phase 0–10 implementation sequence has been consolidated into five human-facing V1 product stages. The original technical sequencing is preserved as bounded A/B/C checkpoints inside those stages so Antigravity can continue to work in small, testable, recoverable increments. macOS is no longer counted as part of the Windows V1 completion path; it is a post-V1 V1.1 platform-expansion stage.
+**Roadmap revision in Plan v1.3:** Coalition V1 remains organized into five human-facing product stages. Each numbered stage is one human-issued Antigravity implementation assignment. The smaller technical units inside a stage remain mandatory internal checkpoints for scope control, testing, documentation, validation, and recoverable commits, but they are not separate phases and must not require a new human prompt between them. Plan v1.3 also synchronizes the roadmap with the current repository baseline: Stage 1 is complete; the Stage 2 ChatGPT Relay and Architecture Workspace internal checkpoint is complete; the remaining Stage 2 work is Architecture Freeze and Git Boundaries. Antigravity should resume from that remaining Stage 2 checkpoint and continue until the complete Stage 2 exit criteria pass, unless an Architecture Concern, unsupported external-interface contradiction, blocking failure, or explicit human-authority decision requires intervention. macOS remains outside the Windows V1 completion path as the post-V1 V1.1 platform-expansion stage.
 
 The Coalition v0.2 design remains the product and architecture reference. Where this master plan adds detail or changes decisions made after v0.2, **this master plan takes precedence**.
 
@@ -920,7 +920,7 @@ Strong deny candidates:
 
 ## 14.5 Headless Antigravity Integration Spike
 
-Stage 1A — Technical Proofs must determine the cleanest supported mechanism for applying Coalition decisions to project-scoped Antigravity permissions in headless mode.
+The Stage 1 technical-proof checkpoint must determine the cleanest supported mechanism for applying Coalition decisions to project-scoped Antigravity permissions in headless mode.
 
 Do not make final architecture depend on unsafe global configuration mutation.
 
@@ -1559,82 +1559,97 @@ macOS CI is added during the post-V1 V1.1 macOS support stage.
 
 ---
 
----
-
 # 28. Revised V1 Development Roadmap
 
 Coalition V1 is organized into **five product stages**.
 
-The stages are the human-facing roadmap.
+Each numbered stage is a **single human-issued implementation assignment**.
 
-Within each stage, Antigravity must still execute the smaller checkpoints in order, verify each checkpoint, update documentation, and commit a recoverable boundary before continuing.
+Inside a stage, Antigravity must still work in bounded internal checkpoints. Those checkpoints exist to keep implementation small, testable, reviewable, and recoverable. They require their own focused tests, documentation updates, validation, and Git boundaries, but they do **not** require the human to issue a new implementation prompt between checkpoints.
 
-The consolidation is:
+The roadmap is:
 
 ```text
 Stage 1 — Foundation
-  ├── Stage 1A — Repository Bootstrap and Technical Proofs
-  │              (former Phase 0)
-  └── Stage 1B — Coalition Core and Project Persistence
-                 (former Phase 1)
+  Internal checkpoint: Repository Bootstrap and Technical Proofs
+  Internal checkpoint: Coalition Core and Project Persistence
 
 Stage 2 — Architecture Contract
-  ├── Stage 2A — ChatGPT Relay and Architecture Workspace
-  │              (former Phase 2)
-  └── Stage 2B — Architecture Freeze and Git Boundaries
-                 (former Phase 3)
+  Internal checkpoint: ChatGPT Relay and Architecture Workspace
+  Internal checkpoint: Architecture Freeze and Git Boundaries
 
 Stage 3 — Builder Control Plane
-  ├── Stage 3A — Antigravity Builder Integration
-  │              (former Phase 4)
-  ├── Stage 3B — Permissions and Icarus
-  │              (former Phase 5)
-  └── Stage 3C — Usage and Capacity
-                 (former Phase 6)
+  Internal checkpoint: Antigravity Builder Integration
+  Internal checkpoint: Permissions and Icarus
+  Internal checkpoint: Usage and Capacity
 
 Stage 4 — Governed Development Loop
-  ├── Stage 4A — Validation Engine
-  │              (former Phase 7)
-  └── Stage 4B — Reviewer and Correction Loop
-                 (former Phase 8)
+  Internal checkpoint: Validation Engine
+  Internal checkpoint: Reviewer and Correction Loop
 
 Stage 5 — V1 Completion and Windows Release
-  ├── Stage 5A — Human-Only Architecture Change
-  │              (former Phase 9)
-  └── Stage 5B — Recovery, Product UX, and Windows Packaging
-                 (former Phase 10)
+  Internal checkpoint: Human-Only Architecture Change
+  Internal checkpoint: Recovery, Product UX, and Windows Packaging
 
 Post-V1 / V1.1
-  └── macOS Platform Support
-      (former Phase 11)
+  macOS Platform Support
 ```
 
-The consolidation changes roadmap presentation, not product requirements.
+The internal checkpoint sequence preserves the technical ordering from the earlier Phase 0–10 roadmap, but the checkpoint labels are not product phases and are not separate human handoff points.
 
 A stage is complete only when all of its internal checkpoints and stage-level acceptance criteria have been verified.
 
-## 28.1 Current Implementation Status at Plan v1.1
+## 28.1 Stage Execution Contract
+
+For each numbered stage, the human gives Antigravity **one stage assignment**.
+
+Antigravity then:
+
+1. inspects the current accepted baseline;
+2. executes the first internal checkpoint only;
+3. tests, documents, validates, and commits a recoverable boundary;
+4. verifies that checkpoint's acceptance criteria;
+5. proceeds automatically to the next internal checkpoint in the same stage assignment;
+6. repeats until every checkpoint and the complete stage journey pass;
+7. returns one stage completion report for human review.
+
+Antigravity must stop early and return to the human only when:
+
+- an Architecture Concern is found;
+- a supported third-party interface contradicts the authoritative plan;
+- a blocker prevents safe continuation;
+- continuing would require changing product architecture or scope;
+- a human-only authority decision is required by the product design.
+
+Ordinary checkpoint completion, test success, documentation updates, and recoverable commits are **not** reasons to ask the human for another implementation prompt.
+
+## 28.2 Current Implementation Status at Plan v1.3
 
 At the time of this roadmap revision:
 
 ```text
 Stage 1 — Foundation                         COMPLETE
-Stage 2 — Architecture Contract              NEXT
+Stage 2 — Architecture Contract              IN PROGRESS
+  Relay + Architecture Workspace             COMPLETE
+  Architecture Freeze + Git Boundaries       NEXT
 Stage 3 — Builder Control Plane              NOT STARTED
 Stage 4 — Governed Development Loop          NOT STARTED
 Stage 5 — V1 Completion and Windows Release  NOT STARTED
 V1.1 — macOS Platform Support                POST-V1
 ```
 
-Stage 1 has established the authoritative project foundation, including the Phase 0 technical proofs and Phase 1 project/persistence work.
+The current repository baseline includes the completed Stage 1 foundation and the completed Stage 2 ChatGPT Relay and Architecture Workspace work, including governed architecture editing, per-project readiness applicability, strict relay envelopes, crash-safe batch import recovery, stale-preview protection, relay lifecycle/idempotency, authoritative readiness transitions, and global relay/import shortcuts.
 
-Future implementation sessions should begin from Stage 2A, not repeat Stage 1 technical spikes unless a regression or external-tool change requires targeted revalidation.
+There is no Architecture Freeze implementation in the current baseline. The next implementation work is therefore the remaining Stage 2 internal checkpoint: **Architecture Freeze and Git Boundaries**.
+
+This remains part of the existing Stage 2 assignment. Do not create or require a separately prompted “Stage 2B” phase.
+
+Future stages must follow the one-assignment-per-stage execution contract above.
 
 ---
-
 # 29. Stage 1 — Foundation
 
-**Status at Plan v1.1:** COMPLETE
+**Status at Plan v1.2:** COMPLETE
 
 **Product goal:** Establish the trustworthy local control-plane foundation on which every governed Coalition workflow depends.
 
@@ -1660,7 +1675,7 @@ Close/reopen Coalition
 Recover project identity and operational state
 ```
 
-## 29.1 Stage 1A — Repository Bootstrap and Technical Proofs
+## 29.1 Internal Checkpoint — Repository Bootstrap and Technical Proofs
 
 **Formerly:** Phase 0
 
@@ -1721,7 +1736,7 @@ Verify:
 - restart process with model B;
 - resume conversation safely.
 
-### Stage 1A acceptance
+### Internal checkpoint acceptance — Repository Bootstrap and Technical Proofs
 
 - clean build;
 - Tauri window launches;
@@ -1732,7 +1747,7 @@ Verify:
 - cancellation works;
 - Phase 0 diagnostics do not depend on consuming AI quota in CI.
 
-## 29.2 Stage 1B — Coalition Core and Project Persistence
+## 29.2 Internal Checkpoint — Coalition Core and Project Persistence
 
 **Formerly:** Phase 1
 
@@ -1767,7 +1782,7 @@ SQLite
 = what Coalition is DOING
 ```
 
-Stage 1B must ensure:
+The project-persistence internal checkpoint must ensure:
 
 - `project.yaml` is portable and contains no local machine path;
 - project IDs are stable UUID v4 values;
@@ -1836,7 +1851,9 @@ Stage 2 must not start Antigravity implementation automatically merely because t
 
 The human freeze action remains the authority boundary.
 
-## 30.1 Stage 2A — ChatGPT Relay and Architecture Workspace
+## 30.1 Internal Checkpoint — ChatGPT Relay and Architecture Workspace
+
+**Current status at Plan v1.3:** COMPLETE in the current repository baseline.
 
 **Formerly:** Phase 2
 
@@ -1872,7 +1889,7 @@ REVIEW_VERDICT
 ARCHITECTURE_CONCERN_ANALYSIS
 ```
 
-Stage 2A should initially exercise the Architect types; later relay types may exist in schema/code without prematurely building Stage 4/5 workflows.
+The relay/workspace internal checkpoint should initially exercise the Architect types; later relay types may exist in schema/code without prematurely building Stage 4/5 workflows.
 
 ### Architect artifact workspace
 
@@ -1901,7 +1918,7 @@ Imported ChatGPT content is untrusted until parsed and confirmed.
 
 It must never execute local commands.
 
-### Stage 2A acceptance
+### Internal checkpoint acceptance — ChatGPT Relay and Architecture Workspace
 
 - user can take a real project through at least one Architect relay round trip;
 - user explicitly initiates clipboard export/import;
@@ -1914,9 +1931,11 @@ It must never execute local commands.
 - imported AI text cannot directly invoke shell/process behavior;
 - readiness state is derived by Rust/core rules rather than arbitrary UI state.
 
-**Checkpoint rule:** When Stage 2A acceptance passes, update docs, run full validation, and commit a recoverable boundary before beginning Stage 2B.
+**Internal checkpoint rule:** When this checkpoint passes, update docs, run full validation, and commit a recoverable boundary. Then continue directly to Architecture Freeze and Git Boundaries within the same Stage 2 assignment unless an Architecture Concern or blocking failure requires human intervention.
 
-## 30.2 Stage 2B — Architecture Freeze and Git Boundaries
+## 30.2 Internal Checkpoint — Architecture Freeze and Git Boundaries
+
+**Current status at Plan v1.3:** NEXT.
 
 **Formerly:** Phase 3
 
@@ -1951,7 +1970,7 @@ Do not automatically mutate architecture because Git or source implementation di
 
 Do not silently overwrite prior architecture versions.
 
-### Stage 2B acceptance
+### Internal checkpoint acceptance — Architecture Freeze and Git Boundaries
 
 - only explicit human action can freeze;
 - architecture readiness alone does not freeze;
@@ -1981,7 +2000,7 @@ project
 
 Run the full Coalition validation suite and perform a manual Stage 2 desktop smoke test before declaring this stage complete.
 
-Do not begin Stage 3 until Stage 2A and Stage 2B are separately verified and the complete Stage 2 journey is human-reviewed.
+Do not begin Stage 3 until both Stage 2 internal checkpoints are verified and the complete Stage 2 journey is human-reviewed.
 
 ---
 
@@ -1991,7 +2010,7 @@ Do not begin Stage 3 until Stage 2A and Stage 2B are separately verified and the
 
 This stage combines Builder execution, human-facing permissions, Icarus mode, and usage/capacity awareness.
 
-## 31.1 Stage 3A — Antigravity Builder Integration
+## 31.1 Internal Checkpoint — Antigravity Builder Integration
 
 **Formerly:** Phase 4
 
@@ -2025,15 +2044,15 @@ Acceptance:
 - restart does not falsely report a dead Builder as running;
 - each architecture re-freeze creates a new Builder epoch.
 
-**Checkpoint rule:** Verify and commit Stage 3A before Stage 3B.
+**Internal checkpoint rule:** Verify and commit this checkpoint, then continue directly to Permissions and Icarus within the same Stage 3 assignment unless a stopping condition from Section 28.1 applies.
 
-## 31.2 Stage 3B — Permissions and Icarus
+## 31.2 Internal Checkpoint — Permissions and Icarus
 
 **Formerly:** Phase 5
 
 **Goal:** Make autonomous Builder operation safe and usable.
 
-Implement based on the documented Stage 1A permission findings:
+Implement based on the documented Stage 1 technical-proof permission findings:
 
 - permission policy evaluator;
 - routine project-safe auto-allow patterns;
@@ -2062,9 +2081,9 @@ Acceptance:
 - all permission decisions are logged;
 - no undocumented global Antigravity permission mutation is used.
 
-**Checkpoint rule:** Verify and commit Stage 3B before Stage 3C.
+**Internal checkpoint rule:** Verify and commit this checkpoint, then continue directly to Usage and Capacity within the same Stage 3 assignment unless a stopping condition from Section 28.1 applies.
 
-## 31.3 Stage 3C — Usage and Capacity
+## 31.3 Internal Checkpoint — Usage and Capacity
 
 **Formerly:** Phase 6
 
@@ -2125,7 +2144,7 @@ Normal public CI must continue using fake `agy` and must not consume subscriptio
 
 **Product goal:** Prove Coalition's central thesis end to end: implementation is checked by deterministic evidence and independently challenged by ChatGPT Reviewer, with accepted corrections routed back to Antigravity.
 
-## 32.1 Stage 4A — Validation Engine
+## 32.1 Internal Checkpoint — Validation Engine
 
 **Formerly:** Phase 7
 
@@ -2167,9 +2186,9 @@ Acceptance:
 - bounded diagnostics can be routed to Builder;
 - arbitrary ChatGPT-imported commands do not become validation commands.
 
-**Checkpoint rule:** Verify and commit Stage 4A before Stage 4B.
+**Internal checkpoint rule:** Verify and commit this checkpoint, then continue directly to Reviewer and Correction Loop within the same Stage 4 assignment unless a stopping condition from Section 28.1 applies.
 
-## 32.2 Stage 4B — Reviewer and Correction Loop
+## 32.2 Internal Checkpoint — Reviewer and Correction Loop
 
 **Formerly:** Phase 8
 
@@ -2207,7 +2226,7 @@ Reviewer output must never be passed raw to Antigravity as executable instructio
 
 Coalition must normalize accepted findings into its own correction protocol.
 
-### Stage 4B acceptance
+### Internal checkpoint acceptance — Reviewer and Correction Loop
 
 At minimum prove an intentional-defect scenario:
 
@@ -2255,7 +2274,7 @@ Do not declare V1 finished at Stage 4; human-only Architecture Change and Window
 
 **Product goal:** Add the human-only architecture revision cycle, harden interruption/recovery and UX, and produce a usable Windows V1 release candidate.
 
-## 33.1 Stage 5A — Human-Only Architecture Change
+## 33.1 Internal Checkpoint — Human-Only Architecture Change
 
 **Formerly:** Phase 9
 
@@ -2291,9 +2310,9 @@ Acceptance:
 - re-freeze creates a new Builder epoch;
 - stale prior Builder process cannot continue writing unnoticed.
 
-**Checkpoint rule:** Verify and commit Stage 5A before Stage 5B.
+**Internal checkpoint rule:** Verify and commit this checkpoint, then continue directly to Recovery, Product UX, and Windows Packaging within the same Stage 5 assignment unless a stopping condition from Section 28.1 applies.
 
-## 33.2 Stage 5B — Recovery, Product UX, and Windows Packaging
+## 33.2 Internal Checkpoint — Recovery, Product UX, and Windows Packaging
 
 **Formerly:** Phase 10
 
@@ -2484,33 +2503,43 @@ macOS is not a V1 non-goal; it is the planned V1.1 platform-expansion target aft
 
 When implementing this plan:
 
-1. Work **stage by stage** and **checkpoint by checkpoint**.
-2. Do not execute an entire multi-checkpoint stage as one unbounded autonomous run.
-3. Do not implement later-stage abstractions prematurely.
-4. At each A/B/C checkpoint:
+1. Work **stage by stage**.
+2. Each numbered stage receives **one human-issued implementation assignment**.
+3. Internal checkpoints are mandatory execution boundaries, not separate phases or separate prompt handoffs.
+4. Within a stage, execute internal checkpoints in the documented order.
+5. At each internal checkpoint:
    - inspect the current baseline;
    - verify a clean or deliberately understood working tree;
-   - add/adjust tests;
-   - implement only the checkpoint scope;
+   - add/adjust focused tests;
+   - implement only that checkpoint's scope;
    - update relevant documentation;
    - run affected validation;
-   - run the full validation suite before checkpoint closure;
-   - produce a concise completion report;
-   - commit a recoverable boundary.
-5. A checkpoint is not complete because code exists; verify its acceptance criteria.
-6. A product stage is not complete until every internal checkpoint and the stage-level journey have been verified.
-7. Human review should occur at the end of each product stage and may also occur between checkpoints where risk warrants it.
-8. Do not silently remove requirements that prove difficult.
-9. Do not introduce a new framework/runtime unless required by the authoritative design.
-10. Prefer supported third-party interfaces over UI automation.
-11. When external documentation contradicts this plan, stop the affected integration and report an Architecture Concern.
-12. Preserve cross-platform seams even while developing Windows first.
-13. Keep the public repository free of private data and credentials.
-14. Real Antigravity smoke tests remain opt-in/manual; public CI must use fake fixtures and consume no subscription quota.
-15. Do not begin the next product stage until the prior stage's validation and human review are complete.
+   - run the full validation suite before checkpoint closure where required by the stage;
+   - verify the checkpoint acceptance criteria;
+   - commit a recoverable boundary;
+   - record the checkpoint result in the eventual stage completion report.
+6. After a checkpoint passes, continue automatically to the next checkpoint **without requiring another human implementation prompt**.
+7. Stop before the next checkpoint only if:
+   - an Architecture Concern is discovered;
+   - a supported external interface contradicts the plan;
+   - a blocking failure prevents safe continuation;
+   - continuing would require architecture/scope change;
+   - an explicit human-only authority decision is required.
+8. A checkpoint is not complete because code exists; verify its acceptance criteria.
+9. A product stage is not complete until every internal checkpoint and the stage-level journey have been verified.
+10. Human implementation review occurs at the end of the product stage by default, not between ordinary internal checkpoints.
+11. Human review may still occur mid-stage when Antigravity stops for one of the explicit conditions in rule 7.
+12. Do not silently remove requirements that prove difficult.
+13. Do not introduce a new framework/runtime unless required by the authoritative design.
+14. Prefer supported third-party interfaces over UI automation.
+15. Preserve cross-platform seams even while developing Windows first.
+16. Keep the public repository free of private data and credentials.
+17. Real Antigravity smoke tests remain opt-in/manual; public CI must use fake fixtures and consume no subscription quota.
+18. Do not begin the next numbered product stage until the prior stage's full validation and human review are complete.
+
+This structure intentionally minimizes orchestration overhead while retaining small, recoverable engineering boundaries inside each stage.
 
 ---
-
 # 38. Coalition Self-Validation Baseline
 
 Coalition's own project validation should remain approximately:
@@ -2564,7 +2593,7 @@ commands:
     timeout_seconds: 1200
 ```
 
-Packaging builds may remain a separate/manual release check until Stage 5B if they materially slow every development cycle.
+Packaging builds may remain a separate/manual release check until the Stage 5 packaging internal checkpoint if they materially slow every development cycle.
 
 Add a Windows Tauri package smoke build in CI when packaging work begins.
 
@@ -2572,40 +2601,55 @@ V1.1 adds macOS CI once macOS implementation begins.
 
 ---
 
-# 39. Next Antigravity Assignment — Stage 2A
+# 39. Current and Next Antigravity Assignment — Stage 2
 
 Stage 1 is complete.
 
-The next bounded implementation session should execute **Stage 2A — ChatGPT Relay and Architecture Workspace only**.
+Stage 2 — Architecture Contract is in progress.
 
-Do not ask Antigravity to implement all of Stage 2 in one autonomous run.
+The first internal checkpoint, **ChatGPT Relay and Architecture Workspace**, is complete in the current repository baseline.
 
-Initial Stage 2A assignment should be grounded in the requirements of Section 30.1 and should:
+The next and only remaining Stage 2 implementation work is **Architecture Freeze and Git Boundaries**.
 
-- inspect the current Stage 1 baseline;
-- preserve the Stage 1 durable/operational authority model;
-- implement versioned Architect relay packets;
-- implement explicit outbound clipboard copy;
-- implement explicit inbound clipboard import;
-- implement ChatGPT opener behavior;
-- parse structured Architect results with safe fallback;
-- persist relay history;
-- preview imported changes before project mutation;
-- establish the architecture artifact workspace;
-- implement required-artifact/readiness evaluation;
-- add relay/import hotkeys;
-- maintain no-passive-clipboard-surveillance and no-ChatGPT-scraping boundaries;
+Before resuming implementation, ensure the repository root contains this Plan v1.3 as the authoritative master plan and remove or clearly archive superseded master-plan copies so Antigravity cannot mistake v1.0/v1.1 for current instructions.
+
+Resume from the current code. Do not reopen completed Stage 1 or relay/workspace work except to fix a regression discovered by the remaining Stage 2 implementation.
+
+The remaining Stage 2 work must be grounded in Section 30 and must:
+
+- preserve the completed relay/workspace architecture and its recovery/security invariants;
+- use the authoritative Rust-owned readiness rules as the prerequisite for freeze;
+- implement explicit human-only architecture freeze;
+- create versioned immutable architecture snapshots;
+- update `project.yaml` consistently and crash-safely;
+- record the Git/contract boundary;
+- detect frozen-contract drift;
+- provide inspect/restore/safe-escalation handling for drift without prematurely implementing the later Architecture Change workflow;
+- generate the bounded Builder packet required for Stage 3;
 - add focused Rust/frontend/integration tests;
 - update documentation;
 - run the full Coalition validation suite;
-- commit a recoverable Stage 2A boundary.
+- perform the complete Stage 2 desktop smoke journey;
+- commit recoverable boundaries;
+- return one complete **Stage 2 completion report** for human review.
 
-The assignment must end before Stage 2B.
+The Stage 2 assignment ends only after the complete journey works:
 
-After Stage 2A is human-reviewed and accepted, issue a separate Stage 2B implementation assignment for Architecture Freeze and Git Boundaries.
+```text
+project
+→ Architect relay
+→ imported structured design
+→ governed architecture workspace
+→ readiness
+→ explicit human freeze
+→ Architecture v1.0
+→ frozen Git/contract boundary
+→ Builder packet
+```
+
+Do not begin Stage 3 automatically. After Stage 2 is human-reviewed and accepted, issue one **Stage 3 — Builder Control Plane** assignment. Stage 3 will internally execute Builder Integration, Permissions and Icarus, and Usage and Capacity without separate human-issued A/B/C prompts.
 
 ---
-
 # 40. Master Product Principle
 
 Coalition is successful when it becomes difficult for an AI implementation to drift silently away from what the human actually approved.

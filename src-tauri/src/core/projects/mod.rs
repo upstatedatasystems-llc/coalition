@@ -100,6 +100,21 @@ impl From<rusqlite::Error> for ProjectError {
     }
 }
 
+impl From<crate::core::freeze::FreezeError> for ProjectError {
+    fn from(e: crate::core::freeze::FreezeError) -> Self {
+        match e {
+            crate::core::freeze::FreezeError::Artifact(msg) => Self::Artifact(msg),
+            crate::core::freeze::FreezeError::Git(msg) => Self::Git(msg),
+            crate::core::freeze::FreezeError::Workflow(msg) => Self::Workflow(msg),
+            crate::core::freeze::FreezeError::Database(msg) => Self::Database(msg),
+            crate::core::freeze::FreezeError::FreezeRecoveryRequired(msg) => {
+                Self::RecoveryRequired(msg)
+            }
+            other => Self::CorruptedState(other.to_string()),
+        }
+    }
+}
+
 pub struct ProjectService;
 
 impl ProjectService {
@@ -451,7 +466,14 @@ impl ProjectService {
         // Commit transaction
         tx.commit()?;
 
-        // 6. Query live Git state
+        // 8. Clean stale freeze staging directories and reconcile freeze state / SQLite boundaries if needed
+        crate::core::freeze::FreezeService::reconcile_freeze_state(
+            &repo_root,
+            &project_record.project_id,
+            conn,
+        )?;
+
+        // 9. Query live Git state
         let git_info = git.inspect_repo(&repo_root).ok();
 
         Ok(ProjectDetails {
@@ -743,23 +765,91 @@ mod tests {
         let repo_dir = tempdir().unwrap();
         init_test_git_repo(repo_dir.path());
 
-        // Create .coalition with architecture_state: frozen and non-empty version
-        let (mut proj_yaml, _) =
-            ArtifactManager::initialize_or_load_project(repo_dir.path(), "frozen-proj").unwrap();
-        proj_yaml.architecture_state = ArchitectureState::Frozen;
-        proj_yaml.current_architecture_version = Some("1.0".to_string());
-        ArtifactManager::write_project_yaml_atomic(
-            repo_dir.path().join(".coalition").join("project.yaml"),
-            &proj_yaml,
+        let project =
+            ArtifactManager::initialize_new_project(repo_dir.path(), "frozen-proj").unwrap();
+        let pid = project.project_id;
+
+        // Populate valid substantive architecture artifacts
+        let files = [
+            (
+                "design/product-vision.md",
+                "# Product Vision\n\nSubstantive product vision content for test project.",
+            ),
+            (
+                "design/requirements.md",
+                "# Requirements\n\nSubstantive requirements content for test project.",
+            ),
+            (
+                "design/architecture.md",
+                "# Architecture\n\nSubstantive architecture content for test project.",
+            ),
+            (
+                "design/constraints.md",
+                "# Constraints\n\nSubstantive constraints content for test project.",
+            ),
+            (
+                "design/interfaces.md",
+                "# Interfaces\n\nSubstantive interfaces content for test project.",
+            ),
+            (
+                "design/security.md",
+                "# Security\n\nSubstantive security content for test project.",
+            ),
+            (
+                "implementation/implementation-plan.md",
+                "# Implementation Plan\n\nSubstantive implementation plan content.",
+            ),
+            (
+                "implementation/acceptance-criteria.yaml",
+                "schema_version: 1\ncriteria:\n  - id: AC-1\n    description: Must pass tests\n",
+            ),
+            (
+                "implementation/test-plan.md",
+                "# Test Plan\n\nSubstantive test plan content.",
+            ),
+        ];
+        for (rel, content) in files {
+            ArtifactManager::write_artifact_atomic(repo_dir.path(), rel, content).unwrap();
+        }
+
+        // DB 1: Register and freeze
+        let mut db1 = DbManager::new_in_memory().unwrap();
+        db1.run_migrations().unwrap();
+        ProjectService::register_or_open_project(db1.connection_mut(), &git, repo_dir.path())
+            .unwrap();
+        workflow::apply_workflow_action(
+            db1.connection_mut(),
+            &pid,
+            workflow::WorkflowAction::StartArchitecting,
+            "HUMAN",
+        )
+        .unwrap();
+        workflow::apply_workflow_action(
+            db1.connection_mut(),
+            &pid,
+            workflow::WorkflowAction::MarkReadyToFreeze,
+            "HUMAN",
         )
         .unwrap();
 
-        // Fresh DB rehydration
-        let mut db = DbManager::new_in_memory().unwrap();
-        db.run_migrations().unwrap();
+        let preview =
+            crate::core::freeze::FreezeService::prepare_freeze_preview(repo_dir.path(), &pid, &git)
+                .unwrap();
+        crate::core::freeze::FreezeService::confirm_freeze(
+            repo_dir.path(),
+            &pid,
+            &preview,
+            &git,
+            db1.connection_mut(),
+        )
+        .unwrap();
+
+        // Fresh DB 2 rehydration (DB 1 wiped)
+        let mut db2 = DbManager::new_in_memory().unwrap();
+        db2.run_migrations().unwrap();
 
         let rehydrated =
-            ProjectService::register_or_open_project(db.connection_mut(), &git, repo_dir.path())
+            ProjectService::register_or_open_project(db2.connection_mut(), &git, repo_dir.path())
                 .unwrap();
         assert_eq!(
             rehydrated.workflow_state.state,
@@ -1086,6 +1176,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            active_manifest_fingerprint: None,
             readiness: None,
         };
         fs::write(&stale_backup, serde_yaml::to_string(&stale_proj).unwrap()).unwrap();
@@ -1164,6 +1255,7 @@ mod tests {
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
             created_at: "2026-09-08T00:00:00Z".to_string(),
+            active_manifest_fingerprint: None,
             readiness: None,
         };
         fs::write(
@@ -1290,6 +1382,7 @@ mod tests {
             name: "rehydrated-from-backup".to_string(),
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
+            active_manifest_fingerprint: None,
             created_at: "2026-09-08T00:00:00Z".to_string(),
             readiness: None,
         };
@@ -1335,6 +1428,7 @@ mod tests {
             name: "backup-1".to_string(),
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
+            active_manifest_fingerprint: None,
             created_at: "2026-09-08T00:00:00Z".to_string(),
             readiness: None,
         };
@@ -1344,6 +1438,7 @@ mod tests {
             name: "backup-2".to_string(),
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
+            active_manifest_fingerprint: None,
             created_at: "2026-09-08T00:00:00Z".to_string(),
             readiness: None,
         };
@@ -1586,6 +1681,7 @@ mod tests {
             name: "conflicting-project".to_string(),
             current_architecture_version: None,
             architecture_state: ArchitectureState::Draft,
+            active_manifest_fingerprint: None,
             created_at: "2026-09-08T00:00:00Z".to_string(),
             readiness: None,
         };

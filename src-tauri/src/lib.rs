@@ -101,6 +101,13 @@ pub fn run() {
             commands::save_artifact_content,
             commands::set_active_project_id,
             commands::set_project_artifact_applicability,
+            commands::prepare_architecture_freeze,
+            commands::confirm_architecture_freeze,
+            commands::get_contract_drift,
+            commands::get_drift_diff,
+            commands::restore_drifted_artifact,
+            commands::restore_all_drifted_artifacts,
+            commands::get_builder_packet,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

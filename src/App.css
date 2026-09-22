@@ -1216,3 +1216,351 @@ body {
   background: #f3f4f6;
   color: #6b7280;
 }
+
+/* -------------------------------------------------------------------------
+   Stage 2B: Architecture Freeze, Drift & Boundaries Styles
+-------------------------------------------------------------------------- */
+
+.frozen-architecture-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #f0fdf4;
+  border: 1px solid #86efac;
+  border-radius: 8px;
+  padding: 14px 18px;
+  margin-bottom: 18px;
+}
+
+.frozen-banner-left {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.frozen-lock-icon {
+  font-size: 1.5rem;
+}
+
+.frozen-info-text strong {
+  color: #166534;
+  font-size: 1rem;
+}
+
+.frozen-info-text p {
+  margin: 4px 0 0 0;
+  font-size: 0.82rem;
+  color: #15803d;
+}
+
+.view-packet-btn {
+  background: #ffffff;
+  border: 1px solid #16a34a;
+  color: #15803d;
+  font-weight: 600;
+  padding: 8px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.view-packet-btn:hover:not(:disabled) {
+  background: #dcfce7;
+}
+
+/* Drift Alert Panel */
+.drift-alert-panel {
+  background: #fef2f2;
+  border: 2px solid #f87171;
+  border-radius: 8px;
+  padding: 14px 18px;
+  margin-bottom: 18px;
+}
+
+.drift-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.drift-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #991b1b;
+  font-size: 1rem;
+}
+
+.drift-warning-icon {
+  font-size: 1.2rem;
+}
+
+.drift-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.arch-change-notice {
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: #b91c1c;
+  background: #fee2e2;
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px dashed #ef4444;
+}
+
+.drift-panel-desc {
+  font-size: 0.82rem;
+  color: #b91c1c;
+  margin: 6px 0 12px 0;
+}
+
+.drift-items-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.drift-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #fca5a5;
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+
+.drift-item-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.drift-item-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.restore-all-btn {
+  background: #dc2626;
+  color: #ffffff;
+  border: none;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.restore-all-btn:hover:not(:disabled) {
+  background: #b91c1c;
+}
+
+.freeze-btn {
+  background: #16a34a;
+  color: #ffffff;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.freeze-btn:hover:not(:disabled) {
+  background: #15803d;
+}
+
+.freeze-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Modals */
+.freeze-modal, .diff-modal, .packet-modal, .freeze-success-modal {
+  max-width: 850px;
+  max-height: 85vh;
+}
+
+.freeze-authority-notice {
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+  padding: 12px;
+  margin-bottom: 16px;
+}
+
+.freeze-authority-notice strong {
+  color: #92400e;
+  font-size: 0.88rem;
+}
+
+.freeze-authority-notice p {
+  margin: 4px 0 0 0;
+  font-size: 0.82rem;
+  color: #b45309;
+}
+
+.freeze-summary-cards {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.freeze-card {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.freeze-card h4 {
+  margin: 0 0 4px 0;
+  font-size: 0.85rem;
+  color: #334155;
+}
+
+.freeze-card p {
+  margin: 2px 0;
+  font-size: 0.8rem;
+  color: #475569;
+}
+
+.freeze-artifacts-table {
+  max-height: 250px;
+  overflow-y: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+}
+
+.freeze-artifacts-table h4 {
+  margin: 8px 12px;
+  font-size: 0.85rem;
+}
+
+.freeze-artifacts-table table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+
+.freeze-artifacts-table th {
+  background: #f1f5f9;
+  text-align: left;
+  padding: 6px 12px;
+  border-bottom: 1px solid #cbd5e1;
+}
+
+.freeze-artifacts-table td {
+  padding: 6px 12px;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.hash-code {
+  color: #64748b;
+  font-size: 0.72rem;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 16px;
+  border-top: 1px solid #e5e7eb;
+}
+
+/* Diff Columns */
+.diff-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.diff-column h4 {
+  margin: 0 0 8px 0;
+  font-size: 0.85rem;
+  color: #4b5563;
+}
+
+.diff-code-box {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 10px;
+  max-height: 50vh;
+  overflow-y: auto;
+  font-family: monospace;
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+}
+
+.diff-modal-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Packet Modal */
+.packet-meta-row {
+  display: flex;
+  gap: 16px;
+  font-size: 0.82rem;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #e2e8f0;
+  margin-bottom: 12px;
+}
+
+.packet-rules-box {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 10px;
+  max-height: 120px;
+  overflow-y: auto;
+  font-family: monospace;
+  font-size: 0.78rem;
+}
+
+.packet-artifact-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 350px;
+  overflow-y: auto;
+}
+
+.packet-artifact-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+}
+
+.packet-card-header {
+  display: flex;
+  justify-content: space-between;
+  background: #f1f5f9;
+  padding: 6px 10px;
+  font-size: 0.8rem;
+}
+
+.packet-artifact-content {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: monospace;
+  font-size: 0.75rem;
+  max-height: 150px;
+  overflow-y: auto;
+  background: #ffffff;
+  white-space: pre-wrap;
+}
+
+.freeze-success-details {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 12px;
+  margin: 12px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 0.85rem;
+}

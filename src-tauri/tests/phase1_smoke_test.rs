@@ -268,25 +268,92 @@ fn test_phase1_complete_desktop_lifecycle_smoke() {
         );
     }
 
-    // --- STEP 10: Safe project.yaml replacement with frozen architecture state and version ---
+    // --- STEP 10: Freeze architecture and verify rehydration preserves frozen state ---
     {
+        let files = [
+            (
+                "design/product-vision.md",
+                "# Product Vision\n\nSubstantive product vision content for test project.",
+            ),
+            (
+                "design/requirements.md",
+                "# Requirements\n\nSubstantive requirements content for test project.",
+            ),
+            (
+                "design/architecture.md",
+                "# Architecture\n\nSubstantive architecture content for test project.",
+            ),
+            (
+                "design/constraints.md",
+                "# Constraints\n\nSubstantive constraints content for test project.",
+            ),
+            (
+                "design/interfaces.md",
+                "# Interfaces\n\nSubstantive interfaces content for test project.",
+            ),
+            (
+                "design/security.md",
+                "# Security\n\nSubstantive security content for test project.",
+            ),
+            (
+                "implementation/implementation-plan.md",
+                "# Implementation Plan\n\nSubstantive implementation plan content.",
+            ),
+            (
+                "implementation/acceptance-criteria.yaml",
+                "schema_version: 1\ncriteria:\n  - id: AC-1\n    description: Must pass tests\n",
+            ),
+            (
+                "implementation/test-plan.md",
+                "# Test Plan\n\nSubstantive test plan content.",
+            ),
+        ];
+        for (rel, content) in files {
+            ArtifactManager::write_artifact_atomic(repo_path, rel, content).unwrap();
+        }
+
         let mut db = DbManager::open(&db_path).unwrap();
         db.run_migrations().unwrap();
 
+        apply_workflow_action(
+            db.connection_mut(),
+            &durable_project_id,
+            WorkflowAction::StartArchitecting,
+            "HUMAN",
+        )
+        .unwrap();
+        apply_workflow_action(
+            db.connection_mut(),
+            &durable_project_id,
+            WorkflowAction::MarkReadyToFreeze,
+            "HUMAN",
+        )
+        .unwrap();
+
+        let preview = coalition_lib::core::freeze::FreezeService::prepare_freeze_preview(
+            repo_path,
+            &durable_project_id,
+            &git,
+        )
+        .unwrap();
+
+        let freeze_res = coalition_lib::core::freeze::FreezeService::confirm_freeze(
+            repo_path,
+            &durable_project_id,
+            &preview,
+            &git,
+            db.connection_mut(),
+        )
+        .unwrap();
+        assert_eq!(freeze_res.architecture_version, "1.0");
+
+        // Read back project.yaml and validate
         let project_yaml_path = repo_path.join(".coalition").join("project.yaml");
-        let mut yaml = ArtifactManager::read_project_yaml(&project_yaml_path).unwrap();
-        yaml.architecture_state = ArchitectureState::Frozen;
-        yaml.current_architecture_version = Some("1.0.0".to_string());
-
-        // Safe atomic write
-        ArtifactManager::write_project_yaml_atomic(&project_yaml_path, &yaml).unwrap();
-
-        // Read back and validate
         let read_back = ArtifactManager::read_project_yaml(&project_yaml_path).unwrap();
         assert_eq!(read_back.architecture_state, ArchitectureState::Frozen);
         assert_eq!(
             read_back.current_architecture_version,
-            Some("1.0.0".to_string())
+            Some("1.0".to_string())
         );
 
         // Delete DB once more and verify rehydration preserves frozen state
@@ -309,7 +376,7 @@ fn test_phase1_complete_desktop_lifecycle_smoke() {
                 .artifact
                 .unwrap()
                 .current_architecture_version,
-            Some("1.0.0".to_string())
+            Some("1.0".to_string())
         );
     }
 }

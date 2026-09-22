@@ -627,4 +627,237 @@ describe('ArchitectureWorkspaceView', () => {
       screen.getByText(/Open Questions \(2 unresolved\):/)
     ).toBeInTheDocument();
   });
+
+  it('handles Freeze Architecture flow: opens modal, authorizes freeze, and renders success modal', async () => {
+    const readyWorkspace: WorkspaceState = {
+      ...mockInitialWorkspace,
+      readiness: {
+        ...mockReadinessInitial,
+        overall_readiness: 'READY_TO_FREEZE',
+        ready_required_count: 9,
+        total_required_count: 9,
+      },
+    };
+
+    const mockFreezePreview = {
+      preview_id: 'prev-123',
+      project_id: 'test-proj-1',
+      target_version: '1.0',
+      readiness_policy_version: 1,
+      ready_required_count: 9,
+      total_required_count: 9,
+      unresolved_open_questions_count: 0,
+      artifact_baselines: {
+        'design/product-vision.md': 'hash1',
+        'design/requirements.md': 'hash2',
+      },
+      git_boundary: {
+        head_commit: 'abc1234567890',
+        branch: 'main',
+        is_detached: false,
+        is_clean: true,
+        staged_count: 0,
+        unstaged_count: 0,
+        untracked_count: 0,
+        dirty_fingerprint: 'clean',
+        porcelain_status: '',
+      },
+      builder_packet_summary: {
+        total_artifacts: 9,
+        total_characters: 15000,
+        estimated_tokens: 3750,
+        is_truncated: false,
+      },
+      created_at: '2026-09-08T12:00:00Z',
+    };
+
+    const mockFreezeResult = {
+      project_id: 'test-proj-1',
+      architecture_version: '1.0',
+      epoch_id: 'epoch-999',
+      frozen_at: '2026-09-08T12:00:00Z',
+      manifest_fingerprint: 'manifest-hash-1234',
+      git_boundary: mockFreezePreview.git_boundary,
+      snapshot_path: '.coalition/architecture-versions/v1.0/',
+      builder_packet: {
+        metadata: {
+          schema_version: 1,
+          packet_id: 'bp-1',
+          project_id: 'test-proj-1',
+          project_name: 'Alpha Project',
+          architecture_version: '1.0',
+          builder_epoch_id: 'epoch-999',
+          created_at: '2026-09-08T12:00:00Z',
+          manifest_fingerprint: 'manifest-hash-1234',
+          git_head_commit: 'abc1234567890',
+          git_branch: 'main',
+        },
+        summary: 'Architecture summary',
+        builder_rules: 'Rules',
+        artifacts: [],
+        is_truncated: false,
+        prompt: 'Build this',
+      },
+    };
+
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_architecture_workspace_state') return readyWorkspace;
+      if (cmd === 'prepare_architecture_freeze') return mockFreezePreview;
+      if (cmd === 'confirm_architecture_freeze') return mockFreezeResult;
+      return {};
+    });
+
+    await act(async () => {
+      render(
+        <ArchitectureWorkspaceView
+          projectId="test-proj-1"
+          projectName="Alpha Project"
+          workflowState="READY_TO_FREEZE"
+          onRefreshProject={onRefreshMock}
+        />
+      );
+    });
+
+    const freezeBtn = screen.getByRole('button', { name: 'Freeze Architecture' });
+    expect(freezeBtn).not.toBeDisabled();
+
+    await act(async () => {
+      fireEvent.click(freezeBtn);
+    });
+
+    expect(screen.getByRole('dialog', { name: /Confirm Architecture Freeze/ })).toBeInTheDocument();
+    expect(screen.getByText('Authorize Architecture Freeze')).toBeInTheDocument();
+
+    const authorizeBtn = screen.getByRole('button', { name: 'Authorize Architecture Freeze' });
+    await act(async () => {
+      fireEvent.click(authorizeBtn);
+    });
+
+    expect(screen.getByText('✓ Architecture Frozen Successfully')).toBeInTheDocument();
+    expect(screen.getAllByText(/v1\.0/).length).toBeGreaterThan(0);
+  });
+
+  it('displays drift detection alert panel and allows inspecting diff in FROZEN state', async () => {
+    const mockDrift = {
+      has_drift: true,
+      is_frozen: true,
+      architecture_version: '1.0',
+      drifted_artifacts: [
+        {
+          path: 'design/product-vision.md',
+          drift_type: 'MODIFIED',
+          frozen_fingerprint: 'hash-orig',
+          active_fingerprint: 'hash-changed',
+        },
+      ],
+      checked_at: '2026-09-08T12:00:00Z',
+    };
+
+    const mockDiff = {
+      path: 'design/product-vision.md',
+      drift_type: 'MODIFIED',
+      frozen_content: '# Frozen Vision\nFrozen content',
+      active_content: '# Active Vision\nSneaky modified content',
+    };
+
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_architecture_workspace_state') return mockInitialWorkspace;
+      if (cmd === 'get_contract_drift') return mockDrift;
+      if (cmd === 'get_drift_diff') return mockDiff;
+      if (cmd === 'restore_drifted_artifact') {
+        return { ...mockDrift, has_drift: false, drifted_artifacts: [] };
+      }
+      return {};
+    });
+
+    await act(async () => {
+      render(
+        <ArchitectureWorkspaceView
+          projectId="test-proj-1"
+          projectName="Alpha Project"
+          workflowState="FROZEN"
+          onRefreshProject={onRefreshMock}
+        />
+      );
+    });
+
+    expect(screen.getByText(/Architecture Contract Drift Detected/)).toBeInTheDocument();
+    expect(screen.getByText('Architecture Change Required')).toBeInTheDocument();
+
+    const inspectBtn = screen.getByRole('button', { name: 'Inspect Diff' });
+    await act(async () => {
+      fireEvent.click(inspectBtn);
+    });
+
+    expect(screen.getByText('Frozen Contract (v1.0 Baseline)')).toBeInTheDocument();
+    expect(screen.getByText('Active Working File')).toBeInTheDocument();
+    expect(screen.getByText(/Frozen content/)).toBeInTheDocument();
+    expect(screen.getByText(/Sneaky modified content/)).toBeInTheDocument();
+
+    const restoreBtn = screen.getByRole('button', { name: 'Restore to Frozen' });
+    await act(async () => {
+      fireEvent.click(restoreBtn);
+    });
+
+    expect(mockInvoke).toHaveBeenCalledWith('restore_drifted_artifact', {
+      projectId: 'test-proj-1',
+      artifactPath: 'design/product-vision.md',
+    });
+  });
+
+  it('renders View Builder Packet modal in FROZEN state', async () => {
+    const mockPacket = {
+      metadata: {
+        schema_version: 1,
+        packet_id: 'packet-1',
+        project_id: 'test-proj-1',
+        project_name: 'Alpha Project',
+        architecture_version: '1.0',
+        builder_epoch_id: 'epoch-1',
+        created_at: '2026-09-08T12:00:00Z',
+        manifest_fingerprint: 'manifest-fp',
+        git_head_commit: 'commit123',
+        git_branch: 'main',
+      },
+      summary: 'High level system summary',
+      builder_rules: 'Strict rules for the builder',
+      artifacts: [
+        {
+          path: 'design/product-vision.md',
+          title: 'Product Vision',
+          content: '# Vision\nProduct vision content',
+          fingerprint: 'fp-1',
+        },
+      ],
+      is_truncated: false,
+      prompt: 'Build prompt',
+    };
+
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_architecture_workspace_state') return mockInitialWorkspace;
+      if (cmd === 'get_contract_drift') return { has_drift: false, is_frozen: true, architecture_version: '1.0', drifted_artifacts: [], checked_at: '' };
+      if (cmd === 'get_builder_packet') return mockPacket;
+      return {};
+    });
+
+    await act(async () => {
+      render(
+        <ArchitectureWorkspaceView
+          projectId="test-proj-1"
+          projectName="Alpha Project"
+          workflowState="FROZEN"
+          onRefreshProject={onRefreshMock}
+        />
+      );
+    });
+
+    const viewPacketBtn = screen.getByRole('button', { name: 'View Builder Packet' });
+    await act(async () => {
+      fireEvent.click(viewPacketBtn);
+    });
+
+    expect(screen.getByText(/Builder Implementation Packet \(v1\.0\)/)).toBeInTheDocument();
+    expect(screen.getByText('High level system summary')).toBeInTheDocument();
+    expect(screen.getByText('Strict rules for the builder')).toBeInTheDocument();
+  });
 });
