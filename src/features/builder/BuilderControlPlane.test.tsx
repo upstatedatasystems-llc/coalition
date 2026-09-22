@@ -105,6 +105,11 @@ const mockTelemetry: UsageTelemetryReport = {
     total_imports_received: 3,
     last_calibrated_at: '2026-09-22T10:00:00Z',
     disclaimer: 'Estimated (~4 chars/token heuristic). Does not reflect official OpenAI billing.',
+    estimator_version: 1,
+    chars_per_token: 4.0,
+    sample_count: 0,
+    estimated_5h_capacity_pct: 15.0,
+    estimated_weekly_capacity_pct: 10.0,
   },
 };
 
@@ -353,12 +358,94 @@ describe('BuilderControlPlaneView', () => {
         projectId: 'proj-stage3',
         model: 'gemini-3.8-flash-high',
         effort: 'medium',
-        followUpPrompt: null,
-        useFakeAgy: false,
       },
     });
 
     expect(onRefreshProject).toHaveBeenCalled();
+    // After successful turn, verify completion report is displayed
+    expect(screen.getByTestId('completion-report')).toBeInTheDocument();
+    expect(screen.getByText('Implementation complete')).toBeInTheDocument();
+  });
+
+  it('surfaces model discovery error cleanly without falling back to hardcoded models', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'list_builder_models') return Promise.reject(new Error('agy binary not found'));
+      if (cmd === 'get_builder_packet') return Promise.resolve(mockBuilderPacket);
+      if (cmd === 'get_contract_drift') return Promise.resolve(mockCleanDriftReport);
+      if (cmd === 'get_icarus_state') return Promise.resolve(mockIcarusInactive);
+      if (cmd === 'get_usage_telemetry') return Promise.resolve(mockTelemetry);
+      if (cmd === 'get_permission_history') return Promise.resolve(mockPermissions);
+      if (cmd === 'list_builder_sessions') return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    await act(async () => {
+      render(
+        <BuilderControlPlaneView
+          projectId="proj-stage3"
+          projectName="Stage3 Test Project"
+          workflowState="FROZEN"
+          onRefreshProject={onRefreshProject}
+        />
+      );
+    });
+
+    expect(screen.getByTestId('model-error-banner')).toBeInTheDocument();
+    expect(screen.getByText(/Live model discovery failed/i)).toBeInTheDocument();
+    // Turn button should be disabled when models are not available
+    expect(screen.getByTestId('run-turn-btn')).toBeDisabled();
+  });
+
+  it('calibrates ChatGPT usage estimator via modal', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'calibrate_chatgpt_usage') return Promise.resolve(mockTelemetry.chatgpt_estimated_usage);
+      if (cmd === 'list_builder_models') return Promise.resolve(mockModels);
+      if (cmd === 'get_builder_packet') return Promise.resolve(mockBuilderPacket);
+      if (cmd === 'get_contract_drift') return Promise.resolve(mockCleanDriftReport);
+      if (cmd === 'get_icarus_state') return Promise.resolve(mockIcarusInactive);
+      if (cmd === 'get_usage_telemetry') return Promise.resolve(mockTelemetry);
+      if (cmd === 'get_permission_history') return Promise.resolve(mockPermissions);
+      if (cmd === 'list_builder_sessions') return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    await act(async () => {
+      render(
+        <BuilderControlPlaneView
+          projectId="proj-stage3"
+          projectName="Stage3 Test Project"
+          workflowState="FROZEN"
+          onRefreshProject={onRefreshProject}
+        />
+      );
+    });
+
+    // Open calibration modal
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('calibrate-chatgpt-btn'));
+    });
+
+    expect(screen.getByTestId('calibration-modal')).toBeInTheDocument();
+
+    // Fill in characters and reported tokens
+    const charsInput = screen.getByLabelText(/Sample Characters/i);
+    const tokensInput = screen.getByLabelText(/Observed \/ Reported Tokens/i);
+
+    await act(async () => {
+      fireEvent.change(charsInput, { target: { value: '1000' } });
+      fireEvent.change(tokensInput, { target: { value: '250' } });
+    });
+
+    // Submit calibration
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('submit-calibration-btn'));
+    });
+
+    expect(mockInvoke).toHaveBeenCalledWith('calibrate_chatgpt_usage', {
+      projectId: 'proj-stage3',
+      sampleTokens: 250,
+      sampleChars: 1000,
+    });
   });
 
   it('inspects frozen builder packet via modal', async () => {

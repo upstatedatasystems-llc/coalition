@@ -2099,3 +2099,130 @@ body {
   border-radius: 4px;
 }
 
+/* Active Run Icarus Warning Banner */
+.active-run-icarus-banner {
+  border-color: #f59e0b;
+  background: #fffbeb;
+  box-shadow: 0 0 14px rgba(245, 158, 11, 0.3);
+}
+
+.active-run-icarus-banner .icarus-text strong {
+  color: #b45309;
+}
+
+.active-run-icarus-banner .icarus-text p {
+  color: #92400e;
+}
+
+.builder-source-notice {
+  font-size: 0.8rem;
+  color: #6b7280;
+  margin: -6px 0 14px 0;
+}
+
+/* Completion Report Card */
+.completion-report-card {
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+}
+
+.report-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.report-header h3 {
+  margin: 0;
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.status-badge {
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.status-badge.status-success {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.status-badge.status-failed {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.status-badge.status-cancelled,
+.status-badge.status-canceled {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.status-badge.status-interrupted,
+.status-badge.status-timeout {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+.report-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.metric-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 0.8rem;
+}
+
+.metric-label {
+  font-size: 0.72rem;
+  color: #64748b;
+  font-weight: 600;
+}
+
+.report-error-box {
+  margin-top: 10px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: #991b1b;
+  font-size: 0.8rem;
+}
+
+.capacity-pct-badge {
+  font-size: 0.72rem;
+  color: #0284c7;
+  margin-left: 4px;
+}
+
+.chatgpt-actions-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.calibrate-btn {
+  font-size: 0.75rem;
+  padding: 4px 10px;
+  width: 100%;
+}
+
+.calibration-dialog {
+  max-width: 440px;
+}
+
+

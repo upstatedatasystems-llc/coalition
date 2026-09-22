@@ -10,7 +10,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 pub const MAX_ACCUMULATED_LINES: usize = 10_000;
-pub const MAX_ACCUMULATED_BYTES: usize = 20 * 1024 * 1024; // 20 MB
+pub const MAX_ACCUMULATED_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 
 #[derive(Error, Debug)]
 pub enum ProcessError {
@@ -287,6 +287,66 @@ impl ProcessRunner {
             event_sender,
         )
         .await
+    }
+
+    pub fn run_sync_bounded(
+        program: &Path,
+        args: &[&str],
+        cwd: Option<&Path>,
+        timeout_duration: Duration,
+    ) -> Result<std::process::Output, ProcessError> {
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let child = cmd.spawn()?;
+        let pid = child.id();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let child_thread = std::thread::spawn(move || {
+            let res = child.wait_with_output();
+            let _ = tx.send(res);
+        });
+
+        match rx.recv_timeout(timeout_duration) {
+            Ok(output_res) => {
+                let _ = child_thread.join();
+                let mut output = output_res?;
+                if output.stdout.len() > MAX_ACCUMULATED_BYTES {
+                    output.stdout.truncate(MAX_ACCUMULATED_BYTES);
+                }
+                if output.stderr.len() > MAX_ACCUMULATED_BYTES {
+                    output.stderr.truncate(MAX_ACCUMULATED_BYTES);
+                }
+                Ok(output)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/F", "/T", "/PID", &pid.to_string()])
+                        .output();
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                }
+                let _ = child_thread.join();
+                Err(ProcessError::Timeout(timeout_duration))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = child_thread.join();
+                Err(ProcessError::Execution(
+                    "Process execution thread disconnected unexpectedly".to_string(),
+                ))
+            }
+        }
     }
 }
 

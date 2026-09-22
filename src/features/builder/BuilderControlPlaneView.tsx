@@ -2,21 +2,22 @@ import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import {
-  WorkflowState,
   ModelInfo,
   BuilderPacket,
   DriftReport,
-  BuilderSessionRecord,
+  IcarusState,
   UsageTelemetryReport,
   PermissionRecord,
-  IcarusState,
+  BuilderSessionRecord,
   BuilderTurnResponse,
+  BuilderEventRecord,
+  ChatGptUsageSummary,
 } from '../../types';
 
 interface BuilderControlPlaneViewProps {
   projectId: string;
   projectName: string;
-  workflowState: WorkflowState;
+  workflowState: string;
   onRefreshProject: () => Promise<void>;
 }
 
@@ -32,12 +33,11 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
   workflowState,
   onRefreshProject,
 }) => {
-  // State
+  // Model & Execution State
   const [models, setModels] = useState<ModelInfo[]>([]);
-  const [selectedModel, setSelectedModel] = useState<string>('gemini-3.8-flash-high');
+  const [selectedModel, setSelectedModel] = useState<string>('');
+  const [modelError, setModelError] = useState<string | null>(null);
   const [effort, setEffort] = useState<'low' | 'medium' | 'high'>('medium');
-  const [followUpPrompt, setFollowUpPrompt] = useState<string>('');
-  const [useFakeAgy, setUseFakeAgy] = useState<boolean>(false);
 
   // Status & Telemetry
   const [builderPacket, setBuilderPacket] = useState<BuilderPacket | null>(null);
@@ -47,9 +47,10 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
   const [permissionHistory, setPermissionHistory] = useState<PermissionRecord[]>([]);
   const [sessions, setSessions] = useState<BuilderSessionRecord[]>([]);
 
-  // Execution
+  // Execution & Live Output
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [activeRunIcarus, setActiveRunIcarus] = useState<boolean | null>(null);
   const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
   const [lastResponse, setLastResponse] = useState<BuilderTurnResponse | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -57,6 +58,9 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
   // Modals & Controls
   const [showIcarusModal, setShowIcarusModal] = useState<boolean>(false);
   const [showPacketModal, setShowPacketModal] = useState<boolean>(false);
+  const [showCalibrationModal, setShowCalibrationModal] = useState<boolean>(false);
+  const [calTokens, setCalTokens] = useState<number>(1000);
+  const [calChars, setCalChars] = useState<number>(4000);
   const [isLoading, setIsLoading] = useState<boolean>(false);
 
   const terminalEndRef = useRef<HTMLDivElement>(null);
@@ -75,7 +79,7 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
   // Load initial data
   useEffect(() => {
     loadAllData();
-  }, [projectId, useFakeAgy]);
+  }, [projectId]);
 
   // Terminal auto-scroll
   useEffect(() => {
@@ -131,15 +135,23 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
 
   const loadModels = async () => {
     try {
-      const availableModels = await invoke<ModelInfo[]>('list_builder_models', {
-        useFakeAgy,
-      });
+      setModelError(null);
+      const availableModels = await invoke<ModelInfo[]>('list_builder_models');
       setModels(availableModels);
-      if (availableModels.length > 0 && !availableModels.some((m) => m.id === selectedModel)) {
-        setSelectedModel(availableModels[0].id);
+      if (availableModels.length > 0) {
+        if (!availableModels.some((m) => m.id === selectedModel)) {
+          setSelectedModel(availableModels[0].id);
+        }
+      } else {
+        setSelectedModel('');
+        setModelError("No Antigravity models discovered. Run 'agy models' in terminal to verify CLI setup.");
       }
-    } catch (err) {
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : JSON.stringify(err);
       console.warn('Could not load builder models:', err);
+      setModelError(`Live model discovery failed: ${msg}`);
+      setModels([]);
+      setSelectedModel('');
     }
   };
 
@@ -201,11 +213,36 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
         limit: 10,
       });
       setSessions(sess);
-      // Check if any session is currently RUNNING
+
+      // Check running session
       const runningSession = sess.find((s) => s.status === 'RUNNING');
       if (runningSession) {
         setIsRunning(true);
         setActiveSessionId(runningSession.session_id);
+        setActiveRunIcarus(runningSession.icarus_mode);
+      } else {
+        setIsRunning(false);
+        setActiveSessionId(null);
+        setActiveRunIcarus(null);
+      }
+
+      // Restore past terminal events from latest session if terminal is empty
+      if (sess.length > 0 && terminalLogs.length === 0) {
+        const latest = sess[0];
+        try {
+          const pastEvents = await invoke<BuilderEventRecord[]>('get_builder_events', {
+            sessionId: latest.session_id,
+          });
+          if (pastEvents.length > 0) {
+            const restoredLines = pastEvents.map((e) => {
+              const time = new Date(e.timestamp).toLocaleTimeString();
+              return `[${time}] ${e.event_type}: ${e.content || e.details_json || e.state || ''}`;
+            });
+            setTerminalLogs(restoredLines.slice(-1000));
+          }
+        } catch (_) {
+          // Non-blocking history restore
+        }
       }
     } catch (err) {
       console.error('Could not load builder sessions:', err);
@@ -238,17 +275,31 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
       line += `${eventType}: ${JSON.stringify(evt)}`;
     }
 
-    setTerminalLogs((prev) => [...prev, line]);
+    setTerminalLogs((prev) => {
+      const next = [...prev, line];
+      return next.length > 1000 ? next.slice(next.length - 1000) : next;
+    });
   };
 
   const handleRunTurn = async () => {
+    if (!selectedModel) {
+      setErrorMessage('Please select a valid Antigravity model before running.');
+      return;
+    }
+
     setErrorMessage(null);
     setIsRunning(true);
     setLastResponse(null);
-    setTerminalLogs((prev) => [
-      ...prev,
-      `--- Starting Builder Turn [${new Date().toLocaleTimeString()}] Model: ${selectedModel} (Effort: ${effort}) ---`,
-    ]);
+    const runIcarus = Boolean(icarusState?.enabled);
+    setActiveRunIcarus(runIcarus);
+
+    setTerminalLogs((prev) => {
+      const next = [
+        ...prev,
+        `--- Starting Governed Builder Turn [${new Date().toLocaleTimeString()}] Model: ${selectedModel} (Effort: ${effort})${runIcarus ? ' [ICARUS MODE]' : ''} ---`,
+      ];
+      return next.length > 1000 ? next.slice(next.length - 1000) : next;
+    });
 
     try {
       const resp = await invoke<BuilderTurnResponse>('start_builder_turn', {
@@ -256,40 +307,44 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
           projectId,
           model: selectedModel,
           effort,
-          followUpPrompt: followUpPrompt.trim() ? followUpPrompt.trim() : null,
-          useFakeAgy,
         },
       });
 
       setLastResponse(resp);
-      setFollowUpPrompt('');
       await loadAllData();
       await onRefreshProject();
 
-      if (resp.status === 'ERROR') {
+      if (resp.status === 'FAILED' || resp.status === 'ERROR') {
         setErrorMessage(resp.text_response || resp.stderr || 'Builder turn reported an error.');
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : JSON.stringify(err);
       setErrorMessage(msg);
-      setTerminalLogs((prev) => [
-        ...prev,
-        `❌ Turn Execution Error: ${msg}`,
-      ]);
+      setTerminalLogs((prev) => {
+        const next = [...prev, `❌ Turn Execution Error: ${msg}`];
+        return next.length > 1000 ? next.slice(next.length - 1000) : next;
+      });
     } finally {
       setIsRunning(false);
       setActiveSessionId(null);
+      setActiveRunIcarus(null);
     }
   };
 
   const handleCancelTurn = async () => {
     try {
-      setTerminalLogs((prev) => [
-        ...prev,
-        `🛑 Cancellation requested by user...`,
-      ]);
-      await invoke('cancel_builder_turn');
+      setTerminalLogs((prev) => {
+        const next = [...prev, `🛑 Cancellation requested by user...`];
+        return next.length > 1000 ? next.slice(next.length - 1000) : next;
+      });
+      await invoke('cancel_builder_turn', {
+        projectId,
+        sessionId: activeSessionId,
+      });
       setIsRunning(false);
+      setActiveSessionId(null);
+      setActiveRunIcarus(null);
+      await loadSessions();
     } catch (err: unknown) {
       console.error('Failed to cancel turn:', err);
     }
@@ -317,19 +372,63 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
     }
   };
 
+  const handleCalibrateChatGpt = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (calTokens <= 0 || calChars <= 0) return;
+    try {
+      const summary = await invoke<ChatGptUsageSummary>('calibrate_chatgpt_usage', {
+        projectId,
+        sampleTokens: calTokens,
+        sampleChars: calChars,
+      });
+      if (telemetry) {
+        setTelemetry({ ...telemetry, chatgpt_estimated_usage: summary });
+      }
+      setShowCalibrationModal(false);
+    } catch (err: unknown) {
+      console.error('Failed to calibrate ChatGPT estimator:', err);
+    }
+  };
+
+  const latestSession = sessions.length > 0 ? sessions[0] : null;
+
   return (
     <div className="builder-control-plane" data-testid="builder-control-plane">
-      {/* 1. Icarus Mode Persistent Warning Banner */}
-      {icarusState?.enabled && (
+      {/* 1. Active-Run Icarus Persistent Warning Banner */}
+      {(activeRunIcarus || (isRunning && icarusState?.enabled)) && (
+        <div className="icarus-warning-banner active-run-icarus-banner" role="alert" data-testid="active-run-icarus-banner">
+          <div className="icarus-banner-content">
+            <span className="icarus-icon">⚡</span>
+            <div className="icarus-text">
+              <strong>ACTIVE BUILDER RUN IN ICARUS MODE (Full Auto-Approval)</strong>
+              <p>
+                This active run was launched with autonomous permissions (<code>--dangerously-skip-permissions</code>).
+                All tool calls and file mutations proceed automatically until turn completion or cancellation.
+              </p>
+            </div>
+          </div>
+          {isRunning && (
+            <button
+              className="danger-btn cancel-turn-btn"
+              onClick={handleCancelTurn}
+              data-testid="cancel-active-run-btn"
+            >
+              Cancel Active Run
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Standard Project-Level Icarus Warning Banner */}
+      {!activeRunIcarus && icarusState?.enabled && (
         <div className="icarus-warning-banner" role="alert" data-testid="icarus-banner">
           <div className="icarus-banner-content">
             <span className="icarus-icon">⚠️</span>
             <div className="icarus-text">
-              <strong>ICARUS MODE ACTIVE: Full Autonomous Execution</strong>
+              <strong>ICARUS MODE ACTIVE: Full Autonomous Execution Preference</strong>
               <p>
                 Antigravity will run external tools and file modifications without interactive
-                prompts (<code>--dangerously-skip-permissions</code>). Human oversight is retained
-                via cancellation and audit logs.
+                prompts (<code>--dangerously-skip-permissions</code>).
               </p>
             </div>
           </div>
@@ -418,7 +517,7 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
         <div className="builder-gated-warning" role="alert">
           <h3>🔒 Architecture Contract Not Frozen</h3>
           <p>
-            The Builder Control Plane executes against the immutable architecture contract.
+            The Builder Control Plane executes strictly against the immutable architecture contract.
             Please complete and freeze your architecture in the <strong>Architecture Workspace</strong> before
             running builder turns.
           </p>
@@ -448,17 +547,20 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
         {/* Left Column: Controls & Execution */}
         <div className="builder-main-col">
           <section className="builder-card control-panel-card">
-            <h3>Builder Turn Configuration</h3>
+            <h3>Governed Builder Execution</h3>
+            <p className="builder-source-notice">
+              Builder prompt and instructions are 100% governed by the frozen Stage 2 Builder Packet.
+            </p>
 
             <div className="config-form-row">
               <div className="form-group model-group">
-                <label htmlFor="model-select">Antigravity Model:</label>
+                <label htmlFor="model-select">Antigravity Model (Live Discovery):</label>
                 <select
                   id="model-select"
                   className="select-input"
                   value={selectedModel}
                   onChange={(e) => setSelectedModel(e.target.value)}
-                  disabled={isRunning || !isFrozen}
+                  disabled={isRunning || !isFrozen || models.length === 0}
                   data-testid="model-select"
                 >
                   {models.length > 0 ? (
@@ -468,9 +570,12 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
                       </option>
                     ))
                   ) : (
-                    <option value="gemini-3.8-flash-high">Gemini 3.8 Flash (High)</option>
+                    <option value="">No models available</option>
                   )}
                 </select>
+                {modelError && (
+                  <span className="field-error-text" role="alert" data-testid="model-error-banner">{modelError}</span>
+                )}
               </div>
 
               <div className="form-group effort-group">
@@ -488,45 +593,13 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
                   <option value="high">High</option>
                 </select>
               </div>
-
-              <div className="form-group fake-agy-toggle">
-                <label className="checkbox-label">
-                  <input
-                    type="checkbox"
-                    checked={useFakeAgy}
-                    onChange={(e) => setUseFakeAgy(e.target.checked)}
-                    disabled={isRunning}
-                    data-testid="fake-agy-checkbox"
-                  />
-                  <span>Fake agy (Zero-Quota CI / Test)</span>
-                </label>
-              </div>
-            </div>
-
-            <div className="form-group follow-up-group">
-              <label htmlFor="follow-up-input">
-                Turn Guidance / Follow-Up Prompt:
-                <span className="label-subtext">
-                  (Stage 2 frozen contract prompt is authoritative; notes here provide steering for current turn)
-                </span>
-              </label>
-              <textarea
-                id="follow-up-input"
-                className="text-input prompt-textarea"
-                placeholder="Enter additional steering notes or follow-up instructions..."
-                value={followUpPrompt}
-                onChange={(e) => setFollowUpPrompt(e.target.value)}
-                disabled={isRunning || !isFrozen}
-                rows={3}
-                data-testid="follow-up-input"
-              />
             </div>
 
             <div className="builder-action-bar">
               <button
                 className="primary-btn run-turn-btn"
                 onClick={handleRunTurn}
-                disabled={isRunning || !isFrozen || (driftReport?.has_drift ?? false)}
+                disabled={isRunning || !isFrozen || (driftReport?.has_drift ?? false) || !selectedModel}
                 data-testid="run-turn-btn"
               >
                 {isRunning ? 'Turn In Progress...' : '▶ Run Builder Turn'}
@@ -542,11 +615,11 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
                 </button>
               )}
 
-              {lastResponse?.status === 'ERROR' && !isRunning && (
+              {(lastResponse?.status === 'ERROR' || lastResponse?.status === 'FAILED') && !isRunning && (
                 <button
                   className="secondary-btn retry-btn"
                   onClick={handleRunTurn}
-                  disabled={!isFrozen}
+                  disabled={!isFrozen || !selectedModel}
                   data-testid="retry-turn-btn"
                 >
                   🔄 Retry Turn
@@ -562,6 +635,54 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
             </div>
           </section>
 
+          {/* Completion / Status Report Card */}
+          {(latestSession || lastResponse) && (
+            <section className="builder-card completion-report-card" data-testid="completion-report">
+              <div className="report-header">
+                <h3>Latest Builder Session Report</h3>
+                <span className={`status-badge status-${(latestSession?.status || lastResponse?.status || '').toLowerCase()}`}>
+                  {latestSession?.status || lastResponse?.status}
+                </span>
+              </div>
+              <div className="report-metrics-grid">
+                <div className="metric-item">
+                  <span className="metric-label">Session ID:</span>
+                  <code>{(latestSession?.session_id || lastResponse?.conversation_id || 'unknown').substring(0, 8)}...</code>
+                </div>
+                <div className="metric-item">
+                  <span className="metric-label">Model:</span>
+                  <span>{latestSession?.model || selectedModel}</span>
+                </div>
+                <div className="metric-item">
+                  <span className="metric-label">Duration:</span>
+                  <span>{latestSession ? `${(latestSession.duration_ms / 1000).toFixed(1)}s` : 'Completed'}</span>
+                </div>
+                <div className="metric-item">
+                  <span className="metric-label">Total Tokens:</span>
+                  <span>{(latestSession?.usage.total_tokens ?? lastResponse?.cumulative_usage.total_tokens ?? 0).toLocaleString()}</span>
+                </div>
+                <div className="metric-item">
+                  <span className="metric-label">Icarus Mode:</span>
+                  <span>{(latestSession?.icarus_mode ?? icarusState?.enabled) ? 'Yes (Auto-approval)' : 'No (Least-privilege)'}</span>
+                </div>
+                <div className="metric-item">
+                  <span className="metric-label">Completed:</span>
+                  <span>{latestSession?.completed_at ? new Date(latestSession.completed_at).toLocaleTimeString() : 'Just now'}</span>
+                </div>
+              </div>
+              {lastResponse?.text_response && (
+                <div className="report-text-response">
+                  <strong>Response:</strong> <p>{lastResponse.text_response}</p>
+                </div>
+              )}
+              {(latestSession?.error_message || lastResponse?.stderr) && (
+                <div className="report-error-box">
+                  <strong>Error / Stderr:</strong> {latestSession?.error_message || lastResponse?.stderr}
+                </div>
+              )}
+            </section>
+          )}
+
           {/* Live Streaming Terminal */}
           <section className="builder-card terminal-card">
             <div className="terminal-header">
@@ -573,7 +694,7 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
                   Antigravity Live Stream {isRunning ? '(Streaming Active)' : '(Idle)'}
                 </span>
               </div>
-              <span className="term-count">{terminalLogs.length} events</span>
+              <span className="term-count">{terminalLogs.length} events (max 1,000)</span>
             </div>
             <div className="terminal-body" data-testid="terminal-stream">
               {terminalLogs.length === 0 ? (
@@ -635,39 +756,66 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
             <div className="telemetry-box chatgpt-box">
               <div className="box-header">
                 <span className="box-title">ChatGPT Architecture Relay</span>
-                <span className="estimated-tag">Estimated</span>
+                <span className="estimated-tag">
+                  v{telemetry?.chatgpt_estimated_usage?.estimator_version ?? 1} Calibrated
+                </span>
               </div>
               <div className="token-stat-grid">
                 <div className="stat-pill">
                   <span className="stat-label">5-Hour Rolling:</span>
                   <span className="stat-number">
-                    {telemetry?.chatgpt_estimated_usage.rolling_5h_tokens.toLocaleString() ?? 0}
+                    {telemetry?.chatgpt_estimated_usage?.rolling_5h_tokens?.toLocaleString() ?? 0}
+                    {telemetry?.chatgpt_estimated_usage?.estimated_5h_capacity_pct != null && (
+                      <span className="capacity-pct-badge">
+                        ({telemetry.chatgpt_estimated_usage.estimated_5h_capacity_pct.toFixed(1)}%)
+                      </span>
+                    )}
                   </span>
                 </div>
                 <div className="stat-pill">
                   <span className="stat-label">Weekly Rolling:</span>
                   <span className="stat-number">
-                    {telemetry?.chatgpt_estimated_usage.rolling_7d_tokens.toLocaleString() ?? 0}
+                    {telemetry?.chatgpt_estimated_usage?.rolling_7d_tokens?.toLocaleString() ?? 0}
+                    {telemetry?.chatgpt_estimated_usage?.estimated_weekly_capacity_pct != null && (
+                      <span className="capacity-pct-badge">
+                        ({telemetry.chatgpt_estimated_usage.estimated_weekly_capacity_pct.toFixed(1)}%)
+                      </span>
+                    )}
                   </span>
                 </div>
                 <div className="stat-pill">
                   <span className="stat-label">Total Cumulative:</span>
                   <span className="stat-number">
-                    {telemetry?.chatgpt_estimated_usage.total_tokens.toLocaleString() ?? 0}
+                    {telemetry?.chatgpt_estimated_usage?.total_tokens?.toLocaleString() ?? 0}
+                  </span>
+                </div>
+                <div className="stat-pill">
+                  <span className="stat-label">Ratio:</span>
+                  <span className="stat-number">
+                    ~{(telemetry?.chatgpt_estimated_usage?.chars_per_token ?? 4.0).toFixed(2)} chars/tok
                   </span>
                 </div>
               </div>
               <p className="disclaimer-text">
-                {telemetry?.chatgpt_estimated_usage.disclaimer ||
-                  'Estimated (~4 chars/token heuristic). Does not reflect official OpenAI billing.'}
+                {telemetry?.chatgpt_estimated_usage?.disclaimer ||
+                  'Estimated relay throughput based on character heuristics. Does not reflect official OpenAI billing.'}
               </p>
-              <button
-                className="secondary-btn reset-window-btn"
-                onClick={handleResetChatGpt}
-                data-testid="reset-chatgpt-btn"
-              >
-                Reset 5h/7d Usage Window
-              </button>
+              <div className="chatgpt-actions-row">
+                <button
+                  className="secondary-btn reset-window-btn"
+                  onClick={handleResetChatGpt}
+                  data-testid="reset-chatgpt-btn"
+                >
+                  Reset Window
+                </button>
+                <button
+                  className="secondary-btn calibrate-btn"
+                  onClick={() => setShowCalibrationModal(true)}
+                  data-testid="calibrate-chatgpt-btn"
+                >
+                  Calibrate Estimator
+                </button>
+              </div>
             </div>
           </section>
 
@@ -757,6 +905,60 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
                 </button>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Estimator Calibration Modal */}
+      {showCalibrationModal && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" data-testid="calibration-modal">
+          <div className="modal-dialog calibration-dialog">
+            <div className="modal-header">
+              <h2>📐 Calibrate ChatGPT Usage Estimator</h2>
+              <button className="close-btn" onClick={() => setShowCalibrationModal(false)}>✕</button>
+            </div>
+            <form onSubmit={handleCalibrateChatGpt}>
+              <div className="modal-body">
+                <p>
+                  Provide an observed prompt or response sample from ChatGPT Plus to calibrate the characters-per-token ratio.
+                </p>
+                <div className="form-group">
+                  <label htmlFor="cal-chars">Sample Characters:</label>
+                  <input
+                    id="cal-chars"
+                    type="number"
+                    min="1"
+                    className="text-input"
+                    value={calChars}
+                    onChange={(e) => setCalChars(parseInt(e.target.value, 10) || 0)}
+                    required
+                  />
+                </div>
+                <div className="form-group">
+                  <label htmlFor="cal-tokens">Observed / Reported Tokens:</label>
+                  <input
+                    id="cal-tokens"
+                    type="number"
+                    min="1"
+                    className="text-input"
+                    value={calTokens}
+                    onChange={(e) => setCalTokens(parseInt(e.target.value, 10) || 0)}
+                    required
+                  />
+                </div>
+                <p className="subtext">
+                  Observed ratio: {calTokens > 0 ? (calChars / calTokens).toFixed(2) : '0'} chars/token.
+                </p>
+              </div>
+              <div className="modal-footer">
+                <button type="button" className="secondary-btn" onClick={() => setShowCalibrationModal(false)}>
+                  Cancel
+                </button>
+                <button type="submit" className="primary-btn" data-testid="submit-calibration-btn">
+                  Apply Calibration
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

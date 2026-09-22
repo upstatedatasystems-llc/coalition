@@ -375,3 +375,166 @@ async fn test_stage3_builder_end_to_end_journey() {
     assert_eq!(usage_reset.total_tokens, 0);
     assert!(usage_reset.last_calibrated_at.is_some());
 }
+
+#[tokio::test]
+async fn test_stage3_drift_and_corruption_rejection_no_state_mutation() {
+    let (repo_temp, db_temp, project_id, _fake_agy) = setup_frozen_test_project();
+    let repo_path = repo_temp.path();
+    let db_path = db_temp.path().join("stage3_test.db");
+    let mut db = DbManager::open(&db_path).unwrap();
+
+    // Verify initial workflow state is FROZEN, revision = 3
+    let wf_before = db
+        .connection()
+        .query_row(
+            "SELECT state, revision FROM workflow_state WHERE project_id = ?1",
+            rusqlite::params![project_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(wf_before.0, "FROZEN");
+
+    // Case 1: Contract drift -> preflight must reject AND leave workflow state strictly FROZEN
+    let test_art = repo_path
+        .join(".coalition")
+        .join("design")
+        .join("architecture.md");
+    let orig_content = fs::read_to_string(&test_art).unwrap();
+    fs::write(&test_art, "drift modification").unwrap();
+
+    let preflight_err = coalition_lib::commands::validate_builder_preflight(&mut db, &project_id);
+    assert!(preflight_err.is_err());
+    assert_eq!(
+        preflight_err.unwrap_err().code,
+        "FROZEN_CONTRACT_DRIFT_DETECTED"
+    );
+
+    // Verify workflow state was NOT mutated
+    let wf_after_drift = db
+        .connection()
+        .query_row(
+            "SELECT state, revision FROM workflow_state WHERE project_id = ?1",
+            rusqlite::params![project_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(wf_after_drift.0, "FROZEN");
+    assert_eq!(wf_after_drift.1, wf_before.1);
+
+    // Restore drift
+    fs::write(&test_art, &orig_content).unwrap();
+
+    // Case 2: Snapshot manifest corruption -> preflight must reject AND leave workflow state strictly FROZEN
+    let manifest_path = repo_path
+        .join(".coalition")
+        .join("architecture-versions")
+        .join("v1.0")
+        .join("contract-manifest.yaml");
+    fs::write(&manifest_path, "corrupt yaml: {[").unwrap();
+
+    let corrupt_err = coalition_lib::commands::validate_builder_preflight(&mut db, &project_id);
+    assert!(corrupt_err.is_err());
+    assert_eq!(corrupt_err.unwrap_err().code, "FROZEN_SNAPSHOT_CORRUPT");
+
+    // Verify workflow state was NOT mutated
+    let wf_after_corrupt = db
+        .connection()
+        .query_row(
+            "SELECT state, revision FROM workflow_state WHERE project_id = ?1",
+            rusqlite::params![project_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(wf_after_corrupt.0, "FROZEN");
+    assert_eq!(wf_after_corrupt.1, wf_before.1);
+}
+
+#[tokio::test]
+async fn test_stage3_active_builder_registry_concurrency() {
+    let mut registry = coalition_lib::core::builder::ActiveBuilderRegistry::new();
+
+    // 1. Register session 1
+    let cancel1 = registry
+        .register(
+            "proj-alpha",
+            "session-1",
+            "epoch-1",
+            None,
+            "gemini-3.8-flash-high",
+            Some("medium".to_string()),
+            false,
+        )
+        .expect("registration should succeed");
+    assert!(!cancel1.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(registry.is_active("proj-alpha"));
+
+    // 2. Registering concurrent session for same project must be rejected
+    let err = registry
+        .register(
+            "proj-alpha",
+            "session-2",
+            "epoch-1",
+            None,
+            "gemini-3.8-flash-high",
+            Some("medium".to_string()),
+            false,
+        )
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("Concurrent build forbidden"));
+
+    // 3. Project cancel sets session cancel flag
+    registry.cancel_project("proj-alpha").unwrap();
+    assert!(cancel1.load(std::sync::atomic::Ordering::SeqCst));
+
+    // 4. Unregister clears active status and allows new registration
+    registry.unregister("proj-alpha", "session-1");
+    assert!(!registry.is_active("proj-alpha"));
+
+    let cancel2 = registry
+        .register(
+            "proj-alpha",
+            "session-2",
+            "epoch-1",
+            None,
+            "gemini-3.8-flash-high",
+            Some("high".to_string()),
+            true,
+        )
+        .expect("subsequent registration should succeed");
+    assert!(!cancel2.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn test_stage3_chatgpt_usage_estimator_calibration_and_capacity() {
+    let (_repo_temp, db_temp, project_id, _fake_agy) = setup_frozen_test_project();
+    let db_path = db_temp.path().join("stage3_test.db");
+    let db = DbManager::open(&db_path).unwrap();
+
+    // Record some usage: 8,000 chars -> initially estimated as 2,000 tokens (4.0 chars/token)
+    db.record_chatgpt_usage(&project_id, Some("pkt-1"), "OUTBOUND_PACKET", 8000, 2000)
+        .unwrap();
+
+    let initial_summary = db.get_chatgpt_usage_summary(&project_id).unwrap();
+    assert_eq!(initial_summary.chars_per_token, 4.0);
+    assert_eq!(initial_summary.estimator_version, 1);
+    assert_eq!(initial_summary.sample_count, 0);
+    assert!(initial_summary.estimated_5h_capacity_pct.is_some());
+    // 2000 / 80000 = 2.5%
+    assert!((initial_summary.estimated_5h_capacity_pct.unwrap() - 2.5).abs() < 0.1);
+
+    // Calibrate with observed sample: 1,000 tokens for 3,000 chars (observed: 3.0 chars/token)
+    let calibrated = db
+        .calibrate_chatgpt_estimator(&project_id, 1000, 3000)
+        .unwrap();
+    assert_eq!(calibrated.version, 2);
+    assert_eq!(calibrated.sample_count, 1);
+    assert_eq!(calibrated.chars_per_token, 3.0);
+
+    let updated_summary = db.get_chatgpt_usage_summary(&project_id).unwrap();
+    assert_eq!(updated_summary.chars_per_token, 3.0);
+    assert_eq!(updated_summary.estimator_version, 2);
+    assert_eq!(updated_summary.sample_count, 1);
+    assert!(updated_summary.last_calibrated_at.is_some());
+}

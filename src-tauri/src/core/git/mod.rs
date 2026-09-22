@@ -1,7 +1,8 @@
+use crate::core::process::ProcessRunner;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -54,11 +55,19 @@ pub struct GitAdapter {
 }
 
 impl GitAdapter {
+    fn run_git_cmd(&self, args: &[&str], cwd: Option<&Path>) -> Result<std::process::Output, GitError> {
+        ProcessRunner::run_sync_bounded(&self.git_bin, args, cwd, Duration::from_secs(30))
+            .map_err(|e| GitError::ExecutionFailed(e.to_string()))
+    }
+
     pub fn new() -> Result<Self, GitError> {
-        let output = Command::new("git")
-            .arg("--version")
-            .output()
-            .map_err(|e| GitError::NotFound(format!("Failed to find git binary on PATH: {}", e)))?;
+        let output = ProcessRunner::run_sync_bounded(
+            Path::new("git"),
+            &["--version"],
+            None,
+            Duration::from_secs(10),
+        )
+        .map_err(|e| GitError::NotFound(format!("Failed to find git binary on PATH: {}", e)))?;
 
         if !output.status.success() {
             return Err(GitError::NotFound("Git command check failed".to_string()));
@@ -70,7 +79,7 @@ impl GitAdapter {
     }
 
     pub fn get_version(&self) -> Result<String, GitError> {
-        let output = Command::new(&self.git_bin).arg("--version").output()?;
+        let output = self.run_git_cmd(&["--version"], None)?;
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
         } else {
@@ -91,10 +100,7 @@ impl GitAdapter {
             )));
         }
 
-        let output = Command::new(&self.git_bin)
-            .args(["rev-parse", "--show-toplevel"])
-            .current_dir(dir)
-            .output()?;
+        let output = self.run_git_cmd(&["rev-parse", "--show-toplevel"], Some(dir))?;
 
         if !output.status.success() {
             return Err(GitError::NotAGitRepository(format!(
@@ -112,10 +118,7 @@ impl GitAdapter {
         let version = self.get_version()?;
         let dir = working_dir.as_ref();
 
-        let is_repo_res = Command::new(&self.git_bin)
-            .args(["rev-parse", "--is-inside-work-tree"])
-            .current_dir(dir)
-            .output();
+        let is_repo_res = self.run_git_cmd(&["rev-parse", "--is-inside-work-tree"], Some(dir));
 
         let is_repo = match is_repo_res {
             Ok(out) => {
@@ -142,10 +145,8 @@ impl GitAdapter {
             });
         }
 
-        let root_dir = Command::new(&self.git_bin)
-            .args(["rev-parse", "--show-toplevel"])
-            .current_dir(dir)
-            .output()
+        let root_dir = self
+            .run_git_cmd(&["rev-parse", "--show-toplevel"], Some(dir))
             .ok()
             .and_then(|out| {
                 if out.status.success() {
@@ -159,10 +160,8 @@ impl GitAdapter {
                 }
             });
 
-        let branch_output = Command::new(&self.git_bin)
-            .args(["branch", "--show-current"])
-            .current_dir(dir)
-            .output()
+        let branch_output = self
+            .run_git_cmd(&["branch", "--show-current"], Some(dir))
             .ok();
 
         let current_branch = branch_output.and_then(|out| {
@@ -179,10 +178,8 @@ impl GitAdapter {
         });
 
         // Safely inspect HEAD: in an empty repository with 0 commits, rev-parse HEAD exits non-zero
-        let head_commit = Command::new(&self.git_bin)
-            .args(["rev-parse", "HEAD"])
-            .current_dir(dir)
-            .output()
+        let head_commit = self
+            .run_git_cmd(&["rev-parse", "HEAD"], Some(dir))
             .ok()
             .and_then(|out| {
                 if out.status.success() {
@@ -199,19 +196,15 @@ impl GitAdapter {
 
         let is_detached = current_branch.is_none() && head_commit.is_some();
 
-        let status_output = Command::new(&self.git_bin)
-            .args(["status", "--porcelain"])
-            .current_dir(dir)
-            .output()
+        let status_output = self
+            .run_git_cmd(&["status", "--porcelain"], Some(dir))
             .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
             .unwrap_or_default();
 
         let status_counts = Self::parse_porcelain_status(&status_output);
 
-        let diff_summary = Command::new(&self.git_bin)
-            .args(["diff", "--stat"])
-            .current_dir(dir)
-            .output()
+        let diff_summary = self
+            .run_git_cmd(&["diff", "--stat"], Some(dir))
             .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
             .unwrap_or_default();
 
@@ -274,10 +267,8 @@ impl GitAdapter {
         let dir = working_dir.as_ref();
 
         // 1. Porcelain status with all untracked individual files listed (-uall)
-        let status_output = Command::new(&self.git_bin)
-            .args(["status", "--porcelain=v1", "-uall"])
-            .current_dir(dir)
-            .output()?;
+        let status_output = self
+            .run_git_cmd(&["status", "--porcelain=v1", "-uall"], Some(dir))?;
 
         if !status_output.status.success() {
             let stderr = String::from_utf8_lossy(&status_output.stderr);
@@ -307,10 +298,8 @@ impl GitAdapter {
         let counts = Self::parse_porcelain_status(&filtered_porcelain);
 
         // 2. Unstaged diff hash
-        let unstaged_diff = Command::new(&self.git_bin)
-            .args(["diff", "--no-ext-diff"])
-            .current_dir(dir)
-            .output()?;
+        let unstaged_diff = self
+            .run_git_cmd(&["diff", "--no-ext-diff"], Some(dir))?;
 
         if !unstaged_diff.status.success() {
             let stderr = String::from_utf8_lossy(&unstaged_diff.stderr);
@@ -326,10 +315,8 @@ impl GitAdapter {
         let unstaged_diff_hash = format!("{:x}", hasher.finalize());
 
         // 3. Staged / cached diff hash
-        let staged_diff = Command::new(&self.git_bin)
-            .args(["diff", "--cached", "--no-ext-diff"])
-            .current_dir(dir)
-            .output()?;
+        let staged_diff = self
+            .run_git_cmd(&["diff", "--cached", "--no-ext-diff"], Some(dir))?;
 
         if !staged_diff.status.success() {
             let stderr = String::from_utf8_lossy(&staged_diff.stderr);
@@ -414,6 +401,7 @@ impl GitAdapter {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
     use tempfile::tempdir;
 
     #[test]

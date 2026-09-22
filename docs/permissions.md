@@ -20,7 +20,11 @@ Coalition never fakes interactive stdin prompts or silently mutates global Antig
    - Explicitly enabled by the human for the active project.
    - Passes `--dangerously-skip-permissions` to allow the Builder to autonomously invoke tools, edit files, and run commands.
    - Persistent, glowing high-visibility banner displayed in the UI whenever active.
-   - Can be toggled on or off at any time.
+   - **Active-Run Immutability**: Toggling project-level Icarus mode while a session is actively executing does not retroactively mutate the running process. The active turn executes strictly under the permission flag established at launch.
+   - Can be toggled on or off for subsequent turns at any time.
+
+### Honest Permission Evaluation vs. Generic Runtime Errors
+When `agy` encounters a tool block or permission denial in headless execution without Icarus, it emits an execution refusal in stderr. Coalition inspects this output and classifies the target action (`READ_ONLY`, `MUTATING`, `HIGH_RISK`) using `evaluate_tool_risk`. Coalition strictly avoids misclassifying generic runtime compilation, build, or script errors as permission denials.
 
 ## Risk Classification
 

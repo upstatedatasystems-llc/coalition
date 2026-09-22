@@ -397,6 +397,11 @@ export interface ChatGptUsageSummary {
   total_imports_received: number;
   last_calibrated_at?: string | null;
   disclaimer: string;
+  estimator_version: number;
+  chars_per_token: number;
+  sample_count: number;
+  estimated_5h_capacity_pct?: number | null;
+  estimated_weekly_capacity_pct?: number | null;
 }
 
 export interface UsageTelemetryReport {
@@ -429,7 +434,6 @@ export interface StartBuilderTurnPayload {
   projectId: string;
   model?: string | null;
   effort?: string | null;
-  followUpPrompt?: string | null;
   useFakeAgy?: boolean;
 }
 

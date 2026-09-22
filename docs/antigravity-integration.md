@@ -23,8 +23,11 @@ All external Builder processes run under the common `ProcessRunner` layer:
 ## Builder Adapter & Session Management
 
 The `AntigravityCliAdapter` in Rust provides typed, bounded execution for Builder turns:
+- **Preflight Validation Before Mutation**: Prior to mutating workflow state, `start_builder_turn` validates repository path, restoration journal cleanliness, frozen snapshot integrity, and contract drift. If any validation fails, execution aborts immediately without mutating workflow state.
+- **ActiveBuilderRegistry Concurrency Control**: Tracks executing sessions per project and epoch. Enforces strictly 1 active Builder execution per project (`CONCURRENT_BUILD_FORBIDDEN`) and manages thread-safe cancellation tokens.
+- **Event Persistence & Stream Capping**: Streamed NDJSON events are sanitized and persisted to the `builder_events` SQLite table with a 32 KB per-payload cap. On frontend mount, the live terminal restores up to 1,000 historical events from the latest session.
 - **Binary Discovery**: Resolves `agy` from system `PATH`, with fallback using platform environment variables (`%LOCALAPPDATA%\agy\bin\agy.exe` on Windows).
-- **Live Model Discovery**: Queries available models dynamically via `agy models`, mapping model names and descriptions.
+- **Live Model Discovery**: Queries available models dynamically via `agy models`, mapping model names and descriptions without hardcoded fallbacks; discovery errors surface cleanly in the UI.
 - **Reasoning Effort**: Passes `--effort <low|medium|high>` when configured.
 - **Conversation Resumption & Safe Model Switching**: Captures `conversation_id` from the initial turn and supplies `--conversation <id>` for subsequent turns. Supports mid-conversation model switching by passing the new `--model <name>` alongside `--conversation`.
 - **Authoritative Contract Input**: The Builder prompt is strictly derived from the Stage 2 frozen `builder-packet.json`.

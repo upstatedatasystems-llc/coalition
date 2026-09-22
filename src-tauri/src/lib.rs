@@ -33,11 +33,12 @@ pub fn run() {
             };
 
             let state = AppState {
-                db: Mutex::new(db),
+                db: Arc::new(Mutex::new(db)),
                 git: Mutex::new(None),
                 agy: Mutex::new(None),
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 active_project_id: Mutex::new(None),
+                active_builder_registry: Arc::new(Mutex::new(crate::core::builder::ActiveBuilderRegistry::new())),
             };
 
             app.manage(state);
@@ -92,6 +93,7 @@ pub fn run() {
             commands::cancel_builder_turn,
             commands::get_usage_telemetry,
             commands::reset_chatgpt_usage,
+            commands::calibrate_chatgpt_usage,
             commands::get_permission_history,
             commands::get_icarus_state,
             commands::set_icarus_mode,

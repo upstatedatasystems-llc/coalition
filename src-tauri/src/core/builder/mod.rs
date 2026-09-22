@@ -35,12 +35,33 @@ pub struct ModelInfo {
     pub name: String,
 }
 
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    let opt = Option::<T>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
+pub const STATUS_RUNNING: &str = "RUNNING";
+pub const STATUS_SUCCESS: &str = "SUCCESS";
+pub const STATUS_FAILED: &str = "FAILED";
+pub const STATUS_CANCELLED: &str = "CANCELLED";
+pub const STATUS_TIMEOUT: &str = "TIMEOUT";
+pub const STATUS_INTERRUPTED: &str = "INTERRUPTED";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct AgyUsage {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub input_tokens: u64,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub output_tokens: u64,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub thinking_tokens: u64,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub cache_read_tokens: u64,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub total_tokens: u64,
 }
 
@@ -144,6 +165,63 @@ pub struct BuilderEventRecord {
     pub timestamp: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatGptUsageEstimator {
+    pub version: u32,
+    pub chars_per_token: f64,
+    pub sample_count: u32,
+    pub last_calibrated_at: Option<String>,
+}
+
+impl Default for ChatGptUsageEstimator {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            chars_per_token: 4.0,
+            sample_count: 0,
+            last_calibrated_at: None,
+        }
+    }
+}
+
+impl ChatGptUsageEstimator {
+    pub fn new(
+        version: u32,
+        chars_per_token: f64,
+        sample_count: u32,
+        last_calibrated_at: Option<String>,
+    ) -> Self {
+        Self {
+            version: if version > 0 { version } else { 1 },
+            chars_per_token: if chars_per_token > 0.0 {
+                chars_per_token
+            } else {
+                4.0
+            },
+            sample_count,
+            last_calibrated_at,
+        }
+    }
+
+    pub fn estimate_tokens(&self, char_count: usize) -> u64 {
+        if self.chars_per_token <= 0.0 {
+            return (char_count / 4) as u64;
+        }
+        (char_count as f64 / self.chars_per_token).round() as u64
+    }
+
+    pub fn calibrate(&mut self, sample_tokens: u64, sample_chars: usize) {
+        if sample_tokens > 0 && sample_chars > 0 {
+            let observed = sample_chars as f64 / sample_tokens as f64;
+            let n = self.sample_count as f64;
+            self.chars_per_token = (self.chars_per_token * n + observed) / (n + 1.0);
+            self.sample_count += 1;
+            self.version += 1;
+            self.last_calibrated_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatGptUsageSummary {
     pub rolling_5h_tokens: u64,
@@ -153,6 +231,11 @@ pub struct ChatGptUsageSummary {
     pub total_imports_received: u64,
     pub last_calibrated_at: Option<String>,
     pub disclaimer: String,
+    pub estimator_version: u32,
+    pub chars_per_token: f64,
+    pub sample_count: u32,
+    pub estimated_5h_capacity_pct: Option<f64>,
+    pub estimated_weekly_capacity_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +309,113 @@ pub struct AntigravityCliAdapter {
     bin_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct ActiveBuilderExecution {
+    pub project_id: String,
+    pub session_id: String,
+    pub epoch_id: String,
+    pub conversation_id: Option<String>,
+    pub model: String,
+    pub effort: Option<String>,
+    pub icarus_mode: bool,
+    pub started_at: String,
+    pub cancel_flag: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+pub struct ActiveBuilderRegistry {
+    executions: std::collections::HashMap<String, ActiveBuilderExecution>,
+}
+
+impl ActiveBuilderRegistry {
+    pub fn new() -> Self {
+        Self {
+            executions: std::collections::HashMap::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register(
+        &mut self,
+        project_id: &str,
+        session_id: &str,
+        epoch_id: &str,
+        conversation_id: Option<String>,
+        model: &str,
+        effort: Option<String>,
+        icarus_mode: bool,
+    ) -> Result<Arc<AtomicBool>, BuilderError> {
+        if let Some(existing) = self.executions.get(project_id) {
+            return Err(BuilderError::ExecutionFailed(format!(
+                "Concurrent build forbidden: Builder session '{}' is already actively running for project '{}'.",
+                existing.session_id, project_id
+            )));
+        }
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        self.executions.insert(
+            project_id.to_string(),
+            ActiveBuilderExecution {
+                project_id: project_id.to_string(),
+                session_id: session_id.to_string(),
+                epoch_id: epoch_id.to_string(),
+                conversation_id,
+                model: model.to_string(),
+                effort,
+                icarus_mode,
+                started_at: chrono::Utc::now().to_rfc3339(),
+                cancel_flag: cancel_flag.clone(),
+            },
+        );
+        Ok(cancel_flag)
+    }
+
+    pub fn unregister(&mut self, project_id: &str, session_id: &str) {
+        if let Some(existing) = self.executions.get(project_id) {
+            if existing.session_id == session_id {
+                self.executions.remove(project_id);
+            }
+        }
+    }
+
+    pub fn cancel_project(&self, project_id: &str) -> Result<String, BuilderError> {
+        if let Some(execution) = self.executions.get(project_id) {
+            execution
+                .cancel_flag
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(execution.session_id.clone())
+        } else {
+            Err(BuilderError::ExecutionFailed(format!(
+                "No active Builder session found for project '{}'",
+                project_id
+            )))
+        }
+    }
+
+    pub fn cancel_session(&self, session_id: &str) -> Result<String, BuilderError> {
+        for (proj_id, execution) in &self.executions {
+            if execution.session_id == session_id {
+                execution
+                    .cancel_flag
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return Ok(proj_id.clone());
+            }
+        }
+        Err(BuilderError::ExecutionFailed(format!(
+            "No active Builder session found with session_id '{}'",
+            session_id
+        )))
+    }
+
+    pub fn get_active_execution(&self, project_id: &str) -> Option<ActiveBuilderExecution> {
+        self.executions.get(project_id).cloned()
+    }
+
+    pub fn is_active(&self, project_id: &str) -> bool {
+        self.executions.contains_key(project_id)
+    }
+}
+
 impl AntigravityCliAdapter {
     pub fn discover() -> Result<Self, BuilderError> {
         // 1. PATH lookup for 'agy'
@@ -264,9 +454,13 @@ impl AntigravityCliAdapter {
     }
 
     pub fn get_version(&self) -> Result<String, BuilderError> {
-        let output = std::process::Command::new(&self.bin_path)
-            .arg("--version")
-            .output()?;
+        let output = ProcessRunner::run_sync_bounded(
+            &self.bin_path,
+            &["--version"],
+            None,
+            Duration::from_secs(10),
+        )
+        .map_err(|e| BuilderError::ExecutionFailed(e.to_string()))?;
 
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -278,9 +472,13 @@ impl AntigravityCliAdapter {
     }
 
     pub fn list_models(&self) -> Result<Vec<ModelInfo>, BuilderError> {
-        let output = std::process::Command::new(&self.bin_path)
-            .arg("models")
-            .output()?;
+        let output = ProcessRunner::run_sync_bounded(
+            &self.bin_path,
+            &["models"],
+            None,
+            Duration::from_secs(15),
+        )
+        .map_err(|e| BuilderError::ExecutionFailed(e.to_string()))?;
 
         if !output.status.success() {
             return Err(BuilderError::ExecutionFailed(
@@ -448,10 +646,20 @@ impl AntigravityCliAdapter {
             }
         };
 
+        // Enforce memory bounds on final_text and stderr_buffer
+        if final_text.len() > 5 * 1024 * 1024 {
+            final_text.truncate(5 * 1024 * 1024);
+            final_text.push_str("\n[TRUNCATED: output exceeded 5 MB]");
+        }
+        if stderr_buffer.len() > 5 * 1024 * 1024 {
+            stderr_buffer.truncate(5 * 1024 * 1024);
+            stderr_buffer.push_str("\n[TRUNCATED: stderr exceeded 5 MB]");
+        }
+
         if proc_res.canceled {
             return Ok(BuilderTurnResponse {
                 conversation_id: active_conversation_id,
-                status: "CANCELED".to_string(),
+                status: STATUS_CANCELLED.to_string(),
                 text_response: final_text,
                 cumulative_usage,
                 was_canceled: true,
@@ -462,7 +670,7 @@ impl AntigravityCliAdapter {
         if proc_res.timed_out {
             return Ok(BuilderTurnResponse {
                 conversation_id: active_conversation_id,
-                status: "TIMEOUT".to_string(),
+                status: STATUS_TIMEOUT.to_string(),
                 text_response: final_text,
                 cumulative_usage,
                 was_canceled: false,
@@ -478,10 +686,18 @@ impl AntigravityCliAdapter {
                         stderr_buffer.trim()
                     )));
                 }
-                if final_status == "UNKNOWN" || final_status == "SUCCESS" {
-                    final_status = format!("EXIT_{}", code);
+                if final_status == "UNKNOWN" || final_status == STATUS_SUCCESS {
+                    final_status = STATUS_FAILED.to_string();
                 }
             }
+        }
+
+        if final_status == "SUCCESS" {
+            final_status = STATUS_SUCCESS.to_string();
+        } else if final_status == "ERROR" {
+            final_status = STATUS_FAILED.to_string();
+        } else if final_status == "CANCELED" {
+            final_status = STATUS_CANCELLED.to_string();
         }
 
         Ok(BuilderTurnResponse {
@@ -728,7 +944,7 @@ mod tests {
             .await
             .expect("should return turn response with status");
 
-        assert_eq!(res.status, "ERROR");
+        assert!(res.status == STATUS_FAILED || res.status == "ERROR");
         assert!(res.stderr.contains("permission denied"));
     }
 }

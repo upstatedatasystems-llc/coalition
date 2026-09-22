@@ -1,6 +1,6 @@
 use crate::core::builder::{
-    AgyUsage, BuilderEventRecord, BuilderSessionRecord, ChatGptUsageSummary, IcarusState,
-    PermissionRecord, PermissionRuleRecord,
+    AgyUsage, BuilderEventRecord, BuilderSessionRecord, ChatGptUsageEstimator, ChatGptUsageSummary,
+    IcarusState, PermissionRecord, PermissionRuleRecord,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -316,6 +316,14 @@ impl DbManager {
                     enabled_by TEXT
                 );",
             ),
+            (
+                8,
+                "008_stage3_estimator_calibration",
+                "ALTER TABLE chatgpt_calibration_settings ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE chatgpt_calibration_settings ADD COLUMN chars_per_token REAL NOT NULL DEFAULT 4.0;
+                ALTER TABLE chatgpt_calibration_settings ADD COLUMN sample_count INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE chatgpt_calibration_settings ADD COLUMN last_calibrated_at TEXT;",
+            ),
         ];
 
         let mut applied = Vec::new();
@@ -610,10 +618,36 @@ impl DbManager {
     }
 
     /// Reconciles any orphaned sessions marked RUNNING when Coalition starts up.
-    /// Returns the number of sessions reconciled.
+    /// Records BUILDER_SESSION_INTERRUPTED activity events and returns the number of sessions reconciled.
     pub fn reconcile_orphaned_sessions(&self) -> Result<usize, DbError> {
         let now = chrono::Utc::now().to_rfc3339();
-        let count = self.conn.execute(
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, project_id FROM builder_sessions WHERE status = 'RUNNING'",
+        )?;
+        let orphaned: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (session_id, project_id) in &orphaned {
+            let meta = serde_json::json!({
+                "session_id": session_id,
+                "reason": "startup_reconciliation"
+            });
+            let _ = crate::core::activity::ActivityManager::record_event(
+                &self.conn,
+                project_id,
+                "BUILDER_SESSION_INTERRUPTED",
+                "System",
+                &format!(
+                    "Builder session {} was interrupted by application shutdown or process loss",
+                    session_id
+                ),
+                Some(&meta),
+            );
+        }
+
+        self.conn.execute(
             "UPDATE builder_sessions
              SET status = 'INTERRUPTED',
                  completed_at = ?1,
@@ -621,7 +655,7 @@ impl DbManager {
              WHERE status = 'RUNNING'",
             params![now],
         )?;
-        Ok(count)
+        Ok(orphaned.len())
     }
 
     // Builder Events
@@ -704,14 +738,19 @@ impl DbManager {
         &self,
         project_id: &str,
     ) -> Result<ChatGptUsageSummary, DbError> {
-        let cal_reset_at: Option<String> = self
+        type CalibrationRow = (Option<String>, u32, f64, u32, Option<String>);
+        let cal_row: Option<CalibrationRow> = self
             .conn
             .query_row(
-                "SELECT reset_at FROM chatgpt_calibration_settings WHERE project_id = ?1",
+                "SELECT reset_at, version, chars_per_token, sample_count, last_calibrated_at
+                 FROM chatgpt_calibration_settings WHERE project_id = ?1",
                 params![project_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
+
+        let (cal_reset_at, estimator_version, chars_per_token, sample_count, last_calibrated_at) =
+            cal_row.unwrap_or((None, 1, 4.0, 0, None));
 
         let reset_filter = cal_reset_at.as_deref().unwrap_or("1970-01-01T00:00:00Z");
 
@@ -753,15 +792,74 @@ impl DbManager {
             |r| r.get(0),
         )?;
 
+        let estimated_5h_capacity_pct =
+            Some(((rolling_5h_tokens as f64 / 80_000.0) * 100.0).min(100.0));
+        let estimated_weekly_capacity_pct =
+            Some(((rolling_7d_tokens as f64 / 500_000.0) * 100.0).min(100.0));
+
+        let disclaimer = format!(
+            "Estimated relay throughput based on character heuristics (~{:.1} chars/token). ChatGPT Plus message caps and rate limits are managed by OpenAI and are not provider-reported here.",
+            chars_per_token
+        );
+
         Ok(ChatGptUsageSummary {
             rolling_5h_tokens: rolling_5h_tokens as u64,
             rolling_7d_tokens: rolling_7d_tokens as u64,
             total_tokens: total_tokens as u64,
             total_packets_sent: total_packets_sent as u64,
             total_imports_received: total_imports_received as u64,
-            last_calibrated_at: cal_reset_at,
-            disclaimer: "Estimated relay throughput based on character heuristics (~4 chars/token). ChatGPT Plus message caps and rate limits are managed by OpenAI and are not provider-reported here.".to_string(),
+            last_calibrated_at: last_calibrated_at.or(cal_reset_at),
+            disclaimer,
+            estimator_version,
+            chars_per_token,
+            sample_count,
+            estimated_5h_capacity_pct,
+            estimated_weekly_capacity_pct,
         })
+    }
+
+    pub fn calibrate_chatgpt_estimator(
+        &self,
+        project_id: &str,
+        sample_tokens: u64,
+        sample_chars: usize,
+    ) -> Result<ChatGptUsageEstimator, DbError> {
+        let cal_row: Option<(u32, f64, u32, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT version, chars_per_token, sample_count, last_calibrated_at
+                 FROM chatgpt_calibration_settings WHERE project_id = ?1",
+                params![project_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+
+        let mut estimator = match cal_row {
+            Some((v, cpt, cnt, last_cal)) => ChatGptUsageEstimator::new(v, cpt, cnt, last_cal),
+            None => ChatGptUsageEstimator::default(),
+        };
+
+        estimator.calibrate(sample_tokens, sample_chars);
+
+        self.conn.execute(
+            "INSERT INTO chatgpt_calibration_settings (project_id, version, chars_per_token, sample_count, last_calibrated_at, notes)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'Calibrated via sample')
+             ON CONFLICT(project_id) DO UPDATE SET
+                 version = excluded.version,
+                 chars_per_token = excluded.chars_per_token,
+                 sample_count = excluded.sample_count,
+                 last_calibrated_at = excluded.last_calibrated_at,
+                 notes = excluded.notes",
+            params![
+                project_id,
+                estimator.version,
+                estimator.chars_per_token,
+                estimator.sample_count,
+                estimator.last_calibrated_at,
+            ],
+        )?;
+
+        Ok(estimator)
     }
 
     pub fn reset_chatgpt_usage(&self, project_id: &str) -> Result<(), DbError> {
@@ -937,7 +1035,7 @@ mod tests {
     fn test_sqlite_in_memory_migrations_and_proof() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let result = db.run_proof().expect("run proof");
-        assert_eq!(result.applied_migrations.len(), 7);
+        assert_eq!(result.applied_migrations.len(), 8);
         assert_eq!(result.applied_migrations[0].version, 1);
         assert_eq!(result.applied_migrations[1].version, 2);
         assert_eq!(result.applied_migrations[2].version, 3);
@@ -945,6 +1043,7 @@ mod tests {
         assert_eq!(result.applied_migrations[4].version, 5);
         assert_eq!(result.applied_migrations[5].version, 6);
         assert_eq!(result.applied_migrations[6].version, 7);
+        assert_eq!(result.applied_migrations[7].version, 8);
         assert_eq!(result.test_record_id, 1);
         assert_eq!(result.total_records, 1);
 
@@ -1002,13 +1101,14 @@ mod tests {
 
         let mut db = DbManager { conn };
         let applied = db.run_migrations().expect("run forward migrations");
-        assert_eq!(applied.len(), 6);
+        assert_eq!(applied.len(), 7);
         assert_eq!(applied[0].version, 2);
         assert_eq!(applied[1].version, 3);
         assert_eq!(applied[2].version, 4);
         assert_eq!(applied[3].version, 5);
         assert_eq!(applied[4].version, 6);
         assert_eq!(applied[5].version, 7);
+        assert_eq!(applied[6].version, 8);
 
         // Verify Phase 0 data preserved
         let count: i64 = db
@@ -1044,7 +1144,7 @@ mod tests {
     fn test_migrations_already_migrated_is_idempotent() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let applied1 = db.run_migrations().expect("first migration run");
-        assert_eq!(applied1.len(), 7);
+        assert_eq!(applied1.len(), 8);
 
         let applied2 = db.run_migrations().expect("second migration run");
         assert_eq!(applied2.len(), 0);
@@ -1120,6 +1220,17 @@ mod tests {
             .error_message
             .unwrap()
             .contains("Session interrupted"));
+
+        // Verify BUILDER_SESSION_INTERRUPTED activity event was recorded
+        let event_count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM activity_events WHERE project_id = 'p1' AND event_type = 'BUILDER_SESSION_INTERRUPTED'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
     }
 
     #[test]
@@ -1180,5 +1291,37 @@ mod tests {
         db.set_icarus_state("p1", false, Some("HUMAN")).unwrap();
         let state2 = db.get_icarus_state("p1").unwrap();
         assert!(!state2.enabled);
+    }
+
+    #[test]
+    fn test_calibrate_chatgpt_estimator() {
+        let mut db = DbManager::new_in_memory().expect("in memory db");
+        db.run_migrations().expect("migrations");
+
+        db.connection()
+            .execute(
+                "INSERT INTO projects (project_id, name, repository_path, created_at, updated_at, last_opened_at)
+                 VALUES ('p1', 'Test', '/path/test', 'now', 'now', 'now')",
+                [],
+            )
+            .unwrap();
+
+        // Default before calibration: chars_per_token = 4.0, version = 1, sample_count = 0
+        let summary0 = db.get_chatgpt_usage_summary("p1").unwrap();
+        assert_eq!(summary0.chars_per_token, 4.0);
+        assert_eq!(summary0.estimator_version, 1);
+        assert_eq!(summary0.sample_count, 0);
+
+        // Calibrate with sample: 1000 tokens for 3500 chars (observed: 3.5 chars/token)
+        let est = db.calibrate_chatgpt_estimator("p1", 1000, 3500).unwrap();
+        assert_eq!(est.version, 2);
+        assert_eq!(est.sample_count, 1);
+        assert_eq!(est.chars_per_token, 3.5);
+
+        let summary1 = db.get_chatgpt_usage_summary("p1").unwrap();
+        assert_eq!(summary1.chars_per_token, 3.5);
+        assert_eq!(summary1.estimator_version, 2);
+        assert_eq!(summary1.sample_count, 1);
+        assert!(summary1.last_calibrated_at.is_some());
     }
 }

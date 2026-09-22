@@ -13,13 +13,14 @@ Coalition provides comprehensive visibility into model resource consumption with
 - Recorded per session in the `builder_sessions` operational database table.
 - Displayed with the **Provider-Reported** badge in the Builder Control Plane.
 
-### 2. ChatGPT Architecture Relay Metrics (Estimated)
+### 2. ChatGPT Architecture Relay Metrics (Estimated & Calibrated)
 - Because ChatGPT interaction is an explicit human relay without direct API ties, tokens cannot be fetched from OpenAI.
-- Estimated conservatively using the standard rule of thumb: `estimated_tokens = round(char_count / 4.0)`.
-- Recorded for both `OUTBOUND_PACKET` (packet copied to clipboard) and `INBOUND_IMPORT` (architecture preview imported from clipboard).
+- Estimated conservatively using a calibrated estimator (`ChatGptUsageEstimator`, default: `4.0 chars/token`).
+- Recorded for both `OUTBOUND_PACKET` (when copied to clipboard via `copy_relay_packet_to_clipboard`) and `INBOUND_IMPORT` (when architecture preview is imported from clipboard). Prompt drafting alone does not increment usage until actually copied.
 - Aggregated across two key operational windows:
-  - **Rolling 5-Hour Window**: Tracks active burst throughput.
-  - **Weekly Rolling Window**: Tracks cumulative sprint volume.
-- Includes a dedicated "Reset 5h/7d Usage Window" control allowing the human to recalibrate their tracking period.
+  - **Rolling 5-Hour Window**: Tracks active burst throughput with an estimated capacity percentage against typical tier limits.
+  - **Weekly Rolling Window**: Tracks cumulative sprint volume with weekly capacity percentage.
+- **Human Calibration**: Includes an interactive estimator calibration modal and `calibrate_chatgpt_usage` command. The user can submit a sample character count alongside an observed OpenAI token count to tune `chars_per_token` and increment the estimator version.
+- Includes a dedicated "Reset Window" control allowing the human to restart their tracking window.
 - Always accompanied by the prominent disclaimer:
   *"Estimated relay throughput (~4 chars/token heuristic). Does not reflect official OpenAI billing or subscription usage."*
