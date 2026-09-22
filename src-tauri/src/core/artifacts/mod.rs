@@ -393,8 +393,12 @@ impl ArtifactManager {
     }
 
     /// Cleans up any stale .staging-restore-* directories in .coalition/recovery/ from interrupted restorations.
+    /// If `active_staging_id` is provided, skips `.staging-restore-<active_staging_id>` so active restoration evidence is preserved.
     /// Fails closed if cleanup cannot establish a known-safe state.
-    pub fn clean_stale_restore_staging(coalition_dir: &Path) -> Result<(), ArtifactError> {
+    pub fn clean_stale_restore_staging(
+        coalition_dir: &Path,
+        active_staging_id: Option<&str>,
+    ) -> Result<(), ArtifactError> {
         let recovery_dir = coalition_dir.join("recovery");
         if !recovery_dir.exists() {
             return Ok(());
@@ -409,6 +413,8 @@ impl ArtifactManager {
             }
         };
 
+        let active_dir_name = active_staging_id.map(|id| format!(".staging-restore-{}", id));
+
         for entry in entries {
             let entry = entry.map_err(|e| {
                 ArtifactError::RecoveryRequired(format!(
@@ -418,6 +424,12 @@ impl ArtifactManager {
             })?;
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with(".staging-restore-") {
+                if let Some(ref active_name) = active_dir_name {
+                    if &name == active_name {
+                        // Preserve active restoration staging directory
+                        continue;
+                    }
+                }
                 let path = entry.path();
                 if path.is_dir() {
                     fs::remove_dir_all(&path).map_err(|e| {

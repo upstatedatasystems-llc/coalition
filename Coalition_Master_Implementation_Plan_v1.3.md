@@ -2597,53 +2597,28 @@ V1.1 adds macOS CI once macOS implementation begins.
 
 ---
 
-# 39. Current and Next Antigravity Assignment — Stage 2
-
-Stage 1 is complete.
-
-Stage 2 — Architecture Contract is in progress.
-
-The first internal checkpoint, **ChatGPT Relay and Architecture Workspace**, is complete in the current repository baseline.
-
-The next and only remaining Stage 2 implementation work is **Architecture Freeze and Git Boundaries**.
-
-Before resuming implementation, ensure the repository root contains this Plan v1.3 as the authoritative master plan and remove or clearly archive superseded master-plan copies so Antigravity cannot mistake v1.0/v1.1 for current instructions.
-
-Resume from the current code. Do not reopen completed Stage 1 or relay/workspace work except to fix a regression discovered by the remaining Stage 2 implementation.
-
-The remaining Stage 2 work must be grounded in Section 30 and must:
-
-- preserve the completed relay/workspace architecture and its recovery/security invariants;
-- use the authoritative Rust-owned readiness rules as the prerequisite for freeze;
-- implement explicit human-only architecture freeze;
-- create versioned immutable architecture snapshots;
-- update `project.yaml` consistently and crash-safely;
-- record the Git/contract boundary;
-- detect frozen-contract drift;
-- provide inspect/restore/safe-escalation handling for drift without prematurely implementing the later Architecture Change workflow;
-- generate the bounded Builder packet required for Stage 3;
-- add focused Rust/frontend/integration tests;
-- update documentation;
-- run the full Coalition validation suite;
-- perform the complete Stage 2 desktop smoke journey;
-- commit recoverable boundaries;
-- return one complete **Stage 2 completion report** for human review.
-
-The Stage 2 assignment ends only after the complete journey works:
+# 39. Current and Next Antigravity Assignment — Stage 3
 
 ```text
-project
-→ Architect relay
-→ imported structured design
-→ governed architecture workspace
-→ readiness
-→ explicit human freeze
-→ Architecture v1.0
-→ frozen Git/contract boundary
-→ Builder packet
+Stage 1 — COMPLETE
+Stage 2 — COMPLETE
+Stage 3 — NEXT
 ```
 
-Do not begin Stage 3 automatically. After Stage 2 is human-reviewed and accepted, issue one **Stage 3 — Builder Control Plane** assignment. Stage 3 will internally execute Builder Integration, Permissions and Icarus, and Usage and Capacity without separate human-issued A/B/C prompts.
+Stage 1 and Stage 2 are complete and verified.
+
+The next assignment is the single, undivided:
+
+```text
+Stage 3 — Builder Control Plane
+```
+
+Stage 3 will internally execute its three constituent checkpoints:
+1. **Antigravity Builder Integration** (adapter-isolated CLI child processes, streaming NDJSON parser, bounded output buffers);
+2. **Permissions and Icarus** (least-privilege approval gates, visible Icarus auto-approval toggle);
+3. **Usage and Capacity** (token and cost accounting, session metrics, capacity limits).
+
+In accordance with Section 28 and Section 37, Stage 3 is executed under a single human assignment without splitting into separately prompted A/B/C phases. Do not begin Stage 3 automatically until explicitly instructed by the human.
 
 ---
 # 40. Master Product Principle
