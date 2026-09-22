@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added - Stage 3 (Builder Control Plane)
+- Common bounded process execution layer (`ProcessRunner`): eliminated stream busy-spinning with guarded `select!` loop, implemented Windows process-tree termination via `taskkill /F /T /PID` to prevent orphaned child processes, and added asynchronous stdin streaming with clean EOF closure.
+- Memory-bounded output capture: buffers up to 10,000 lines or 10 MB per turn with explicit `is_truncated` tracking, preventing runaway memory exhaustion during excessive generation.
+- Production `AntigravityCliAdapter` execution: routes headless stream-json execution through `ProcessRunner`, dynamically parsing `init`, `step_update`, and `result` NDJSON events.
+- Frozen Builder Packet authority: Builder turn prompt strictly derived from the Stage 2 frozen `builder-packet.json` contract, epoch ID, and rules with zero frontend arbitrary prompt override.
+- Strict workflow & contract drift gating: blocks Builder turns if workflow state is not `FROZEN`, `BUILDING`, or `CORRECTIONS_REQUIRED`, automatically transitions `FROZEN` to `BUILDING`, and fails closed if frozen contract drift is detected.
+- Dynamic Antigravity model discovery & safe switching: queries available models via `agy models`, exposes reasoning effort (`--effort low|medium|high`), and supports safe model switching mid-conversation by providing a new `--model` alongside existing `--conversation`.
+- Startup session reconciliation: automatically reconciles orphaned `RUNNING` sessions from previous app runs or unexpected crashes to `INTERRUPTED` on startup, logging activity events without touching durable project truth.
+- Permission architecture & Icarus autonomy: governed autonomy at the launch boundary via explicit Icarus Mode (`--dangerously-skip-permissions`), tool risk classification (`READ_ONLY`, `MUTATING`, `HIGH_RISK`), audit history in `builder_permission_history`, and actionable guidance for blocked actions.
+- Capacity & usage telemetry: authoritative provider-reported token tracking for Antigravity, heuristic ChatGPT token estimation (~4 chars/token heuristic) across 5-hour rolling and weekly windows, calibration reset controls, and prominent disclaimers.
+- Desktop Builder Control Plane UI: `BuilderControlPlaneView` tab in `ProjectDetailView`, featuring persistent glowing amber/red Icarus warning banner, configuration controls, live streaming terminal with auto-scroll, telemetry cards, permission history, and packet inspector modal.
+- Zero-quota test double (`fake-agy.cjs`): deterministic CLI simulation for CI and automated testing, covering models, effort, multi-turn conversation persistence, permission denial, and stderr warnings.
+
 ### Added - Stage 2 (Architecture Freeze and Git Boundaries)
 - Explicit human-only architecture freeze: readiness-gated transition (`READY_TO_FREEZE` -> `FROZEN`) requiring all required contract artifacts to be substantively complete with zero machine bypass.
 - Single-use server-owned `preview_id`: bound freeze confirmation to an authoritative database-backed preview ID, preventing client parameter tampering, stale previews, or duplicate confirmations.

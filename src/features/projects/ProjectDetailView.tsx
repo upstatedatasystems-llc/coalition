@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { ProjectDetails, ActivityEventRecord } from '../../types';
 import { ActivityLogView } from '../activity/ActivityLogView';
 import { ArchitectureWorkspaceView } from '../architecture/ArchitectureWorkspaceView';
+import { BuilderControlPlaneView } from '../builder/BuilderControlPlaneView';
 
 interface ProjectDetailViewProps {
   details: ProjectDetails;
@@ -19,7 +20,7 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
   isRefreshing,
 }) => {
   const { project, workflow_state, artifact, git, is_available } = details;
-  const [activeSubTab, setActiveSubTab] = useState<'workspace' | 'overview'>('workspace');
+  const [activeSubTab, setActiveSubTab] = useState<'workspace' | 'builder' | 'overview'>('workspace');
 
   React.useEffect(() => {
     const handleRelayImported = () => {
@@ -46,6 +47,14 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
             disabled={!is_available}
           >
             Architecture Workspace
+          </button>
+          <button
+            className={`subtab-btn ${activeSubTab === 'builder' ? 'active' : ''}`}
+            onClick={() => setActiveSubTab('builder')}
+            disabled={!is_available}
+            data-testid="builder-subtab-btn"
+          >
+            Builder Control Plane
           </button>
           <button
             className={`subtab-btn ${activeSubTab === 'overview' ? 'active' : ''}`}
@@ -83,14 +92,25 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
         </p>
       </header>
 
-      {is_available && activeSubTab === 'workspace' ? (
+      {is_available && activeSubTab === 'workspace' && (
         <ArchitectureWorkspaceView
           projectId={project.project_id}
           projectName={project.name}
           workflowState={workflow_state.state}
           onRefreshProject={onRefresh}
         />
-      ) : (
+      )}
+
+      {is_available && activeSubTab === 'builder' && (
+        <BuilderControlPlaneView
+          projectId={project.project_id}
+          projectName={project.name}
+          workflowState={workflow_state.state}
+          onRefreshProject={onRefresh}
+        />
+      )}
+
+      {(!is_available || activeSubTab === 'overview') && (
         <>
           <div className="detail-sections-grid">
             <section className="detail-card">

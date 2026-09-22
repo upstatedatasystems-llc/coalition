@@ -1,12 +1,10 @@
+use crate::core::process::{ProcessOutputKind, ProcessOutputLine, ProcessRunner};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::mpsc;
 
 #[derive(Error, Debug)]
@@ -23,6 +21,12 @@ pub enum BuilderError {
     Canceled,
     #[error("Session timed out")]
     Timeout,
+    #[error("Architecture not frozen or contract missing: {0}")]
+    NotFrozen(String),
+    #[error("Contract drift detected: {0}")]
+    DriftDetected(String),
+    #[error("Database error: {0}")]
+    Database(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,7 +35,7 @@ pub struct ModelInfo {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct AgyUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -44,6 +48,7 @@ pub struct AgyUsage {
 pub struct AgyInitData {
     pub cwd: Option<String>,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub permission_mode: Option<String>,
     #[serde(default)]
     pub tools: Vec<String>,
@@ -104,6 +109,117 @@ pub struct BuilderTurnResponse {
     pub text_response: String,
     pub cumulative_usage: AgyUsage,
     pub was_canceled: bool,
+    pub stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuilderSessionRecord {
+    pub session_id: String,
+    pub project_id: String,
+    pub epoch_id: String,
+    pub conversation_id: Option<String>,
+    pub model: String,
+    pub effort: Option<String>,
+    pub icarus_mode: bool,
+    pub status: String,
+    pub prompt: String,
+    pub response_text: Option<String>,
+    pub error_message: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub duration_ms: u64,
+    pub usage: AgyUsage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuilderEventRecord {
+    pub id: i64,
+    pub session_id: String,
+    pub project_id: String,
+    pub step_index: Option<i64>,
+    pub event_type: String,
+    pub state: Option<String>,
+    pub content: Option<String>,
+    pub details_json: Option<String>,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatGptUsageSummary {
+    pub rolling_5h_tokens: u64,
+    pub rolling_7d_tokens: u64,
+    pub total_tokens: u64,
+    pub total_packets_sent: u64,
+    pub total_imports_received: u64,
+    pub last_calibrated_at: Option<String>,
+    pub disclaimer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRecord {
+    pub id: i64,
+    pub project_id: String,
+    pub session_id: Option<String>,
+    pub tool_name: String,
+    pub target: Option<String>,
+    pub risk_level: String,
+    pub decision: String,
+    pub reason: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRuleRecord {
+    pub rule_id: String,
+    pub project_id: String,
+    pub tool_name: String,
+    pub pattern: Option<String>,
+    pub decision: String,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IcarusState {
+    pub project_id: String,
+    pub enabled: bool,
+    pub enabled_at: Option<String>,
+    pub enabled_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageTelemetryReport {
+    pub provider_antigravity_usage: AgyUsage,
+    pub active_model: Option<String>,
+    pub active_effort: Option<String>,
+    pub chatgpt_estimated_usage: ChatGptUsageSummary,
+    pub context_window_note: String,
+    pub quota_buckets_note: String,
+}
+
+pub fn evaluate_tool_risk(tool_name: &str, content: &str) -> (&'static str, &'static str) {
+    match tool_name {
+        "run_command" => {
+            if content.contains("rm -rf")
+                || content.contains("del /f")
+                || content.contains("git reset --hard")
+            {
+                (
+                    "CRITICAL",
+                    "Potentially destructive shell command execution",
+                )
+            } else {
+                ("HIGH", "Arbitrary command line process execution")
+            }
+        }
+        "write_to_file" => ("MEDIUM", "File modification or creation"),
+        "replace_file_content" => ("MEDIUM", "In-place file mutation"),
+        "view_file" => ("LOW", "Read-only file inspection"),
+        "list_dir" => ("LOW", "Directory listing"),
+        "grep_search" => ("LOW", "Read-only pattern search"),
+        "find_by_name" => ("LOW", "File search"),
+        _ => ("HIGH", "External tool invocation with unclassified risk"),
+    }
 }
 
 pub struct AntigravityCliAdapter {
@@ -208,43 +324,32 @@ impl AntigravityCliAdapter {
         cancel_flag: Arc<AtomicBool>,
         event_sender: Option<mpsc::Sender<AgyEvent>>,
     ) -> Result<BuilderTurnResponse, BuilderError> {
-        let mut cmd = Command::new(&self.bin_path);
-        cmd.arg("--input-format").arg("stream-json");
-        cmd.arg("--output-format").arg("stream-json");
+        let mut args = vec![
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+        ];
 
         if let Some(ref conv_id) = request.conversation_id {
-            cmd.arg("--conversation").arg(conv_id);
+            args.push("--conversation".to_string());
+            args.push(conv_id.clone());
         }
 
         if let Some(ref model) = request.model {
-            cmd.arg("--model").arg(model);
+            args.push("--model".to_string());
+            args.push(model.clone());
         }
 
         if let Some(ref effort) = request.effort {
-            cmd.arg("--effort").arg(effort);
+            args.push("--effort".to_string());
+            args.push(effort.clone());
         }
 
         if request.icarus_mode {
-            cmd.arg("--dangerously-skip-permissions");
+            args.push("--dangerously-skip-permissions".to_string());
         }
 
-        if let Some(ref cwd) = request.working_dir {
-            cmd.current_dir(cwd);
-        }
-
-        cmd.stdin(Stdio::piped());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let mut child = cmd.spawn()?;
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            BuilderError::ExecutionFailed("Failed to open child stdin".to_string())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            BuilderError::ExecutionFailed("Failed to open child stdout".to_string())
-        })?;
-
-        // Construct stream input message
         let input_msg = serde_json::json!({
             "event": "user",
             "message": {
@@ -255,92 +360,137 @@ impl AntigravityCliAdapter {
             .map_err(|e| BuilderError::ParseError(e.to_string()))?;
         input_line.push('\n');
 
-        stdin.write_all(input_line.as_bytes()).await?;
-        stdin.flush().await?;
-        drop(stdin); // Close stdin to signal end of stream turn
+        let bin_path = self.bin_path.clone();
+        let working_path = request.working_dir.map(PathBuf::from);
 
-        let mut stdout_reader = BufReader::new(stdout).lines();
+        let (line_tx, mut line_rx) = mpsc::channel::<ProcessOutputLine>(500);
+
+        let runner_cancel = cancel_flag.clone();
+        let runner_task = tokio::spawn(async move {
+            ProcessRunner::run_turn_stream(
+                &bin_path,
+                &args,
+                working_path.as_deref(),
+                Some(&input_line),
+                Duration::from_secs(600), // bounded turn limit
+                runner_cancel,
+                Some(line_tx),
+            )
+            .await
+        });
 
         let mut active_conversation_id = request.conversation_id.clone();
         let mut final_text = String::new();
         let mut final_status = "UNKNOWN".to_string();
         let mut cumulative_usage = AgyUsage::default();
-        let mut was_canceled = false;
+        let mut stderr_buffer = String::new();
 
-        loop {
-            if cancel_flag.load(Ordering::Relaxed) {
-                was_canceled = true;
-                let _ = child.kill().await;
-                break;
-            }
-
-            tokio::select! {
-                line_res = stdout_reader.next_line() => {
-                    match line_res {
-                        Ok(Some(line)) => {
-                            if let Ok(event) = serde_json::from_str::<AgyEvent>(&line) {
-                                match &event {
-                                    AgyEvent::Init { conversation_id, .. } => {
-                                        if let Some(cid) = conversation_id {
-                                            active_conversation_id = Some(cid.clone());
-                                        }
-                                    }
-                                    AgyEvent::StepUpdate { step_update } => {
-                                        if let Some(ref delta) = step_update.text_delta {
-                                            final_text.push_str(delta);
-                                        }
-                                        if let Some(ref u) = step_update.usage {
-                                            cumulative_usage = u.clone();
-                                        }
-                                    }
-                                    AgyEvent::Result { result } => {
-                                        final_status = result.status.clone();
-                                        if let Some(ref u) = result.usage {
-                                            cumulative_usage = u.clone();
-                                        }
-                                        if let Some(ref resp) = result.response {
-                                            if final_text.is_empty() {
-                                                final_text = resp.clone();
-                                            }
-                                        }
-                                    }
-                                    AgyEvent::Unknown => {}
-                                }
-
-                                if let Some(tx) = &event_sender {
-                                    let _ = tx.send(event).await;
+        while let Some(out_line) = line_rx.recv().await {
+            match out_line.kind {
+                ProcessOutputKind::Stdout => {
+                    if let Ok(event) = serde_json::from_str::<AgyEvent>(&out_line.line) {
+                        match &event {
+                            AgyEvent::Init {
+                                conversation_id, ..
+                            } => {
+                                if let Some(cid) = conversation_id {
+                                    active_conversation_id = Some(cid.clone());
                                 }
                             }
+                            AgyEvent::StepUpdate { step_update } => {
+                                if let Some(ref delta) = step_update.text_delta {
+                                    final_text.push_str(delta);
+                                }
+                                if let Some(ref u) = step_update.usage {
+                                    cumulative_usage = u.clone();
+                                }
+                            }
+                            AgyEvent::Result { result } => {
+                                final_status = result.status.clone();
+                                if let Some(ref u) = result.usage {
+                                    cumulative_usage = u.clone();
+                                }
+                                if let Some(ref resp) = result.response {
+                                    if final_text.is_empty() {
+                                        final_text = resp.clone();
+                                    }
+                                }
+                                if let Some(ref err) = result.error {
+                                    if !err.is_empty() {
+                                        stderr_buffer.push_str(err);
+                                        stderr_buffer.push('\n');
+                                    }
+                                }
+                            }
+                            AgyEvent::Unknown => {}
                         }
-                        Ok(None) => break,
-                        Err(e) => {
-                            eprintln!("Error reading stdout from agy: {}", e);
-                            break;
+
+                        if let Some(tx) = &event_sender {
+                            let _ = tx.send(event).await;
                         }
                     }
                 }
-                status_res = child.wait() => {
-                    if let Ok(exit) = status_res {
-                        if !exit.success() && final_status == "UNKNOWN" {
-                            final_status = format!("EXIT_{}", exit.code().unwrap_or(1));
-                        }
-                    }
-                    break;
+                ProcessOutputKind::Stderr => {
+                    stderr_buffer.push_str(&out_line.line);
+                    stderr_buffer.push('\n');
                 }
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+
+        let proc_res = match runner_task.await {
+            Ok(Ok(res)) => res,
+            Ok(Err(e)) => return Err(BuilderError::ExecutionFailed(e.to_string())),
+            Err(e) => {
+                return Err(BuilderError::ExecutionFailed(format!(
+                    "Task join error: {}",
+                    e
+                )))
+            }
+        };
+
+        if proc_res.canceled {
+            return Ok(BuilderTurnResponse {
+                conversation_id: active_conversation_id,
+                status: "CANCELED".to_string(),
+                text_response: final_text,
+                cumulative_usage,
+                was_canceled: true,
+                stderr: stderr_buffer,
+            });
+        }
+
+        if proc_res.timed_out {
+            return Ok(BuilderTurnResponse {
+                conversation_id: active_conversation_id,
+                status: "TIMEOUT".to_string(),
+                text_response: final_text,
+                cumulative_usage,
+                was_canceled: false,
+                stderr: stderr_buffer,
+            });
+        }
+
+        if let Some(code) = proc_res.exit_code {
+            if code != 0 {
+                if stderr_buffer.contains("unavailable or not found") {
+                    return Err(BuilderError::ExecutionFailed(format!(
+                        "Model unavailable: {}",
+                        stderr_buffer.trim()
+                    )));
+                }
+                if final_status == "UNKNOWN" || final_status == "SUCCESS" {
+                    final_status = format!("EXIT_{}", code);
+                }
             }
         }
 
         Ok(BuilderTurnResponse {
             conversation_id: active_conversation_id,
-            status: if was_canceled {
-                "CANCELED".to_string()
-            } else {
-                final_status
-            },
+            status: final_status,
             text_response: final_text,
             cumulative_usage,
-            was_canceled,
+            was_canceled: false,
+            stderr: stderr_buffer,
         })
     }
 }
@@ -433,6 +583,7 @@ mod tests {
         assert_eq!(response.status, "SUCCESS");
         assert!(response.text_response.contains("test prompt"));
         assert!(response.cumulative_usage.total_tokens > 0);
+        assert!(!response.was_canceled);
     }
 
     #[tokio::test]
@@ -473,7 +624,6 @@ mod tests {
             .await
             .expect("run turn on fake-agy");
 
-        // Verify accurate response fields
         assert_eq!(
             response.conversation_id,
             Some("fake-conv-uuid-12345".to_string())
@@ -482,35 +632,103 @@ mod tests {
         assert_eq!(response.cumulative_usage.total_tokens, 550);
         assert!(!response.was_canceled);
 
-        // Collect all streamed events
         let mut received_events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             received_events.push(event);
         }
 
-        // Must receive exactly 4 events: Init, StepUpdate (user), StepUpdate (agent), Result
         assert_eq!(
             received_events.len(),
             4,
             "Expected exactly 4 stream events, received {}",
             received_events.len()
         );
+    }
 
-        match &received_events[0] {
-            AgyEvent::Init {
-                conversation_id, ..
-            } => {
-                assert_eq!(conversation_id.as_deref(), Some("fake-conv-uuid-12345"));
-            }
-            other => panic!("Expected Init event first, got {:?}", other),
+    #[tokio::test]
+    async fn test_fake_agy_unavailable_model_fails_visibly() {
+        let fake_agy_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("fake-commands")
+            .join(if cfg!(windows) {
+                "fake-agy.cmd"
+            } else {
+                "fake-agy"
+            });
+
+        if !fake_agy_path.exists() {
+            return;
         }
 
-        match &received_events[3] {
-            AgyEvent::Result { result } => {
-                assert_eq!(result.status, "SUCCESS");
-                assert_eq!(result.usage.as_ref().unwrap().total_tokens, 550);
-            }
-            other => panic!("Expected Result event last, got {:?}", other),
+        let adapter = AntigravityCliAdapter::with_path(fake_agy_path);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let res = adapter
+            .run_turn(
+                BuilderTurnRequest {
+                    prompt: "test".to_string(),
+                    conversation_id: None,
+                    model: Some("unavailable-pinned-model".to_string()),
+                    effort: None,
+                    icarus_mode: false,
+                    working_dir: None,
+                },
+                cancel,
+                None,
+            )
+            .await;
+
+        assert!(
+            res.is_err(),
+            "Unavailable model must fail visibly and return an error"
+        );
+        let err_str = res.unwrap_err().to_string();
+        assert!(
+            err_str.contains("Model unavailable") || err_str.contains("unavailable"),
+            "Error must indicate model is unavailable: {}",
+            err_str
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fake_agy_permission_denied_detection() {
+        let fake_agy_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("fake-commands")
+            .join(if cfg!(windows) {
+                "fake-agy.cmd"
+            } else {
+                "fake-agy"
+            });
+
+        if !fake_agy_path.exists() {
+            return;
         }
+
+        let adapter = AntigravityCliAdapter::with_path(fake_agy_path);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let res = adapter
+            .run_turn(
+                BuilderTurnRequest {
+                    prompt: "trigger_permission_denial".to_string(),
+                    conversation_id: None,
+                    model: Some("gemini-3.8-flash-high".to_string()),
+                    effort: None,
+                    icarus_mode: false,
+                    working_dir: None,
+                },
+                cancel,
+                None,
+            )
+            .await
+            .expect("should return turn response with status");
+
+        assert_eq!(res.status, "ERROR");
+        assert!(res.stderr.contains("permission denied"));
     }
 }

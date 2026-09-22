@@ -128,13 +128,12 @@ export interface AgyEvent {
 }
 
 export interface BuilderTurnResponse {
-  conversation_id: string;
-  success: boolean;
-  exit_code: number | null;
-  stdout: string;
+  conversation_id?: string | null;
+  status: string;
+  text_response: string;
+  cumulative_usage: AgyUsage;
+  was_canceled: boolean;
   stderr: string;
-  duration_ms: number;
-  events: AgyEvent[];
 }
 
 // Stage 2A ChatGPT Relay & Architecture Workspace Types
@@ -350,3 +349,87 @@ export interface DriftDiff {
   frozen_content: string | null;
   active_content: string | null;
 }
+
+// Stage 3 Builder Control Plane Types
+export interface AgyUsage {
+  input_tokens: number;
+  output_tokens: number;
+  thinking_tokens: number;
+  cache_read_tokens: number;
+  total_tokens: number;
+}
+
+export interface BuilderSessionRecord {
+  session_id: string;
+  project_id: string;
+  epoch_id: string;
+  conversation_id?: string | null;
+  model: string;
+  effort?: string | null;
+  icarus_mode: boolean;
+  status: 'RUNNING' | 'SUCCESS' | 'INTERRUPTED' | 'CANCELLED' | 'FAILED';
+  prompt: string;
+  response_text?: string | null;
+  error_message?: string | null;
+  started_at: string;
+  completed_at?: string | null;
+  duration_ms: number;
+  usage: AgyUsage;
+}
+
+export interface BuilderEventRecord {
+  id: number;
+  session_id: string;
+  project_id: string;
+  step_index?: number | null;
+  event_type: string;
+  state?: string | null;
+  content?: string | null;
+  details_json?: string | null;
+  timestamp: string;
+}
+
+export interface ChatGptUsageSummary {
+  rolling_5h_tokens: number;
+  rolling_7d_tokens: number;
+  total_tokens: number;
+  total_packets_sent: number;
+  total_imports_received: number;
+  last_calibrated_at?: string | null;
+  disclaimer: string;
+}
+
+export interface UsageTelemetryReport {
+  provider_antigravity_usage: AgyUsage;
+  active_model?: string | null;
+  active_effort?: string | null;
+  chatgpt_estimated_usage: ChatGptUsageSummary;
+}
+
+export interface PermissionRecord {
+  id: number;
+  project_id: string;
+  session_id?: string | null;
+  tool_name: string;
+  target?: string | null;
+  risk_level: string;
+  decision: string;
+  reason?: string | null;
+  created_at: string;
+}
+
+export interface IcarusState {
+  project_id: string;
+  enabled: boolean;
+  enabled_at?: string | null;
+  enabled_by?: string | null;
+}
+
+export interface StartBuilderTurnPayload {
+  projectId: string;
+  model?: string | null;
+  effort?: string | null;
+  followUpPrompt?: string | null;
+  useFakeAgy?: boolean;
+}
+

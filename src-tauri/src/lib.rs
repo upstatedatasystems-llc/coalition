@@ -17,6 +17,7 @@ pub fn run() {
             let db = if let Ok(custom_path) = std::env::var("COALITION_DB_PATH") {
                 let mut d = DbManager::open(custom_path).expect("Failed to open custom database");
                 d.run_migrations().expect("Failed to run migrations");
+                let _ = d.reconcile_orphaned_sessions();
                 d
             } else {
                 let app_dir = app
@@ -27,6 +28,7 @@ pub fn run() {
                 let db_path = app_dir.join("coalition.db");
                 let mut d = DbManager::open(db_path).expect("Failed to open operational database");
                 d.run_migrations().expect("Failed to run migrations");
+                let _ = d.reconcile_orphaned_sessions();
                 d
             };
 
@@ -82,8 +84,17 @@ pub fn run() {
             commands::get_last_opened_project_id,
             commands::get_system_diagnostics,
             commands::run_sqlite_proof,
+            commands::list_builder_models,
+            commands::get_builder_session,
+            commands::list_builder_sessions,
+            commands::get_builder_events,
             commands::start_builder_turn,
             commands::cancel_builder_turn,
+            commands::get_usage_telemetry,
+            commands::reset_chatgpt_usage,
+            commands::get_permission_history,
+            commands::get_icarus_state,
+            commands::set_icarus_mode,
             commands::desktop_clipboard_write,
             commands::desktop_clipboard_read,
             commands::desktop_open_url,

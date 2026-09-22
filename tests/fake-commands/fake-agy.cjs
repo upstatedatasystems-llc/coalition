@@ -6,6 +6,9 @@
  */
 
 const readline = require('readline');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 function main() {
   const args = process.argv.slice(2);
@@ -20,8 +23,13 @@ function main() {
   if (args[0] === 'models') {
     console.log('Fetching available models...');
     console.log('gemini-3.8-flash-high\tGemini 3.8 Flash (High)');
+    console.log('gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)');
+    console.log('gemini-3.8-flash-low\tGemini 3.8 Flash (Low)');
+    console.log('gemini-3.7-flash-high\tGemini 3.7 Flash (High)');
     console.log('gemini-3.7-flash-medium\tGemini 3.7 Flash (Medium)');
     console.log('claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)');
+    console.log('claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)');
+    console.log('gpt-oss-120b-medium\tGPT-OSS 120B (Medium)');
     process.exit(0);
   }
 
@@ -35,9 +43,12 @@ function main() {
   const modelIndex = args.indexOf('--model');
   const modelName = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'gemini-3.8-flash-high';
 
+  const effortIndex = args.indexOf('--effort');
+  const effortLevel = effortIndex !== -1 && args[effortIndex + 1] ? args[effortIndex + 1] : 'medium';
+
   const mode = process.env.FAKE_AGY_MODE || 'success';
 
-  if (mode === 'unavailable_model') {
+  if (mode === 'unavailable_model' || modelName === 'unavailable-pinned-model') {
     console.error(`Error: model "${modelName}" is unavailable or not found`);
     process.exit(1);
   }
@@ -54,6 +65,10 @@ function main() {
     process.exit(0);
   }
 
+  if (mode === 'stderr_warning') {
+    console.error('Warning: experimental tool usage detected in environment');
+  }
+
   // Standard init event
   const initEvent = {
     event: 'init',
@@ -61,7 +76,8 @@ function main() {
     init: {
       cwd: process.cwd(),
       model: modelName,
-      tools: ['run_command', 'view_file', 'write_to_file'],
+      effort: effortLevel,
+      tools: ['run_command', 'view_file', 'write_to_file', 'grep_search'],
       permission_mode: isDangerouslySkipPermissions ? 'always-proceed' : 'request-review'
     }
   };
@@ -74,7 +90,7 @@ function main() {
       result: {
         conversation_id: conversationId,
         status: 'ERROR',
-        error: 'permission denied',
+        error: 'permission denied: action requires review but running headlessly without --dangerously-skip-permissions',
         duration_seconds: 0.1,
         num_turns: 1,
         usage: { input_tokens: 100, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 100 }
@@ -91,12 +107,52 @@ function main() {
     terminal: false
   });
 
+  const stateFile = path.join(os.tmpdir(), `fake-agy-${conversationId.replace(/[^a-zA-Z0-9_-]/g, '_')}.json`);
   let turnCount = 0;
+  if (conversationIndex !== -1) {
+    if (fs.existsSync(stateFile)) {
+      try {
+        const data = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+        turnCount = data.turnCount || 0;
+      } catch (_) {}
+    }
+  } else {
+    if (fs.existsSync(stateFile)) {
+      try {
+        fs.unlinkSync(stateFile);
+      } catch (_) {}
+    }
+  }
 
   rl.on('line', (line) => {
     try {
       const inputMsg = JSON.parse(line);
       turnCount++;
+      try {
+        fs.writeFileSync(stateFile, JSON.stringify({ turnCount }));
+      } catch (_) {}
+
+      const promptContent = inputMsg.message?.content || '';
+
+      if (promptContent.includes('trigger_permission_denial')) {
+        const errResult = {
+          event: 'result',
+          result: {
+            conversation_id: conversationId,
+            status: 'ERROR',
+            error: 'permission denied: operation rejected',
+            duration_seconds: 0.15,
+            num_turns: turnCount,
+            usage: { input_tokens: 150, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 150 }
+          }
+        };
+        process.stderr.write('Error: tool execution denied by user permission policy\n', () => {
+          process.stdout.write(JSON.stringify(errResult) + '\n', () => {
+            process.exit(1);
+          });
+        });
+        return;
+      }
 
       // Emit user_input step
       const step0 = {
@@ -118,7 +174,7 @@ function main() {
           step_index: turnCount * 2 - 1,
           state: 'DONE',
           step_type: 'agent_response',
-          text_delta: `echo: ${JSON.stringify(inputMsg.message?.content || '')}\n`,
+          text_delta: `echo: ${JSON.stringify(promptContent)}\n`,
           duration_seconds: 0.25,
           usage: {
             input_tokens: 500 * turnCount,
@@ -137,7 +193,7 @@ function main() {
         result: {
           conversation_id: conversationId,
           status: 'SUCCESS',
-          response: `echo: ${JSON.stringify(inputMsg.message?.content || '')}\n`,
+          response: `echo: ${JSON.stringify(promptContent)}\n`,
           duration_seconds: 0.5,
           num_turns: turnCount,
           usage: {
@@ -153,6 +209,10 @@ function main() {
     } catch (err) {
       console.error(`Error parsing stdin stream line: ${err.message}`);
     }
+  });
+
+  rl.on('close', () => {
+    process.exit(0);
   });
 }
 

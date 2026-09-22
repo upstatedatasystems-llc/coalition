@@ -1,7 +1,9 @@
 use crate::core::activity::{ActivityEventRecord, ActivityManager};
 use crate::core::artifacts::{ArtifactApplicability, ArtifactError};
 use crate::core::builder::{
-    AgyEvent, AntigravityCliAdapter, BuilderTurnRequest, BuilderTurnResponse, ModelInfo,
+    AgyEvent, AgyUsage, AntigravityCliAdapter, BuilderError, BuilderEventRecord,
+    BuilderSessionRecord, BuilderTurnRequest, BuilderTurnResponse, ChatGptUsageSummary,
+    IcarusState, ModelInfo, PermissionRecord, UsageTelemetryReport,
 };
 use crate::core::git::{GitAdapter, GitError, GitRepoInfo};
 use crate::core::projects::{ProjectDetails, ProjectError, ProjectService, ProjectSummary};
@@ -364,6 +366,22 @@ impl From<crate::core::freeze::FreezeError> for CommandError {
     }
 }
 
+impl From<BuilderError> for CommandError {
+    fn from(e: BuilderError) -> Self {
+        match e {
+            BuilderError::NotFound(msg) => Self::new("AGY_NOT_FOUND", msg),
+            BuilderError::ExecutionFailed(msg) => Self::new("BUILDER_EXECUTION_FAILED", msg),
+            BuilderError::ParseError(msg) => Self::new("BUILDER_PARSE_ERROR", msg),
+            BuilderError::Io(err) => Self::new("IO_ERROR", err.to_string()),
+            BuilderError::Canceled => Self::new("BUILDER_CANCELED", "Session was canceled"),
+            BuilderError::Timeout => Self::new("BUILDER_TIMEOUT", "Session timed out"),
+            BuilderError::NotFrozen(msg) => Self::new("NOT_FROZEN", msg),
+            BuilderError::DriftDetected(msg) => Self::new("DRIFT_DETECTED", msg),
+            BuilderError::Database(msg) => Self::new("DATABASE_ERROR", msg),
+        }
+    }
+}
+
 impl From<String> for CommandError {
     fn from(msg: String) -> Self {
         Self::new("GENERAL_ERROR", msg)
@@ -685,14 +703,91 @@ pub async fn run_sqlite_proof(state: State<'_, AppState>) -> Result<ProofResult,
     db.run_proof().map_err(CommandError::from)
 }
 
+fn get_fake_agy_path() -> Result<PathBuf, CommandError> {
+    let fake_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("tests")
+        .join("fake-commands")
+        .join(if cfg!(windows) {
+            "fake-agy.cmd"
+        } else {
+            "fake-agy"
+        });
+
+    if !fake_path.exists() {
+        return Err(CommandError::new(
+            "FAKE_AGY_NOT_FOUND",
+            format!("fake-agy executable not found at {:?}", fake_path),
+        ));
+    }
+    Ok(fake_path)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StartBuilderTurnPayload {
-    pub prompt: String,
-    pub conversation_id: Option<String>,
+    #[serde(alias = "project_id")]
+    pub project_id: String,
     pub model: Option<String>,
     pub effort: Option<String>,
-    pub icarus_mode: bool,
+    #[serde(alias = "follow_up_prompt")]
+    pub follow_up_prompt: Option<String>,
+    #[serde(alias = "use_fake_agy")]
     pub use_fake_agy: bool,
+}
+
+#[tauri::command]
+pub async fn list_builder_models(
+    state: State<'_, AppState>,
+    use_fake_agy: Option<bool>,
+) -> Result<Vec<ModelInfo>, CommandError> {
+    let adapter = if use_fake_agy.unwrap_or(false) {
+        let fake_path = get_fake_agy_path()?;
+        AntigravityCliAdapter::with_path(fake_path)
+    } else {
+        let lock = state.agy.lock().await;
+        if let Some(ref a) = *lock {
+            AntigravityCliAdapter::with_path(a.binary_path())
+        } else {
+            AntigravityCliAdapter::discover()
+                .map_err(|e| CommandError::new("AGY_DISCOVERY_ERROR", e.to_string()))?
+        }
+    };
+    adapter
+        .list_models()
+        .map_err(|e| CommandError::new("AGY_MODELS_ERROR", e.to_string()))
+}
+
+#[tauri::command]
+pub async fn get_builder_session(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Option<BuilderSessionRecord>, CommandError> {
+    let db = state.db.lock().await;
+    db.get_latest_builder_session(&project_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn list_builder_sessions(
+    state: State<'_, AppState>,
+    project_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<BuilderSessionRecord>, CommandError> {
+    let db = state.db.lock().await;
+    db.list_builder_sessions(&project_id, limit.unwrap_or(20))
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_builder_events(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<BuilderEventRecord>, CommandError> {
+    let db = state.db.lock().await;
+    db.list_builder_events(&session_id)
+        .map_err(CommandError::from)
 }
 
 #[tauri::command]
@@ -703,24 +798,163 @@ pub async fn start_builder_turn(
 ) -> Result<BuilderTurnResponse, CommandError> {
     state.cancel_flag.store(false, Ordering::Relaxed);
 
-    let adapter = if payload.use_fake_agy {
-        let fake_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("tests")
-            .join("fake-commands")
-            .join(if cfg!(windows) {
-                "fake-agy.cmd"
-            } else {
-                "fake-agy"
-            });
+    let repo_path = {
+        let db = state.db.lock().await;
+        get_repo_path_for_project_sync(&db, &payload.project_id)?
+    };
 
-        if !fake_path.exists() {
-            return Err(CommandError::new(
-                "FAKE_AGY_NOT_FOUND",
-                format!("fake-agy executable not found at {:?}", fake_path),
-            ));
+    if !repo_path.exists() {
+        return Err(CommandError::new(
+            "REPOSITORY_UNAVAILABLE",
+            format!("Repository at {:?} is unavailable on disk", repo_path),
+        ));
+    }
+
+    // Check workflow state: must be FROZEN, BUILDING, or CORRECTIONS_REQUIRED
+    let current_wf_state = {
+        let db = state.db.lock().await;
+        db.connection()
+            .query_row(
+                "SELECT state FROM workflow_state WHERE project_id = ?1",
+                rusqlite::params![payload.project_id],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(|e| CommandError::new("WORKFLOW_STATE_NOT_FOUND", e.to_string()))?
+    };
+
+    if current_wf_state != "FROZEN"
+        && current_wf_state != "BUILDING"
+        && current_wf_state != "CORRECTIONS_REQUIRED"
+    {
+        return Err(CommandError::new(
+            "INVALID_WORKFLOW_STATE",
+            format!(
+                "Cannot start Builder turn while project is in {} state. Architecture must be FROZEN first.",
+                current_wf_state
+            ),
+        ));
+    }
+
+    // If in FROZEN or CORRECTIONS_REQUIRED, transition to BUILDING
+    if current_wf_state == "FROZEN" || current_wf_state == "CORRECTIONS_REQUIRED" {
+        let mut db = state.db.lock().await;
+        workflow::apply_workflow_action(
+            db.connection_mut(),
+            &payload.project_id,
+            WorkflowAction::StartBuild,
+            "HUMAN",
+        )
+        .map_err(CommandError::from)?;
+    }
+
+    // Check drift
+    let drift_report =
+        crate::core::freeze::FreezeService::check_contract_drift(&repo_path, &payload.project_id)
+            .map_err(CommandError::from)?;
+    if drift_report.has_drift {
+        return Err(CommandError::new(
+            "DRIFT_DETECTED",
+            "Cannot run Builder: frozen architecture contract drift detected. Please reconcile drift before proceeding.",
+        ));
+    }
+
+    // Authoritative builder packet from Stage 2 contract
+    let builder_packet = crate::core::freeze::FreezeService::get_builder_packet(&repo_path, None)
+        .map_err(CommandError::from)?;
+
+    let epoch_id = builder_packet.metadata.builder_epoch_id.clone();
+
+    // Check for existing conversation in this epoch and Icarus state
+    let (existing_conv_id, icarus_mode) = {
+        let db = state.db.lock().await;
+        let latest_session = db
+            .get_latest_builder_session(&payload.project_id)
+            .map_err(CommandError::from)?;
+        let cid = latest_session.and_then(|s| {
+            if s.epoch_id == epoch_id {
+                s.conversation_id
+            } else {
+                None
+            }
+        });
+        let icarus = db
+            .get_icarus_state(&payload.project_id)
+            .map_err(CommandError::from)?
+            .enabled;
+        (cid, icarus)
+    };
+
+    // Construct authoritative prompt
+    let turn_prompt = if let Some(ref follow_up) = payload.follow_up_prompt {
+        if existing_conv_id.is_some() {
+            follow_up.clone()
+        } else {
+            format!(
+                "{}\n\nAdditional Guidance:\n{}",
+                builder_packet.prompt, follow_up
+            )
         }
+    } else {
+        builder_packet.prompt.clone()
+    };
+
+    let model_name = payload
+        .model
+        .clone()
+        .unwrap_or_else(|| "gemini-3.8-flash-high".to_string());
+    let effort_level = payload.effort.clone();
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let started_at = chrono::Utc::now().to_rfc3339();
+
+    // Insert initial session record
+    {
+        let db = state.db.lock().await;
+        let session_rec = BuilderSessionRecord {
+            session_id: session_id.clone(),
+            project_id: payload.project_id.clone(),
+            epoch_id: epoch_id.clone(),
+            conversation_id: existing_conv_id.clone(),
+            model: model_name.clone(),
+            effort: effort_level.clone(),
+            icarus_mode,
+            status: "RUNNING".to_string(),
+            prompt: turn_prompt.clone(),
+            response_text: None,
+            error_message: None,
+            started_at: started_at.clone(),
+            completed_at: None,
+            duration_ms: 0,
+            usage: AgyUsage::default(),
+        };
+        db.insert_builder_session(&session_rec)
+            .map_err(CommandError::from)?;
+
+        let meta = serde_json::json!({
+            "session_id": session_id,
+            "epoch_id": epoch_id,
+            "model": model_name,
+            "effort": effort_level,
+            "icarus_mode": icarus_mode,
+            "conversation_id": existing_conv_id,
+        });
+        let _ = ActivityManager::record_event(
+            db.connection(),
+            &payload.project_id,
+            "BUILDER_TURN_STARTED",
+            "BUILDER",
+            &format!(
+                "Started Builder turn with model {} (epoch: {}){}",
+                model_name,
+                epoch_id,
+                if icarus_mode { " [ICARUS MODE]" } else { "" }
+            ),
+            Some(&meta),
+        );
+    }
+
+    let adapter = if payload.use_fake_agy {
+        let fake_path = get_fake_agy_path()?;
         AntigravityCliAdapter::with_path(fake_path)
     } else {
         let lock = state.agy.lock().await;
@@ -732,40 +966,254 @@ pub async fn start_builder_turn(
         }
     };
 
-    let (tx, mut rx) = mpsc::channel::<AgyEvent>(100);
+    let (tx, mut rx) = mpsc::channel::<AgyEvent>(200);
 
     let app_clone = app.clone();
+    let session_id_clone = session_id.clone();
+    let project_id_clone = payload.project_id.clone();
+
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            let _ = app_clone.emit("agy-stream-event", &event);
+            let _ = app_clone.emit(
+                "coalition:builder-event",
+                &serde_json::json!({
+                    "session_id": session_id_clone,
+                    "project_id": project_id_clone,
+                    "event": event,
+                }),
+            );
         }
     });
 
-    let current_dir = std::env::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
-
     let request = BuilderTurnRequest {
-        prompt: payload.prompt,
-        conversation_id: payload.conversation_id,
-        model: payload.model,
-        effort: payload.effort,
-        icarus_mode: payload.icarus_mode,
-        working_dir: current_dir,
+        prompt: turn_prompt,
+        conversation_id: existing_conv_id,
+        model: Some(model_name.clone()),
+        effort: effort_level,
+        icarus_mode,
+        working_dir: Some(repo_path.to_string_lossy().to_string()),
     };
 
-    let result = adapter
+    let turn_start = tokio::time::Instant::now();
+    let execution_result = adapter
         .run_turn(request, state.cancel_flag.clone(), Some(tx))
-        .await
-        .map_err(|e| CommandError::new("BUILDER_TURN_FAILED", e.to_string()))?;
+        .await;
+    let duration_ms = turn_start.elapsed().as_millis() as u64;
+    let completed_at = chrono::Utc::now().to_rfc3339();
 
-    Ok(result)
+    match execution_result {
+        Ok(resp) => {
+            let db = state.db.lock().await;
+            let _ = db.update_builder_session_status(
+                &session_id,
+                &resp.status,
+                Some(&resp.text_response),
+                None,
+                Some(&completed_at),
+                duration_ms,
+                &resp.cumulative_usage,
+                resp.conversation_id.as_deref(),
+            );
+
+            let meta = serde_json::json!({
+                "session_id": session_id,
+                "status": resp.status,
+                "duration_ms": duration_ms,
+                "tokens": resp.cumulative_usage.total_tokens,
+                "conversation_id": resp.conversation_id,
+            });
+            let _ = ActivityManager::record_event(
+                db.connection(),
+                &payload.project_id,
+                if resp.was_canceled {
+                    "BUILDER_TURN_CANCELED"
+                } else {
+                    "BUILDER_TURN_COMPLETED"
+                },
+                "BUILDER",
+                &format!(
+                    "Builder turn {} with status: {}",
+                    if resp.was_canceled {
+                        "canceled"
+                    } else {
+                        "completed"
+                    },
+                    resp.status
+                ),
+                Some(&meta),
+            );
+
+            if resp.status == "ERROR" || resp.stderr.contains("permission denied") {
+                let perm_rec = PermissionRecord {
+                    id: 0,
+                    project_id: payload.project_id.clone(),
+                    session_id: Some(session_id.clone()),
+                    tool_name: "external_action".to_string(),
+                    target: None,
+                    risk_level: "HIGH".to_string(),
+                    decision: "BLOCKED".to_string(),
+                    reason: Some(
+                        "Action requires review or permission was denied in headless execution"
+                            .to_string(),
+                    ),
+                    created_at: completed_at.clone(),
+                };
+                let _ = db.record_permission_history(&perm_rec);
+            }
+
+            Ok(resp)
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            let db = state.db.lock().await;
+            let _ = db.update_builder_session_status(
+                &session_id,
+                "FAILED",
+                None,
+                Some(&err_str),
+                Some(&completed_at),
+                duration_ms,
+                &AgyUsage::default(),
+                None,
+            );
+
+            let meta = serde_json::json!({
+                "session_id": session_id,
+                "error": err_str,
+                "duration_ms": duration_ms,
+            });
+            let _ = ActivityManager::record_event(
+                db.connection(),
+                &payload.project_id,
+                "BUILDER_TURN_FAILED",
+                "BUILDER",
+                &format!("Builder turn failed: {}", err_str),
+                Some(&meta),
+            );
+
+            Err(CommandError::new("BUILDER_TURN_FAILED", err_str))
+        }
+    }
 }
 
 #[tauri::command]
-pub async fn cancel_builder_turn(state: State<'_, AppState>) -> Result<(), CommandError> {
+pub async fn cancel_builder_turn(
+    state: State<'_, AppState>,
+    project_id: Option<String>,
+) -> Result<(), CommandError> {
     state.cancel_flag.store(true, Ordering::Relaxed);
+    if let Some(pid) = project_id {
+        let db = state.db.lock().await;
+        if let Ok(Some(session)) = db.get_latest_builder_session(&pid) {
+            if session.status == "RUNNING" {
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = db.update_builder_session_status(
+                    &session.session_id,
+                    "CANCELED",
+                    None,
+                    None,
+                    Some(&now),
+                    session.duration_ms,
+                    &session.usage,
+                    session.conversation_id.as_deref(),
+                );
+            }
+        }
+    }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn get_usage_telemetry(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<UsageTelemetryReport, CommandError> {
+    let db = state.db.lock().await;
+    let chatgpt_summary = db
+        .get_chatgpt_usage_summary(&project_id)
+        .map_err(CommandError::from)?;
+    let latest_session = db
+        .get_latest_builder_session(&project_id)
+        .map_err(CommandError::from)?;
+    let (usage, active_model, active_effort) = match latest_session {
+        Some(s) => (s.usage, Some(s.model), s.effort),
+        None => (AgyUsage::default(), None, None),
+    };
+
+    Ok(UsageTelemetryReport {
+        provider_antigravity_usage: usage,
+        active_model,
+        active_effort,
+        chatgpt_estimated_usage: chatgpt_summary,
+        context_window_note:
+            "Context window remaining is not exposed by Antigravity CLI v1.1.27. No fabrication is performed."
+                .to_string(),
+        quota_buckets_note:
+            "Account quota buckets and reset timers are not exposed by Antigravity CLI v1.1.27."
+                .to_string(),
+    })
+}
+
+#[tauri::command]
+pub async fn reset_chatgpt_usage(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<ChatGptUsageSummary, CommandError> {
+    let db = state.db.lock().await;
+    db.reset_chatgpt_usage(&project_id)
+        .map_err(CommandError::from)?;
+    db.get_chatgpt_usage_summary(&project_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_permission_history(
+    state: State<'_, AppState>,
+    project_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<PermissionRecord>, CommandError> {
+    let db = state.db.lock().await;
+    db.list_permission_history(&project_id, limit.unwrap_or(50))
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_icarus_state(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<IcarusState, CommandError> {
+    let db = state.db.lock().await;
+    db.get_icarus_state(&project_id).map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn set_icarus_mode(
+    state: State<'_, AppState>,
+    project_id: String,
+    enabled: bool,
+) -> Result<IcarusState, CommandError> {
+    let db = state.db.lock().await;
+    db.set_icarus_state(&project_id, enabled, Some("HUMAN"))
+        .map_err(CommandError::from)?;
+    let summary = if enabled {
+        "Icarus Mode ENABLED: Antigravity will run with --dangerously-skip-permissions".to_string()
+    } else {
+        "Icarus Mode DISABLED: Standard permissions restored".to_string()
+    };
+    let meta = serde_json::json!({ "enabled": enabled });
+    let _ = ActivityManager::record_event(
+        db.connection(),
+        &project_id,
+        if enabled {
+            "ICARUS_ENABLED"
+        } else {
+            "ICARUS_DISABLED"
+        },
+        "HUMAN",
+        &summary,
+        Some(&meta),
+    );
+    db.get_icarus_state(&project_id).map_err(CommandError::from)
 }
 
 #[tauri::command]
@@ -883,13 +1331,25 @@ pub async fn prepare_architect_relay_packet(
 ) -> Result<RelayPacket, CommandError> {
     let mut db = state.db.lock().await;
     let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
-    RelayService::prepare_architect_packet(
+    let packet = RelayService::prepare_architect_packet(
         db.connection_mut(),
         &repo_path,
         &project_id,
         custom_notes.as_deref(),
     )
-    .map_err(CommandError::from)
+    .map_err(CommandError::from)?;
+
+    let char_count = packet.prompt.len();
+    let estimated_tokens = char_count / 4;
+    let _ = db.record_chatgpt_usage(
+        &project_id,
+        Some(&packet.metadata.packet_id),
+        "OUTBOUND_PACKET",
+        char_count,
+        estimated_tokens,
+    );
+
+    Ok(packet)
 }
 
 #[tauri::command]
@@ -945,8 +1405,21 @@ pub async fn import_from_clipboard(
     let clipboard_text = desktop_clipboard_read().await?;
     let db = state.db.lock().await;
     let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
-    RelayService::process_import(db.connection(), &repo_path, &project_id, &clipboard_text)
-        .map_err(CommandError::from)
+    let preview =
+        RelayService::process_import(db.connection(), &repo_path, &project_id, &clipboard_text)
+            .map_err(CommandError::from)?;
+
+    let char_count = clipboard_text.len();
+    let estimated_tokens = char_count / 4;
+    let _ = db.record_chatgpt_usage(
+        &project_id,
+        Some(&preview.packet_id),
+        "INBOUND_IMPORT",
+        char_count,
+        estimated_tokens,
+    );
+
+    Ok(preview)
 }
 
 #[tauri::command]
