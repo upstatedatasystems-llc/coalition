@@ -295,7 +295,7 @@ export interface BuilderPacketMetadata {
   architecture_version: string;
   builder_epoch_id: string;
   created_at: string;
-  manifest_fingerprint: string;
+  contract_fingerprint: string;
   git_head_commit: string;
   git_branch: string | null;
 }

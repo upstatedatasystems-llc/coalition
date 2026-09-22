@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -38,6 +38,7 @@ pub struct FrozenGitBoundary {
 pub struct BuilderPacketSummary {
     pub total_artifacts: usize,
     pub total_characters: usize,
+    pub prompt_bytes: usize,
     pub estimated_tokens: usize,
     pub is_truncated: bool,
 }
@@ -91,7 +92,6 @@ pub struct BuilderPacketMetadata {
     pub architecture_version: String,
     pub builder_epoch_id: String,
     pub created_at: String,
-    pub manifest_fingerprint: String,
     pub contract_fingerprint: String,
     pub git_head_commit: String,
     pub git_branch: Option<String>,
@@ -173,9 +173,8 @@ pub enum RestorationPhase {
 pub struct RestorationOp {
     pub path: String,
     pub drift_type: DriftType,
-    pub staged_file_path: Option<String>,
-    pub backup_path: Option<String>,
-    pub quarantine_dest_path: Option<String>,
+    pub staged_file_rel: Option<String>,
+    pub quarantine_dest_rel: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -207,6 +206,10 @@ pub enum FreezeError {
     FrozenSnapshotCorrupt { version: String, reason: String },
     #[error("Freeze recovery required: {0}")]
     FreezeRecoveryRequired(String),
+    #[error("Drift restoration recovery required: {0}")]
+    DriftRestorationRecoveryRequired(String),
+    #[error("Invalid architecture version: {0}")]
+    InvalidArchitectureVersion(String),
     #[error("Artifact error: {0}")]
     Artifact(String),
     #[error("Git error: {0}")]
@@ -269,6 +272,23 @@ thread_local! {
     pub static INJECTED_FREEZE_SEAM: std::cell::Cell<InjectedFreezeSeam> = const { std::cell::Cell::new(InjectedFreezeSeam::None) };
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InjectedRestoreSeam {
+    None,
+    BeforeFirstRestoreMutation,
+    AfterFirstRestoreMutation,
+    MidRestoreBatch,
+    AfterAllMutationsBeforeVerification,
+    DuringAddedArtifactQuarantine,
+    AfterVerificationBeforeJournalCleanup,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub static INJECTED_RESTORE_SEAM: std::cell::Cell<InjectedRestoreSeam> = const { std::cell::Cell::new(InjectedRestoreSeam::None) };
+}
+
 /// Finds the largest byte index <= max_bytes that falls on a UTF-8 character boundary.
 pub fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
     if max_bytes >= s.len() {
@@ -281,9 +301,73 @@ pub fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
     index
 }
 
+/// Durably synchronizes directory metadata to disk where supported.
+/// On POSIX systems, opens the directory and invokes `sync_all()`.
+/// On Windows NTFS, directory entries and renames are journaled into the transactional
+/// NTFS metadata log ($LogFile); where supported, an explicit FlushFileBuffers is issued
+/// on the directory handle opened with backup semantics.
+pub fn durable_directory_sync(dir: &Path) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        let f = fs::File::open(dir)?;
+        f.sync_all()?;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+        if let Ok(f) = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)
+        {
+            let _ = f.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Strictly validates an architecture version string.
+/// Allows 1-32 chars of ASCII alphanumeric, dots, and hyphens (e.g. "1.0", "1.0-alpha").
+/// Strictly rejects empty strings, path traversals (".."), slashes, whitespace, and control chars.
+pub fn validate_architecture_version(version: &str) -> Result<(), FreezeError> {
+    let trimmed = version.trim();
+    if trimmed.is_empty() || trimmed.len() > 32 {
+        return Err(FreezeError::InvalidArchitectureVersion(format!(
+            "Architecture version must be between 1 and 32 characters, got '{}'",
+            version
+        )));
+    }
+    if trimmed.contains("..")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(FreezeError::InvalidArchitectureVersion(format!(
+            "Architecture version contains forbidden characters or path traversal: '{}'",
+            version
+        )));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Err(FreezeError::InvalidArchitectureVersion(format!(
+            "Architecture version has invalid format: '{}'",
+            version
+        )));
+    }
+    Ok(())
+}
+
 pub struct FreezeService;
 
 impl FreezeService {
+    /// Strictly validates an architecture version string.
+    pub fn validate_architecture_version(version: &str) -> Result<(), FreezeError> {
+        validate_architecture_version(version)
+    }
+
     /// Computes SHA-256 hex string for given bytes.
     pub fn sha256_hex(bytes: &[u8]) -> String {
         let mut hasher = Sha256::new();
@@ -427,20 +511,46 @@ impl FreezeService {
         // 3. Compute baseline fingerprints of all active governed contract artifacts
         let artifact_baselines = Self::compute_active_contract_baselines(root)?;
 
-        // 4. Summarize Builder packet
+        // 4. Summarize Builder packet using the exact shared prompt builder
+        let mut prospective_manifest_artifacts = Vec::new();
         let mut total_characters = 0;
-        for rel in artifact_baselines.keys() {
-            if let Ok(Some(content)) = ArtifactManager::read_artifact(root, rel) {
-                total_characters += content.len();
-            }
+        for (rel, fp) in &artifact_baselines {
+            let content = ArtifactManager::read_artifact(root, rel)?.unwrap_or_default();
+            total_characters += content.len();
+            prospective_manifest_artifacts.push(ContractArtifactEntry {
+                relative_path: rel.clone(),
+                fingerprint: fp.clone(),
+                size_bytes: content.len(),
+            });
         }
-        let estimated_tokens = (total_characters / 4).max(1);
-        let is_truncated = total_characters > BUILDER_PACKET_MAX_BYTES;
+
+        let mut contract_hasher = Sha256::new();
+        for entry in &prospective_manifest_artifacts {
+            contract_hasher.update(entry.relative_path.as_bytes());
+            contract_hasher.update(entry.fingerprint.as_bytes());
+            contract_hasher.update(entry.size_bytes.to_le_bytes());
+        }
+        let prospective_contract_fingerprint = format!("{:x}", contract_hasher.finalize());
+
+        let (_prompt, _rules, _arts, is_truncated, prompt_bytes) =
+            Self::build_builder_packet_prompt_and_artifacts(
+                INITIAL_ARCHITECTURE_VERSION,
+                &project_yaml.name,
+                project_id,
+                &git_boundary.head_commit,
+                &prospective_contract_fingerprint,
+                &prospective_manifest_artifacts,
+                |rel| {
+                    ArtifactManager::read_artifact(root, rel)?
+                        .ok_or_else(|| FreezeError::Artifact(format!("Artifact missing: {}", rel)))
+                },
+            )?;
 
         let summary = BuilderPacketSummary {
             total_artifacts: artifact_baselines.len(),
             total_characters,
-            estimated_tokens,
+            prompt_bytes,
+            estimated_tokens: (prompt_bytes / 4).max(1),
             is_truncated,
         };
 
@@ -484,15 +594,21 @@ impl FreezeService {
         Ok(preview)
     }
 
-    /// Assembles the bounded Builder packet from the staged frozen contract files.
-    /// Strictly enforces the 200 KB context budget against the full generated prompt,
-    /// accounting for Builder instructions, headings, paths, fingerprints, metadata, and truncation notices.
-    /// Uses UTF-8 char boundary truncation to prevent invalid UTF-8 slicing.
-    fn build_builder_packet(
-        metadata: BuilderPacketMetadata,
-        staged_contract_dir: &Path,
+    /// Builds the prompt and artifacts for a Builder implementation packet using a shared calculation
+    /// between preflight preview and snapshot finalization.
+    /// Strictly enforces the 200 KB context budget against the full prompt context transmitted to the Builder.
+    pub fn build_builder_packet_prompt_and_artifacts<F>(
+        architecture_version: &str,
+        project_name: &str,
+        project_id: &str,
+        git_head_commit: &str,
+        contract_fingerprint: &str,
         manifest_artifacts: &[ContractArtifactEntry],
-    ) -> Result<BuilderPacket, FreezeError> {
+        load_content: F,
+    ) -> Result<(String, String, Vec<BuilderPacketArtifact>, bool, usize), FreezeError>
+    where
+        F: Fn(&str) -> Result<String, FreezeError>,
+    {
         let builder_rules = r#"=== COALITION BUILDER INSTRUCTIONS ===
 1. You are Google Antigravity acting as the Builder for this project.
 2. The architecture specifications in this packet are FROZEN and IMMUTABLE.
@@ -503,11 +619,11 @@ impl FreezeService {
 
         let prompt_header = format!(
             "# Coalition Builder Milestone Task: Architecture v{}\n\nProject: {}\nProject ID: {}\nGit HEAD: {}\nContract Fingerprint: `{}`\n\n{}\n## Frozen Contract Specifications\n\n",
-            metadata.architecture_version,
-            metadata.project_name,
-            metadata.project_id,
-            metadata.git_head_commit,
-            metadata.contract_fingerprint,
+            architecture_version,
+            project_name,
+            project_id,
+            git_head_commit,
+            contract_fingerprint,
             builder_rules
         );
 
@@ -516,13 +632,7 @@ impl FreezeService {
         let mut is_truncated = false;
 
         for entry in manifest_artifacts {
-            let file_path = staged_contract_dir.join(&entry.relative_path);
-            let content = fs::read_to_string(&file_path).map_err(|e| {
-                FreezeError::Io(format!(
-                    "Failed to read staged contract file {:?}: {}",
-                    file_path, e
-                ))
-            })?;
+            let content = load_content(&entry.relative_path)?;
 
             let title = entry
                 .relative_path
@@ -589,6 +699,35 @@ impl FreezeService {
                 }
             }
         }
+
+        let prompt_bytes = prompt.len();
+        Ok((prompt, builder_rules, artifacts, is_truncated, prompt_bytes))
+    }
+
+    /// Assembles the bounded Builder packet from the staged frozen contract files.
+    fn build_builder_packet(
+        metadata: BuilderPacketMetadata,
+        staged_contract_dir: &Path,
+        manifest_artifacts: &[ContractArtifactEntry],
+    ) -> Result<BuilderPacket, FreezeError> {
+        let (prompt, builder_rules, artifacts, is_truncated, _prompt_bytes) =
+            Self::build_builder_packet_prompt_and_artifacts(
+                &metadata.architecture_version,
+                &metadata.project_name,
+                &metadata.project_id,
+                &metadata.git_head_commit,
+                &metadata.contract_fingerprint,
+                manifest_artifacts,
+                |rel| {
+                    let file_path = staged_contract_dir.join(rel);
+                    fs::read_to_string(&file_path).map_err(|e| {
+                        FreezeError::Io(format!(
+                            "Failed to read staged contract file {:?}: {}",
+                            file_path, e
+                        ))
+                    })
+                },
+            )?;
 
         let summary = format!(
             "Architecture v{} implementation contract containing {} frozen specifications",
@@ -830,6 +969,7 @@ impl FreezeService {
         let contract_fingerprint = format!("{:x}", contract_hasher.finalize());
 
         // 8. Build, serialize, and persist finalized Builder Packet
+        let freeze_timestamp = chrono::Utc::now().to_rfc3339();
         let epoch_id = Uuid::new_v4().to_string();
         let packet_id = Uuid::new_v4().to_string();
         let packet_metadata = BuilderPacketMetadata {
@@ -839,8 +979,7 @@ impl FreezeService {
             project_name: current_project_yaml.name.clone(),
             architecture_version: INITIAL_ARCHITECTURE_VERSION.to_string(),
             builder_epoch_id: epoch_id.clone(),
-            created_at: preview.created_at.clone(),
-            manifest_fingerprint: contract_fingerprint.clone(),
+            created_at: freeze_timestamp.clone(),
             contract_fingerprint: contract_fingerprint.clone(),
             git_head_commit: current_git_boundary.head_commit.clone(),
             git_branch: current_git_boundary.branch.clone(),
@@ -890,7 +1029,7 @@ impl FreezeService {
             manifest_version: MANIFEST_VERSION,
             project_id: project_id.to_string(),
             architecture_version: INITIAL_ARCHITECTURE_VERSION.to_string(),
-            frozen_at: preview.created_at.clone(),
+            frozen_at: freeze_timestamp.clone(),
             frozen_by: "HUMAN".to_string(),
             builder_epoch_id: epoch_id.clone(),
             readiness_policy_version: preview.readiness_policy_version,
@@ -957,6 +1096,16 @@ impl FreezeService {
             )));
         }
 
+        // Durably synchronize directory metadata
+        durable_directory_sync(&arch_versions_dir).map_err(|e| {
+            let _ = fs::remove_dir_all(&target_v1_dir);
+            FreezeError::Io(format!("Failed to sync architecture-versions dir: {}", e))
+        })?;
+        durable_directory_sync(&target_v1_dir).map_err(|e| {
+            let _ = fs::remove_dir_all(&target_v1_dir);
+            FreezeError::Io(format!("Failed to sync snapshot dir: {}", e))
+        })?;
+
         #[cfg(test)]
         {
             let seam = INJECTED_FREEZE_SEAM.with(|c| c.get());
@@ -1000,6 +1149,15 @@ impl FreezeService {
         let tx_res = (|| -> Result<(), FreezeError> {
             let tx = conn.transaction()?;
 
+            // A. Invalidate single-use preview
+            tx.execute(
+                "UPDATE freeze_previews SET status = 'CONSUMED' WHERE preview_id = ?1",
+                params![preview_id],
+            )?;
+
+            // B. Authoritative workflow transition
+            workflow::apply_workflow_action_tx(&tx, project_id, WorkflowAction::Freeze, "HUMAN")?;
+
             #[cfg(test)]
             {
                 let seam = INJECTED_FREEZE_SEAM.with(|c| c.get());
@@ -1009,15 +1167,6 @@ impl FreezeService {
                     ));
                 }
             }
-
-            // A. Invalidate single-use preview
-            tx.execute(
-                "UPDATE freeze_previews SET status = 'CONSUMED' WHERE preview_id = ?1",
-                params![preview_id],
-            )?;
-
-            // B. Authoritative workflow transition
-            workflow::apply_workflow_action_tx(&tx, project_id, WorkflowAction::Freeze, "HUMAN")?;
 
             // C. Insert minimal PENDING builder epoch
             tx.execute(
@@ -1029,7 +1178,7 @@ impl FreezeService {
                     INITIAL_ARCHITECTURE_VERSION,
                     current_git_boundary.head_commit,
                     current_git_boundary.branch,
-                    preview.created_at,
+                    freeze_timestamp,
                     "PENDING",
                 ],
             )?;
@@ -1059,7 +1208,7 @@ impl FreezeService {
                     current_git_boundary.dirty_fingerprint,
                     snapshot_path_rel,
                     manifest_fingerprint,
-                    preview.created_at,
+                    freeze_timestamp,
                     "HUMAN",
                 ],
             )?;
@@ -1078,6 +1227,7 @@ impl FreezeService {
                 "git_commit": current_git_boundary.head_commit,
                 "git_branch": current_git_boundary.branch,
                 "is_clean": current_git_boundary.is_clean,
+                "frozen_at": freeze_timestamp,
             });
             ActivityManager::record_event(
                 &tx,
@@ -1101,7 +1251,7 @@ impl FreezeService {
             project_id: project_id.to_string(),
             architecture_version: INITIAL_ARCHITECTURE_VERSION.to_string(),
             epoch_id,
-            frozen_at: preview.created_at.clone(),
+            frozen_at: freeze_timestamp,
             manifest_fingerprint,
             contract_fingerprint,
             git_boundary: current_git_boundary,
@@ -1169,6 +1319,12 @@ impl FreezeService {
 
             // Reconstruct operational records inside an explicit transaction
             let tx = conn.transaction()?;
+
+            // Invalidate any single-use freeze preview
+            tx.execute(
+                "UPDATE freeze_previews SET status = 'CONSUMED' WHERE project_id = ?1 AND status = 'PENDING'",
+                params![project_id],
+            )?;
 
             // Reconcile SQLite workflow state
             let wf = workflow::get_workflow_state(&tx, project_id);
@@ -1260,6 +1416,45 @@ impl FreezeService {
                 )?;
             }
 
+            // Ensure activity event exists for this freeze
+            let event_count: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM activity_events WHERE project_id = ?1 AND event_type = 'ARCHITECTURE_FROZEN'",
+                    params![project_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            if event_count == 0 {
+                let manifest = Self::read_contract_manifest(root, version)?;
+                let short_commit = if manifest.git_boundary.head_commit.len() >= 8 {
+                    &manifest.git_boundary.head_commit[..8]
+                } else {
+                    &manifest.git_boundary.head_commit
+                };
+                let event_meta = serde_json::json!({
+                    "architecture_version": version,
+                    "epoch_id": manifest.builder_epoch_id,
+                    "manifest_fingerprint": project_yaml.active_manifest_fingerprint,
+                    "contract_fingerprint": manifest.contract_fingerprint,
+                    "git_commit": manifest.git_boundary.head_commit,
+                    "git_branch": manifest.git_boundary.branch,
+                    "is_clean": manifest.git_boundary.is_clean,
+                    "frozen_at": manifest.frozen_at,
+                });
+                ActivityManager::record_event(
+                    &tx,
+                    project_id,
+                    "ARCHITECTURE_FROZEN",
+                    "HUMAN",
+                    &format!(
+                        "Frozen Architecture v{} at Git commit {} (clean: {})",
+                        version, short_commit, manifest.git_boundary.is_clean
+                    ),
+                    Some(&event_meta),
+                )?;
+            }
+
             tx.commit().map_err(|e| {
                 FreezeError::FreezeRecoveryRequired(format!(
                     "Failed to commit operational reconciliation transaction: {}",
@@ -1313,17 +1508,60 @@ impl FreezeService {
         version: &str,
         expected_manifest_fingerprint: Option<&str>,
     ) -> Result<ContractManifest, FreezeError> {
+        Self::validate_architecture_version(version)?;
+
+        fn check_no_symlinks(path: &Path, version: &str) -> Result<(), FreezeError> {
+            let meta =
+                fs::symlink_metadata(path).map_err(|e| FreezeError::FrozenSnapshotCorrupt {
+                    version: version.to_string(),
+                    reason: format!("Failed to read metadata for {:?}: {}", path, e),
+                })?;
+            if meta.file_type().is_symlink() {
+                return Err(FreezeError::FrozenSnapshotCorrupt {
+                    version: version.to_string(),
+                    reason: format!("Snapshot path {:?} is a symlink", path),
+                });
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    return Err(FreezeError::FrozenSnapshotCorrupt {
+                        version: version.to_string(),
+                        reason: format!("Snapshot path {:?} is a reparse point", path),
+                    });
+                }
+            }
+            Ok(())
+        }
+
         let root = repo_root.as_ref();
         let coalition_dir = ArtifactManager::resolve_coalition_dir(root)?;
-        let version_dir = coalition_dir
-            .join("architecture-versions")
-            .join(format!("v{}", version));
+        let arch_versions_dir = coalition_dir.join("architecture-versions");
+        let version_dir = arch_versions_dir.join(format!("v{}", version));
 
         if !version_dir.exists() {
             return Err(FreezeError::FrozenSnapshotCorrupt {
                 version: version.to_string(),
                 reason: format!("Snapshot directory {:?} missing", version_dir),
             });
+        }
+
+        check_no_symlinks(&version_dir, version)?;
+
+        if let (Ok(canon_root), Ok(canon_ver)) =
+            (arch_versions_dir.canonicalize(), version_dir.canonicalize())
+        {
+            if !canon_ver.starts_with(&canon_root) {
+                return Err(FreezeError::FrozenSnapshotCorrupt {
+                    version: version.to_string(),
+                    reason: format!(
+                        "Snapshot directory {:?} escapes architecture-versions root",
+                        version_dir
+                    ),
+                });
+            }
         }
 
         let manifest_path = version_dir.join("contract-manifest.yaml");
@@ -1333,6 +1571,7 @@ impl FreezeService {
                 reason: "contract-manifest.yaml missing in snapshot".to_string(),
             });
         }
+        check_no_symlinks(&manifest_path, version)?;
 
         let manifest_content =
             fs::read_to_string(&manifest_path).map_err(|e| FreezeError::FrozenSnapshotCorrupt {
@@ -1368,6 +1607,7 @@ impl FreezeService {
                 reason: "contract/ subfolder missing in snapshot".to_string(),
             });
         }
+        check_no_symlinks(&contract_dir, version)?;
 
         // 2. Verify each frozen contract file against its manifest hash
         for entry in &manifest.artifacts {
@@ -1378,6 +1618,7 @@ impl FreezeService {
                     reason: format!("Frozen file {:?} missing from snapshot contract", file_path),
                 });
             }
+            check_no_symlinks(&file_path, version)?;
 
             let bytes = fs::read(&file_path).map_err(|e| FreezeError::FrozenSnapshotCorrupt {
                 version: version.to_string(),
@@ -1400,14 +1641,24 @@ impl FreezeService {
         fn scan_dir_files(
             dir: &Path,
             base: &Path,
+            version: &str,
             files: &mut Vec<String>,
-        ) -> Result<(), std::io::Error> {
+        ) -> Result<(), FreezeError> {
             if dir.is_dir() {
-                for entry in fs::read_dir(dir)? {
-                    let entry = entry?;
+                let entries =
+                    fs::read_dir(dir).map_err(|e| FreezeError::FrozenSnapshotCorrupt {
+                        version: version.to_string(),
+                        reason: format!("Failed to read snapshot directory {:?}: {}", dir, e),
+                    })?;
+                for entry in entries {
+                    let entry = entry.map_err(|e| FreezeError::FrozenSnapshotCorrupt {
+                        version: version.to_string(),
+                        reason: format!("Failed to read snapshot directory entry: {}", e),
+                    })?;
                     let path = entry.path();
+                    check_no_symlinks(&path, version)?;
                     if path.is_dir() {
-                        scan_dir_files(&path, base, files)?;
+                        scan_dir_files(&path, base, version, files)?;
                     } else if path.is_file() {
                         if let Ok(rel) = path.strip_prefix(base) {
                             let rel_str = rel.to_string_lossy().replace('\\', "/");
@@ -1420,12 +1671,7 @@ impl FreezeService {
         }
 
         let mut actual_files = Vec::new();
-        if let Err(e) = scan_dir_files(&contract_dir, &contract_dir, &mut actual_files) {
-            return Err(FreezeError::FrozenSnapshotCorrupt {
-                version: version.to_string(),
-                reason: format!("Failed to scan snapshot contract directory: {}", e),
-            });
-        }
+        scan_dir_files(&contract_dir, &contract_dir, version, &mut actual_files)?;
 
         for actual in actual_files {
             if !manifest.artifacts.iter().any(|a| a.relative_path == actual) {
@@ -1447,6 +1693,7 @@ impl FreezeService {
                 reason: "builder-packet.json missing in snapshot".to_string(),
             });
         }
+        check_no_symlinks(&packet_path, version)?;
 
         let packet_bytes =
             fs::read(&packet_path).map_err(|e| FreezeError::FrozenSnapshotCorrupt {
@@ -1727,84 +1974,217 @@ impl FreezeService {
         let recovery_dir = coalition_dir.join("recovery");
         let disk_journal_path = recovery_dir.join("drift-restoration-journal.json");
 
-        // 1. Read journal from SQLite or disk
-        let row_opt: Option<(String, String, String, String)> = conn
-            .query_row(
-                "SELECT journal_id, architecture_version, phase, operations_json
-                 FROM drift_restoration_journals
-                 WHERE project_id = ?1",
-                params![project_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-
-        let journal: Option<DriftRestorationJournal> = if let Some((jid, ver, ph, ops)) = row_opt {
-            let phase = match ph.as_str() {
-                "COMMITTING" => RestorationPhase::Committing,
-                "COMMITTED" => RestorationPhase::Committed,
-                _ => RestorationPhase::Staged,
-            };
-            let operations: Vec<RestorationOp> = serde_json::from_str(&ops).map_err(|e| {
-                FreezeError::FreezeRecoveryRequired(format!(
-                    "Corrupt operations in drift journal: {}",
-                    e
-                ))
-            })?;
-            Some(DriftRestorationJournal {
-                journal_id: jid,
-                project_id: project_id.to_string(),
-                architecture_version: ver,
-                phase,
-                operations,
-                created_at: String::new(),
-                updated_at: String::new(),
-            })
-        } else if disk_journal_path.exists() {
+        // 1. Read disk journal if present (strict fail-closed on corrupt content)
+        let disk_journal: Option<DriftRestorationJournal> = if disk_journal_path.exists() {
             let content = fs::read_to_string(&disk_journal_path).map_err(|e| {
-                FreezeError::FreezeRecoveryRequired(format!(
-                    "Failed to read drift journal from disk: {}",
-                    e
+                FreezeError::DriftRestorationRecoveryRequired(format!(
+                    "Failed to read drift journal from disk {:?}: {}",
+                    disk_journal_path, e
                 ))
             })?;
-            serde_json::from_str(&content).ok()
+            let parsed: DriftRestorationJournal = serde_json::from_str(&content).map_err(|e| {
+                FreezeError::DriftRestorationRecoveryRequired(format!(
+                    "Corrupt disk drift restoration journal {:?}: {}",
+                    disk_journal_path, e
+                ))
+            })?;
+            Some(parsed)
         } else {
             None
         };
 
-        if let Some(j) = journal {
+        // 2. Read SQLite journal if present
+        let db_row_opt: Option<(String, String, String, String, String, String)> = conn
+            .query_row(
+                "SELECT journal_id, architecture_version, phase, operations_json, created_at, updated_at
+                 FROM drift_restoration_journals
+                 WHERE project_id = ?1",
+                params![project_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .optional()?;
+
+        let db_journal: Option<DriftRestorationJournal> =
+            if let Some((jid, ver, ph, ops, cat, uat)) = db_row_opt {
+                let phase = match ph.as_str() {
+                    "COMMITTING" => RestorationPhase::Committing,
+                    "COMMITTED" => RestorationPhase::Committed,
+                    _ => RestorationPhase::Staged,
+                };
+                let operations: Vec<RestorationOp> = serde_json::from_str(&ops).map_err(|e| {
+                    FreezeError::DriftRestorationRecoveryRequired(format!(
+                        "Corrupt operations JSON in SQLite drift restoration journal: {}",
+                        e
+                    ))
+                })?;
+                Some(DriftRestorationJournal {
+                    journal_id: jid,
+                    project_id: project_id.to_string(),
+                    architecture_version: ver,
+                    phase,
+                    operations,
+                    created_at: cat,
+                    updated_at: uat,
+                })
+            } else {
+                None
+            };
+
+        // 3. Reconcile dual journals (disk and SQLite)
+        let authoritative_journal: Option<DriftRestorationJournal> = match (
+            disk_journal,
+            db_journal,
+        ) {
+            (Some(disk_j), Some(db_j)) => {
+                if disk_j.journal_id != db_j.journal_id
+                    || disk_j.architecture_version != db_j.architecture_version
+                {
+                    return Err(FreezeError::DriftRestorationRecoveryRequired(format!(
+                        "Conflicting disk and SQLite restoration journals: disk='{}' (v{}), db='{}' (v{})",
+                        disk_j.journal_id, disk_j.architecture_version, db_j.journal_id, db_j.architecture_version
+                    )));
+                }
+
+                // If either indicates COMMITTING, mutations may have started; must complete deterministically
+                let effective_phase = if disk_j.phase == RestorationPhase::Committing
+                    || db_j.phase == RestorationPhase::Committing
+                {
+                    RestorationPhase::Committing
+                } else {
+                    RestorationPhase::Staged
+                };
+
+                Some(DriftRestorationJournal {
+                    phase: effective_phase,
+                    ..disk_j
+                })
+            }
+            (Some(disk_j), None) => {
+                // SQLite record missing or deleted; disk journal is durable authority
+                Some(disk_j)
+            }
+            (None, Some(db_j)) => {
+                if db_j.phase == RestorationPhase::Committing {
+                    // Check if contract is already clean
+                    let report = Self::check_contract_drift(root, project_id)?;
+                    if !report.has_drift {
+                        // Disk journal was removed after clean restore, clean up SQLite
+                        conn.execute(
+                            "DELETE FROM drift_restoration_journals WHERE project_id = ?1",
+                            params![project_id],
+                        )?;
+                        return Ok(());
+                    } else {
+                        return Err(FreezeError::DriftRestorationRecoveryRequired(
+                            "SQLite indicates COMMITTING drift restoration but disk journal is missing while drift exists".to_string(),
+                        ));
+                    }
+                } else {
+                    // STAGED and disk journal missing: safely clean SQLite row
+                    conn.execute(
+                        "DELETE FROM drift_restoration_journals WHERE project_id = ?1",
+                        params![project_id],
+                    )?;
+                    return Ok(());
+                }
+            }
+            (None, None) => None,
+        };
+
+        if let Some(j) = authoritative_journal {
             match j.phase {
                 RestorationPhase::Staged => {
-                    // Crash happened before any active files were modified. Rollback is safe.
-                    // Clean up any staged files
+                    // Safe rollback: mutations never began
                     for op in &j.operations {
-                        if let Some(ref staged) = op.staged_file_path {
-                            let p = PathBuf::from(staged);
+                        if let Some(ref rel) = op.staged_file_rel {
+                            let p = coalition_dir.join(rel);
                             if p.exists() {
-                                let _ = fs::remove_file(p);
+                                fs::remove_file(&p).map_err(|e| {
+                                    FreezeError::Io(format!(
+                                        "Failed to clean staged restore file during rollback: {}",
+                                        e
+                                    ))
+                                })?;
                             }
                         }
                     }
+                    let staging_batch_dir =
+                        recovery_dir.join(format!(".staging-restore-{}", j.journal_id));
+                    if staging_batch_dir.exists() {
+                        fs::remove_dir_all(&staging_batch_dir).map_err(|e| {
+                            FreezeError::Io(format!(
+                                "Failed to clean staging restore dir during rollback: {}",
+                                e
+                            ))
+                        })?;
+                    }
+                    if disk_journal_path.exists() {
+                        fs::remove_file(&disk_journal_path).map_err(|e| {
+                            FreezeError::Io(format!(
+                                "Failed to clean disk drift journal during rollback: {}",
+                                e
+                            ))
+                        })?;
+                    }
+                    durable_directory_sync(&recovery_dir).map_err(|e| {
+                        FreezeError::Io(format!(
+                            "Failed to sync recovery dir during rollback: {}",
+                            e
+                        ))
+                    })?;
+                    conn.execute(
+                        "DELETE FROM drift_restoration_journals WHERE project_id = ?1",
+                        params![project_id],
+                    )?;
                 }
                 RestorationPhase::Committing => {
-                    // Crash happened mid-mutation. Complete all operations deterministically.
+                    // Mid-mutation crash: replay all operations deterministically from staged/snapshot files
                     for op in &j.operations {
                         match op.drift_type {
                             DriftType::Modified | DriftType::Deleted => {
-                                if let Some(ref staged) = op.staged_file_path {
-                                    let staged_p = PathBuf::from(staged);
-                                    let target_p = coalition_dir.join(&op.path);
+                                let target_p = coalition_dir.join(&op.path);
+                                let mut staged_applied = false;
+
+                                if let Some(ref rel) = op.staged_file_rel {
+                                    let staged_p = coalition_dir.join(rel);
                                     if staged_p.exists() {
                                         ArtifactManager::replace_file_atomically(
                                             &staged_p, &target_p,
                                         )?;
+                                        staged_applied = true;
+                                    }
+                                }
+
+                                if !staged_applied {
+                                    let snapshot_p = coalition_dir
+                                        .join("architecture-versions")
+                                        .join(format!("v{}", j.architecture_version))
+                                        .join("contract")
+                                        .join(&op.path);
+
+                                    if snapshot_p.exists() {
+                                        let content = fs::read_to_string(&snapshot_p).map_err(|e| {
+                                            FreezeError::Io(format!(
+                                                "Failed to read snapshot file {:?} during reconcile: {}",
+                                                snapshot_p, e
+                                            ))
+                                        })?;
+                                        ArtifactManager::write_artifact_atomic(
+                                            root, &op.path, &content,
+                                        )?;
+                                    } else {
+                                        return Err(FreezeError::DriftRestorationRecoveryRequired(format!(
+                                            "Snapshot file missing at {:?} during drift restoration reconcile",
+                                            snapshot_p
+                                        )));
                                     }
                                 }
                             }
                             DriftType::Added => {
                                 let active_p = coalition_dir.join(&op.path);
                                 if active_p.exists() {
-                                    if let Some(ref qdest) = op.quarantine_dest_path {
-                                        let q_p = PathBuf::from(qdest);
+                                    if let Some(ref q_rel) = op.quarantine_dest_rel {
+                                        let q_p = coalition_dir.join(q_rel);
                                         if let Some(parent) = q_p.parent() {
                                             fs::create_dir_all(parent).map_err(|e| {
                                                 FreezeError::Io(format!(
@@ -1813,24 +2193,87 @@ impl FreezeService {
                                                 ))
                                             })?;
                                         }
-                                        let _ = fs::rename(&active_p, &q_p);
+                                        if let Err(e) = fs::rename(&active_p, &q_p) {
+                                            fs::copy(&active_p, &q_p).map_err(|ce| {
+                                                FreezeError::Io(format!(
+                                                    "Failed to quarantine added file: rename: {}, copy: {}",
+                                                    e, ce
+                                                ))
+                                            })?;
+                                            fs::remove_file(&active_p).map_err(|re| {
+                                                FreezeError::Io(format!(
+                                                    "Failed to remove quarantined file: {}",
+                                                    re
+                                                ))
+                                            })?;
+                                        }
+                                        if let Some(parent) = q_p.parent() {
+                                            durable_directory_sync(parent).map_err(|e| {
+                                                FreezeError::Io(format!(
+                                                    "Failed to sync quarantine dir: {}",
+                                                    e
+                                                ))
+                                            })?;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-                RestorationPhase::Committed => {}
-            }
 
-            // Cleanup journal from disk and database
-            if disk_journal_path.exists() {
-                let _ = fs::remove_file(&disk_journal_path);
+                    // Verify clean contract drift
+                    let report = Self::check_contract_drift(root, project_id)?;
+                    if report.has_drift {
+                        return Err(FreezeError::DriftRestorationRecoveryRequired(format!(
+                            "Reconciliation of drift restoration failed: {} artifacts still drifted",
+                            report.drifted_artifacts.len()
+                        )));
+                    }
+
+                    // Clean up after successful verification
+                    let staging_batch_dir =
+                        recovery_dir.join(format!(".staging-restore-{}", j.journal_id));
+                    if staging_batch_dir.exists() {
+                        fs::remove_dir_all(&staging_batch_dir).map_err(|e| {
+                            FreezeError::Io(format!("Failed to remove staging restore dir: {}", e))
+                        })?;
+                    }
+                    if disk_journal_path.exists() {
+                        fs::remove_file(&disk_journal_path).map_err(|e| {
+                            FreezeError::Io(format!("Failed to remove disk drift journal: {}", e))
+                        })?;
+                    }
+                    durable_directory_sync(&recovery_dir).map_err(|e| {
+                        FreezeError::Io(format!("Failed to sync recovery dir: {}", e))
+                    })?;
+                    conn.execute(
+                        "DELETE FROM drift_restoration_journals WHERE project_id = ?1",
+                        params![project_id],
+                    )?;
+                }
+                RestorationPhase::Committed => {
+                    // Clean up any lingering files
+                    let staging_batch_dir =
+                        recovery_dir.join(format!(".staging-restore-{}", j.journal_id));
+                    if staging_batch_dir.exists() {
+                        fs::remove_dir_all(&staging_batch_dir).map_err(|e| {
+                            FreezeError::Io(format!("Failed to remove staging restore dir: {}", e))
+                        })?;
+                    }
+                    if disk_journal_path.exists() {
+                        fs::remove_file(&disk_journal_path).map_err(|e| {
+                            FreezeError::Io(format!("Failed to remove disk drift journal: {}", e))
+                        })?;
+                    }
+                    durable_directory_sync(&recovery_dir).map_err(|e| {
+                        FreezeError::Io(format!("Failed to sync recovery dir: {}", e))
+                    })?;
+                    conn.execute(
+                        "DELETE FROM drift_restoration_journals WHERE project_id = ?1",
+                        params![project_id],
+                    )?;
+                }
             }
-            conn.execute(
-                "DELETE FROM drift_restoration_journals WHERE project_id = ?1",
-                params![project_id],
-            )?;
         }
 
         Ok(())
@@ -1867,15 +2310,19 @@ impl FreezeService {
 
         let batch_id = Uuid::new_v4().to_string();
         let recovery_dir = coalition_dir.join("recovery");
+        fs::create_dir_all(&recovery_dir)
+            .map_err(|e| FreezeError::Io(format!("Failed to create recovery dir: {}", e)))?;
         let staging_batch_dir = recovery_dir.join(format!(".staging-restore-{}", batch_id));
         fs::create_dir_all(&staging_batch_dir)
             .map_err(|e| FreezeError::Io(format!("Failed to create staging restore dir: {}", e)))?;
+        durable_directory_sync(&recovery_dir)
+            .map_err(|e| FreezeError::Io(format!("Failed to sync recovery dir: {}", e)))?;
 
         // 2. Deterministically order operations
         let mut sorted_drift = report.drifted_artifacts.clone();
         sorted_drift.sort_by(|a, b| a.path.cmp(&b.path));
 
-        // 3. Stage restoration files and pre-allocate quarantine paths
+        // 3. Stage restoration files and pre-allocate relative quarantine paths
         let mut operations = Vec::new();
         for drifted in &sorted_drift {
             match drifted.drift_type {
@@ -1894,8 +2341,8 @@ impl FreezeService {
                         ))
                     })?;
 
-                    let staged_file = staging_batch_dir
-                        .join(format!("{}.staged", drifted.path.replace('/', "_")));
+                    let staged_filename = format!("{}.staged", drifted.path.replace('/', "_"));
+                    let staged_file = staging_batch_dir.join(&staged_filename);
                     {
                         let mut file = fs::OpenOptions::new()
                             .write(true)
@@ -1918,37 +2365,40 @@ impl FreezeService {
                         })?;
                     }
 
-                    operations.push(RestorationOp {
-                        path: drifted.path.clone(),
-                        drift_type: drifted.drift_type,
-                        staged_file_path: Some(staged_file.to_string_lossy().to_string()),
-                        backup_path: None,
-                        quarantine_dest_path: None,
-                    });
-                }
-                DriftType::Added => {
-                    let quarantine_dest = recovery_dir
-                        .join(format!(
-                            "quarantine-{}-{}",
-                            chrono::Utc::now().format("%Y%m%d%H%M%S"),
-                            batch_id
-                        ))
-                        .join(&drifted.path);
+                    let staged_file_rel =
+                        format!("recovery/.staging-restore-{}/{}", batch_id, staged_filename);
 
                     operations.push(RestorationOp {
                         path: drifted.path.clone(),
                         drift_type: drifted.drift_type,
-                        staged_file_path: None,
-                        backup_path: None,
-                        quarantine_dest_path: Some(quarantine_dest.to_string_lossy().to_string()),
+                        staged_file_rel: Some(staged_file_rel),
+                        quarantine_dest_rel: None,
+                    });
+                }
+                DriftType::Added => {
+                    let quarantine_dest_rel = format!(
+                        "recovery/quarantine-{}-{}/{}",
+                        chrono::Utc::now().format("%Y%m%d%H%M%S"),
+                        batch_id,
+                        drifted.path
+                    );
+
+                    operations.push(RestorationOp {
+                        path: drifted.path.clone(),
+                        drift_type: drifted.drift_type,
+                        staged_file_rel: None,
+                        quarantine_dest_rel: Some(quarantine_dest_rel),
                     });
                 }
             }
         }
 
-        // 4. Record journal durably (STAGED phase)
+        durable_directory_sync(&staging_batch_dir)
+            .map_err(|e| FreezeError::Io(format!("Failed to sync staging batch dir: {}", e)))?;
+
+        // 4. Record journal durably on disk (STAGED phase)
         let now = chrono::Utc::now().to_rfc3339();
-        let journal = DriftRestorationJournal {
+        let mut journal = DriftRestorationJournal {
             journal_id: batch_id.clone(),
             project_id: project_id.to_string(),
             architecture_version: version.to_string(),
@@ -1958,16 +2408,32 @@ impl FreezeService {
             updated_at: now.clone(),
         };
 
-        let journal_json = serde_json::to_string_pretty(&journal).map_err(|e| {
-            let _ = fs::remove_dir_all(&staging_batch_dir);
-            FreezeError::Artifact(format!("Failed to serialize drift journal: {}", e))
-        })?;
-
         let disk_journal_path = recovery_dir.join("drift-restoration-journal.json");
-        fs::write(&disk_journal_path, journal_json.as_bytes()).map_err(|e| {
-            let _ = fs::remove_dir_all(&staging_batch_dir);
-            FreezeError::Io(format!("Failed to write disk drift journal: {}", e))
-        })?;
+        {
+            let journal_json = serde_json::to_string_pretty(&journal).map_err(|e| {
+                let _ = fs::remove_dir_all(&staging_batch_dir);
+                FreezeError::Artifact(format!("Failed to serialize drift journal: {}", e))
+            })?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&disk_journal_path)
+                .map_err(|e| {
+                    let _ = fs::remove_dir_all(&staging_batch_dir);
+                    FreezeError::Io(format!("Failed to open disk drift journal: {}", e))
+                })?;
+            file.write_all(journal_json.as_bytes()).map_err(|e| {
+                let _ = fs::remove_dir_all(&staging_batch_dir);
+                FreezeError::Io(format!("Failed to write disk drift journal: {}", e))
+            })?;
+            file.sync_all().map_err(|e| {
+                let _ = fs::remove_dir_all(&staging_batch_dir);
+                FreezeError::Io(format!("Failed to sync disk drift journal: {}", e))
+            })?;
+        }
+        durable_directory_sync(&recovery_dir)
+            .map_err(|e| FreezeError::Io(format!("Failed to sync recovery dir: {}", e)))?;
 
         conn.execute(
             "INSERT INTO drift_restoration_journals (journal_id, project_id, architecture_version, phase, operations_json, created_at, updated_at)
@@ -1982,28 +2448,105 @@ impl FreezeService {
             ],
         )?;
 
-        // 5. Transition to COMMITTING phase before first mutation
-        let now = chrono::Utc::now().to_rfc3339();
+        // 5. Transition to COMMITTING phase on disk and database before first mutation
+        let committing_time = chrono::Utc::now().to_rfc3339();
+        journal.phase = RestorationPhase::Committing;
+        journal.updated_at = committing_time.clone();
+
+        {
+            let journal_json = serde_json::to_string_pretty(&journal).map_err(|e| {
+                FreezeError::Artifact(format!(
+                    "Failed to serialize committing drift journal: {}",
+                    e
+                ))
+            })?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&disk_journal_path)
+                .map_err(|e| {
+                    FreezeError::Io(format!(
+                        "Failed to open committing disk drift journal: {}",
+                        e
+                    ))
+                })?;
+            file.write_all(journal_json.as_bytes()).map_err(|e| {
+                FreezeError::Io(format!(
+                    "Failed to write committing disk drift journal: {}",
+                    e
+                ))
+            })?;
+            file.sync_all().map_err(|e| {
+                FreezeError::Io(format!(
+                    "Failed to sync committing disk drift journal: {}",
+                    e
+                ))
+            })?;
+        }
+        durable_directory_sync(&recovery_dir).map_err(|e| {
+            FreezeError::Io(format!("Failed to sync recovery dir for committing: {}", e))
+        })?;
+
         conn.execute(
             "UPDATE drift_restoration_journals SET phase = 'COMMITTING', updated_at = ?1 WHERE journal_id = ?2",
-            params![now, journal.journal_id],
+            params![committing_time, journal.journal_id],
         )?;
 
+        #[cfg(test)]
+        {
+            let seam = INJECTED_RESTORE_SEAM.with(|c| c.get());
+            if seam == InjectedRestoreSeam::BeforeFirstRestoreMutation {
+                return Err(FreezeError::Io(
+                    "Injected restore seam: BeforeFirstRestoreMutation".to_string(),
+                ));
+            }
+        }
+
         // 6. Execute mutations in deterministic order
-        for op in &operations {
+        #[cfg(test)]
+        let op_count = operations.len();
+        for (idx, op) in operations.iter().enumerate() {
+            #[cfg(not(test))]
+            let _ = idx;
             match op.drift_type {
                 DriftType::Modified | DriftType::Deleted => {
-                    if let Some(ref staged) = op.staged_file_path {
-                        let staged_p = PathBuf::from(staged);
+                    if let Some(ref staged_rel) = op.staged_file_rel {
+                        let staged_p = coalition_dir.join(staged_rel);
                         let target_p = coalition_dir.join(&op.path);
-                        ArtifactManager::replace_file_atomically(&staged_p, &target_p)?;
+                        if staged_p.exists() {
+                            ArtifactManager::replace_file_atomically(&staged_p, &target_p)?;
+                        } else {
+                            let snapshot_p = coalition_dir
+                                .join("architecture-versions")
+                                .join(format!("v{}", version))
+                                .join("contract")
+                                .join(&op.path);
+                            let content = fs::read_to_string(&snapshot_p).map_err(|e| {
+                                FreezeError::Io(format!(
+                                    "Failed to read snapshot file during restore: {}",
+                                    e
+                                ))
+                            })?;
+                            ArtifactManager::write_artifact_atomic(root, &op.path, &content)?;
+                        }
                     }
                 }
                 DriftType::Added => {
+                    #[cfg(test)]
+                    {
+                        let seam = INJECTED_RESTORE_SEAM.with(|c| c.get());
+                        if seam == InjectedRestoreSeam::DuringAddedArtifactQuarantine {
+                            return Err(FreezeError::Io(
+                                "Injected restore seam: DuringAddedArtifactQuarantine".to_string(),
+                            ));
+                        }
+                    }
+
                     let active_p = coalition_dir.join(&op.path);
                     if active_p.exists() {
-                        if let Some(ref qdest) = op.quarantine_dest_path {
-                            let q_p = PathBuf::from(qdest);
+                        if let Some(ref q_rel) = op.quarantine_dest_rel {
+                            let q_p = coalition_dir.join(q_rel);
                             if let Some(parent) = q_p.parent() {
                                 fs::create_dir_all(parent).map_err(|e| {
                                     FreezeError::Io(format!(
@@ -2019,25 +2562,92 @@ impl FreezeService {
                                         e, ce
                                     ))
                                 })?;
-                                let _ = fs::remove_file(&active_p);
+                                fs::remove_file(&active_p).map_err(|re| {
+                                    FreezeError::Io(format!(
+                                        "Failed to remove quarantined source file: {}",
+                                        re
+                                    ))
+                                })?;
+                            }
+                            if let Some(parent) = q_p.parent() {
+                                durable_directory_sync(parent).map_err(|e| {
+                                    FreezeError::Io(format!("Failed to sync quarantine dir: {}", e))
+                                })?;
                             }
                         }
                     }
                 }
             }
+
+            #[cfg(test)]
+            {
+                let seam = INJECTED_RESTORE_SEAM.with(|c| c.get());
+                if idx == 0 && seam == InjectedRestoreSeam::AfterFirstRestoreMutation {
+                    return Err(FreezeError::Io(
+                        "Injected restore seam: AfterFirstRestoreMutation".to_string(),
+                    ));
+                }
+                if op_count > 1
+                    && idx == op_count / 2
+                    && seam == InjectedRestoreSeam::MidRestoreBatch
+                {
+                    return Err(FreezeError::Io(
+                        "Injected restore seam: MidRestoreBatch".to_string(),
+                    ));
+                }
+            }
         }
 
-        // 7. Cleanup journal and staging files
-        let _ = fs::remove_dir_all(&staging_batch_dir);
-        if disk_journal_path.exists() {
-            let _ = fs::remove_file(&disk_journal_path);
+        #[cfg(test)]
+        {
+            let seam = INJECTED_RESTORE_SEAM.with(|c| c.get());
+            if seam == InjectedRestoreSeam::AfterAllMutationsBeforeVerification {
+                return Err(FreezeError::Io(
+                    "Injected restore seam: AfterAllMutationsBeforeVerification".to_string(),
+                ));
+            }
         }
+
+        // 7. Verify contract drift is completely resolved before cleaning journals
+        let post_report = Self::check_contract_drift(root, project_id)?;
+        if post_report.has_drift {
+            return Err(FreezeError::DriftRestorationRecoveryRequired(format!(
+                "Drift restoration failed to restore clean contract: {} artifacts remain drifted",
+                post_report.drifted_artifacts.len()
+            )));
+        }
+
+        #[cfg(test)]
+        {
+            let seam = INJECTED_RESTORE_SEAM.with(|c| c.get());
+            if seam == InjectedRestoreSeam::AfterVerificationBeforeJournalCleanup {
+                return Err(FreezeError::Io(
+                    "Injected restore seam: AfterVerificationBeforeJournalCleanup".to_string(),
+                ));
+            }
+        }
+
+        // 8. Cleanup journal and staging files (fails closed without swallowing errors)
+        if staging_batch_dir.exists() {
+            fs::remove_dir_all(&staging_batch_dir).map_err(|e| {
+                FreezeError::Io(format!("Failed to remove staging restore dir: {}", e))
+            })?;
+        }
+        if disk_journal_path.exists() {
+            fs::remove_file(&disk_journal_path).map_err(|e| {
+                FreezeError::Io(format!("Failed to remove disk drift journal: {}", e))
+            })?;
+        }
+        durable_directory_sync(&recovery_dir).map_err(|e| {
+            FreezeError::Io(format!("Failed to sync recovery dir after cleanup: {}", e))
+        })?;
+
         conn.execute(
             "DELETE FROM drift_restoration_journals WHERE journal_id = ?1",
             params![journal.journal_id],
         )?;
 
-        Self::check_contract_drift(root, project_id)
+        Ok(post_report)
     }
 
     /// Retrieves the bounded Builder implementation packet for a frozen version.
@@ -2053,6 +2663,8 @@ impl FreezeService {
         let version = version_override
             .or(project_yaml.current_architecture_version.as_deref())
             .unwrap_or(INITIAL_ARCHITECTURE_VERSION);
+
+        Self::validate_architecture_version(version)?;
 
         // Verify snapshot integrity
         Self::verify_snapshot_integrity(
@@ -2698,6 +3310,41 @@ mod tests {
 
             assert!(res.is_err(), "Seam {:?} must fail freeze", seam);
 
+            if seam == InjectedFreezeSeam::MidDbTransaction {
+                // Assert that DB transaction rolled back completely
+                let preview_status: String = db
+                    .connection()
+                    .query_row(
+                        "SELECT status FROM freeze_previews WHERE preview_id = ?1",
+                        params![preview.preview_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    preview_status, "PENDING",
+                    "Preview must remain PENDING on rollback"
+                );
+
+                let pre_wf =
+                    workflow::get_workflow_state(db.connection(), &project_yaml.project_id)
+                        .unwrap();
+                assert_eq!(
+                    pre_wf.state,
+                    WorkflowState::ReadyToFreeze,
+                    "Workflow must remain READY_TO_FREEZE on rollback"
+                );
+
+                let epoch_count: i64 = db
+                    .connection()
+                    .query_row(
+                        "SELECT COUNT(*) FROM builder_epochs WHERE project_id = ?1",
+                        params![project_yaml.project_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(epoch_count, 0, "No epochs must be committed on rollback");
+            }
+
             // Reconcile and test safe convergence
             FreezeService::reconcile_freeze_state(
                 dir.path(),
@@ -2747,11 +3394,332 @@ mod tests {
                         .unwrap();
                     assert_eq!(boundary_count, 1, "Boundary must be reconstructed");
 
+                    let preview_status: String = db
+                        .connection()
+                        .query_row(
+                            "SELECT status FROM freeze_previews WHERE preview_id = ?1",
+                            params![preview.preview_id],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        preview_status, "CONSUMED",
+                        "Preview must be reconciled to CONSUMED"
+                    );
+
+                    let event_count: i64 = db
+                        .connection()
+                        .query_row(
+                            "SELECT COUNT(*) FROM activity_events WHERE project_id = ?1 AND event_type = 'ARCHITECTURE_FROZEN'",
+                            params![project_yaml.project_id],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        event_count, 1,
+                        "ARCHITECTURE_FROZEN activity event must be reconciled"
+                    );
+
                     let packet = FreezeService::get_builder_packet(dir.path(), None);
                     assert!(packet.is_ok(), "Builder packet must be retrievable");
                 }
                 InjectedFreezeSeam::None => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn test_all_restoration_failure_injection_seams() {
+        let seams = [
+            InjectedRestoreSeam::BeforeFirstRestoreMutation,
+            InjectedRestoreSeam::AfterFirstRestoreMutation,
+            InjectedRestoreSeam::MidRestoreBatch,
+            InjectedRestoreSeam::DuringAddedArtifactQuarantine,
+            InjectedRestoreSeam::AfterAllMutationsBeforeVerification,
+            InjectedRestoreSeam::AfterVerificationBeforeJournalCleanup,
+        ];
+
+        for &seam in &seams {
+            let dir = tempdir().unwrap();
+            let mut db = DbManager::new_in_memory().unwrap();
+            db.run_migrations().unwrap();
+
+            setup_git_repo(dir.path());
+            commit_file(dir.path(), "README.md", "# Test", "Initial commit");
+
+            let project_yaml =
+                ArtifactManager::initialize_new_project(dir.path(), "test-restore-seams").unwrap();
+            insert_test_project_and_workflow(
+                &mut db,
+                &project_yaml.project_id,
+                dir.path(),
+                "READY_TO_FREEZE",
+            );
+            populate_ready_artifacts(dir.path());
+
+            let git = GitAdapter::new().unwrap();
+            let preview = FreezeService::prepare_freeze_preview(
+                dir.path(),
+                &project_yaml.project_id,
+                &git,
+                db.connection(),
+            )
+            .unwrap();
+
+            FreezeService::confirm_freeze(
+                dir.path(),
+                &project_yaml.project_id,
+                &preview.preview_id,
+                &git,
+                db.connection_mut(),
+            )
+            .unwrap();
+
+            // Introduce 3 kinds of drift: modified, deleted, added
+            ArtifactManager::write_artifact_atomic(
+                dir.path(),
+                "design/product-vision.md",
+                "# Drifted Vision\n\nModified content.",
+            )
+            .unwrap();
+
+            let target_req = dir.path().join(".coalition").join("design/requirements.md");
+            fs::remove_file(target_req).unwrap();
+
+            let rogue_added = dir
+                .path()
+                .join(".coalition")
+                .join("decisions/ADR-999-rogue.md");
+            fs::create_dir_all(dir.path().join(".coalition").join("decisions")).unwrap();
+            fs::write(rogue_added, "# Rogue ADR\n\nUnexpected added decision.").unwrap();
+
+            let drift =
+                FreezeService::check_contract_drift(dir.path(), &project_yaml.project_id).unwrap();
+            assert!(drift.has_drift);
+            assert_eq!(drift.drifted_artifacts.len(), 3);
+
+            // Inject seam and call restore
+            INJECTED_RESTORE_SEAM.with(|c| c.set(seam));
+            let res = FreezeService::restore_all_drifted_artifacts(
+                dir.path(),
+                &project_yaml.project_id,
+                db.connection_mut(),
+            );
+            INJECTED_RESTORE_SEAM.with(|c| c.set(InjectedRestoreSeam::None));
+
+            assert!(res.is_err(), "Seam {:?} must fail restore", seam);
+
+            // Reconcile and assert clean convergence
+            FreezeService::reconcile_drift_restoration(
+                dir.path(),
+                &project_yaml.project_id,
+                db.connection_mut(),
+            )
+            .unwrap();
+
+            let post_drift =
+                FreezeService::check_contract_drift(dir.path(), &project_yaml.project_id).unwrap();
+            assert!(
+                !post_drift.has_drift,
+                "Seam {:?} must safely converge to clean contract after reconcile",
+                seam
+            );
+
+            // Verify disk journal is cleaned
+            let disk_journal = dir
+                .path()
+                .join(".coalition")
+                .join("recovery")
+                .join("drift-restoration-journal.json");
+            assert!(!disk_journal.exists(), "Disk journal must be cleaned up");
+
+            // Verify SQLite journal row is cleaned
+            let journal_count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM drift_restoration_journals WHERE project_id = ?1",
+                    params![project_yaml.project_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(journal_count, 0, "SQLite journal record must be cleaned up");
+        }
+    }
+
+    #[test]
+    fn test_restoration_recovery_with_sqlite_loss_during_committing() {
+        let dir = tempdir().unwrap();
+        let mut db = DbManager::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+
+        setup_git_repo(dir.path());
+        commit_file(dir.path(), "README.md", "# Test", "Initial commit");
+
+        let project_yaml =
+            ArtifactManager::initialize_new_project(dir.path(), "test-restore-loss").unwrap();
+        insert_test_project_and_workflow(
+            &mut db,
+            &project_yaml.project_id,
+            dir.path(),
+            "READY_TO_FREEZE",
+        );
+        populate_ready_artifacts(dir.path());
+
+        let git = GitAdapter::new().unwrap();
+        let preview = FreezeService::prepare_freeze_preview(
+            dir.path(),
+            &project_yaml.project_id,
+            &git,
+            db.connection(),
+        )
+        .unwrap();
+
+        FreezeService::confirm_freeze(
+            dir.path(),
+            &project_yaml.project_id,
+            &preview.preview_id,
+            &git,
+            db.connection_mut(),
+        )
+        .unwrap();
+
+        // Mutate product-vision
+        ArtifactManager::write_artifact_atomic(
+            dir.path(),
+            "design/product-vision.md",
+            "# Corrupted Vision\n\nModified content.",
+        )
+        .unwrap();
+
+        // Fail restore at BeforeFirstRestoreMutation (disk journal is durably COMMITTING)
+        INJECTED_RESTORE_SEAM.with(|c| c.set(InjectedRestoreSeam::BeforeFirstRestoreMutation));
+        let res = FreezeService::restore_all_drifted_artifacts(
+            dir.path(),
+            &project_yaml.project_id,
+            db.connection_mut(),
+        );
+        INJECTED_RESTORE_SEAM.with(|c| c.set(InjectedRestoreSeam::None));
+        assert!(res.is_err());
+
+        // Verify disk journal is COMMITTING
+        let disk_journal = dir
+            .path()
+            .join(".coalition")
+            .join("recovery")
+            .join("drift-restoration-journal.json");
+        assert!(disk_journal.exists(), "Disk journal must exist on disk");
+        let content = fs::read_to_string(&disk_journal).unwrap();
+        let j: DriftRestorationJournal = serde_json::from_str(&content).unwrap();
+        assert_eq!(j.phase, RestorationPhase::Committing);
+
+        // Simulate complete SQLite loss: create a brand new clean database
+        let mut fresh_db = DbManager::new_in_memory().unwrap();
+        fresh_db.run_migrations().unwrap();
+
+        // Run reconcile_drift_restoration on fresh DB with no prior records
+        FreezeService::reconcile_drift_restoration(
+            dir.path(),
+            &project_yaml.project_id,
+            fresh_db.connection_mut(),
+        )
+        .unwrap();
+
+        // Contract must be completely restored from disk journal alone!
+        let post_drift =
+            FreezeService::check_contract_drift(dir.path(), &project_yaml.project_id).unwrap();
+        assert!(
+            !post_drift.has_drift,
+            "Contract must be restored cleanly from disk journal alone"
+        );
+        assert!(!disk_journal.exists(), "Disk journal must be cleaned up");
+    }
+
+    #[test]
+    fn test_architecture_version_validation_and_containment() {
+        // 1. Version format validation
+        assert!(validate_architecture_version("1.0").is_ok());
+        assert!(validate_architecture_version("1.0-alpha").is_ok());
+        assert!(validate_architecture_version("v2.0").is_ok());
+        assert!(validate_architecture_version("3.14-beta.1").is_ok());
+
+        assert!(matches!(
+            validate_architecture_version("").unwrap_err(),
+            FreezeError::InvalidArchitectureVersion(_)
+        ));
+        assert!(matches!(
+            validate_architecture_version("   ").unwrap_err(),
+            FreezeError::InvalidArchitectureVersion(_)
+        ));
+        assert!(matches!(
+            validate_architecture_version("1.0/../escape").unwrap_err(),
+            FreezeError::InvalidArchitectureVersion(_)
+        ));
+        assert!(matches!(
+            validate_architecture_version("1.0\\escape").unwrap_err(),
+            FreezeError::InvalidArchitectureVersion(_)
+        ));
+        assert!(matches!(
+            validate_architecture_version("1.0\0bad").unwrap_err(),
+            FreezeError::InvalidArchitectureVersion(_)
+        ));
+        assert!(matches!(
+            validate_architecture_version("123456789012345678901234567890123").unwrap_err(),
+            FreezeError::InvalidArchitectureVersion(_)
+        ));
+
+        // 2. Traversal version rejected by verify_snapshot_integrity
+        let dir = tempdir().unwrap();
+        let res = FreezeService::verify_snapshot_integrity(dir.path(), "../escape", None);
+        assert!(matches!(
+            res.unwrap_err(),
+            FreezeError::InvalidArchitectureVersion(_)
+        ));
+    }
+
+    #[test]
+    fn test_prompt_overhead_budget_truncation() {
+        let manifest_artifacts = vec![
+            ContractArtifactEntry {
+                relative_path: "design/product-vision.md".to_string(),
+                fingerprint: "abc".to_string(),
+                size_bytes: 104_000,
+            },
+            ContractArtifactEntry {
+                relative_path: "design/architecture.md".to_string(),
+                fingerprint: "def".to_string(),
+                size_bytes: 100_500, // Total content = 204,500 (< 204,800 bytes = 200 KB)
+            },
+        ];
+
+        let (prompt, _rules, artifacts, is_truncated, prompt_bytes) =
+            FreezeService::build_builder_packet_prompt_and_artifacts(
+                "1.0",
+                "Test Project",
+                "test-proj-123",
+                "0123456789abcdef0123456789abcdef01234567",
+                "contractfp123",
+                &manifest_artifacts,
+                |rel| {
+                    if rel == "design/product-vision.md" {
+                        Ok("A".repeat(104_000))
+                    } else {
+                        Ok("B".repeat(100_500))
+                    }
+                },
+            )
+            .unwrap();
+
+        // Because prompt header, markdown headings, and footers push total prompt over 200 KB:
+        assert!(
+            is_truncated,
+            "Must be truncated due to prompt context budget"
+        );
+        assert!(
+            prompt_bytes <= BUILDER_PACKET_MAX_BYTES,
+            "Prompt bytes must not exceed 200 KB"
+        );
+        assert!(prompt.len() <= BUILDER_PACKET_MAX_BYTES);
+        assert_eq!(artifacts.len(), 2);
+        assert!(artifacts[1].content.contains("[TRUNCATED"));
     }
 }

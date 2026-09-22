@@ -347,6 +347,14 @@ impl From<crate::core::freeze::FreezeError> for CommandError {
                 serde_json::json!({ "version": version, "reason": reason }),
             ),
             FreezeError::FreezeRecoveryRequired(msg) => Self::new("FREEZE_RECOVERY_REQUIRED", msg),
+            FreezeError::DriftRestorationRecoveryRequired(msg) => {
+                Self::new("DRIFT_RESTORATION_RECOVERY_REQUIRED", msg)
+            }
+            FreezeError::InvalidArchitectureVersion(v) => Self::with_details(
+                "INVALID_ARCHITECTURE_VERSION",
+                format!("Invalid architecture version: {}", v),
+                serde_json::json!({ "version": v }),
+            ),
             FreezeError::Artifact(msg) => Self::new("ARTIFACT_ERROR", msg),
             FreezeError::Git(msg) => Self::new("GIT_ERROR", msg),
             FreezeError::Workflow(msg) => Self::new("WORKFLOW_ERROR", msg),
@@ -528,9 +536,16 @@ pub async fn apply_workflow_action(
 ) -> Result<WorkflowStateRecord, CommandError> {
     let mut db = state.db.lock().await;
 
-    // Invariant: Builder execution cannot start if frozen architecture contract has drifted
+    // Invariant: Builder execution cannot start if frozen architecture contract has drifted or has unresolved restoration
     if action == WorkflowAction::StartBuild {
         if let Ok(repo_path) = get_repo_path_for_project_sync(&db, &project_id) {
+            crate::core::freeze::FreezeService::reconcile_drift_restoration(
+                &repo_path,
+                &project_id,
+                db.connection_mut(),
+            )
+            .map_err(CommandError::from)?;
+
             let drift =
                 crate::core::freeze::FreezeService::check_contract_drift(&repo_path, &project_id)
                     .map_err(CommandError::from)?;
@@ -1068,8 +1083,14 @@ pub async fn get_contract_drift(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<crate::core::freeze::DriftReport, CommandError> {
-    let db = state.db.lock().await;
+    let mut db = state.db.lock().await;
     let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    crate::core::freeze::FreezeService::reconcile_drift_restoration(
+        &repo_path,
+        &project_id,
+        db.connection_mut(),
+    )
+    .map_err(CommandError::from)?;
     crate::core::freeze::FreezeService::check_contract_drift(&repo_path, &project_id)
         .map_err(CommandError::from)
 }
@@ -1126,6 +1147,9 @@ pub async fn get_builder_packet(
 ) -> Result<crate::core::freeze::BuilderPacket, CommandError> {
     let db = state.db.lock().await;
     let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    if let Some(ref v) = version {
+        crate::core::freeze::validate_architecture_version(v).map_err(CommandError::from)?;
+    }
     crate::core::freeze::FreezeService::get_builder_packet(&repo_path, version.as_deref())
         .map_err(CommandError::from)
 }

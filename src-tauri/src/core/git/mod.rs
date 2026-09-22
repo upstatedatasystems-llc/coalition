@@ -279,23 +279,52 @@ impl GitAdapter {
             .current_dir(dir)
             .output()?;
 
+        if !status_output.status.success() {
+            let stderr = String::from_utf8_lossy(&status_output.stderr);
+            return Err(GitError::ExecutionFailed(format!(
+                "git status --porcelain=v1 -uall failed with exit code {:?}: {}",
+                status_output.status.code(),
+                stderr.trim()
+            )));
+        }
+
         let raw_porcelain = String::from_utf8_lossy(&status_output.stdout).to_string();
         let counts = Self::parse_porcelain_status(&raw_porcelain);
 
         // 2. Unstaged diff hash
         let unstaged_diff = Command::new(&self.git_bin)
-            .args(["diff"])
+            .args(["diff", "--no-ext-diff"])
             .current_dir(dir)
             .output()?;
+
+        if !unstaged_diff.status.success() {
+            let stderr = String::from_utf8_lossy(&unstaged_diff.stderr);
+            return Err(GitError::ExecutionFailed(format!(
+                "git diff --no-ext-diff failed with exit code {:?}: {}",
+                unstaged_diff.status.code(),
+                stderr.trim()
+            )));
+        }
+
         let mut hasher = Sha256::new();
         hasher.update(&unstaged_diff.stdout);
         let unstaged_diff_hash = format!("{:x}", hasher.finalize());
 
         // 3. Staged / cached diff hash
         let staged_diff = Command::new(&self.git_bin)
-            .args(["diff", "--cached"])
+            .args(["diff", "--cached", "--no-ext-diff"])
             .current_dir(dir)
             .output()?;
+
+        if !staged_diff.status.success() {
+            let stderr = String::from_utf8_lossy(&staged_diff.stderr);
+            return Err(GitError::ExecutionFailed(format!(
+                "git diff --cached --no-ext-diff failed with exit code {:?}: {}",
+                staged_diff.status.code(),
+                stderr.trim()
+            )));
+        }
+
         let mut hasher = Sha256::new();
         hasher.update(&staged_diff.stdout);
         let staged_diff_hash = format!("{:x}", hasher.finalize());
@@ -306,8 +335,19 @@ impl GitAdapter {
             if let Some(rel_path_raw) = line.strip_prefix("?? ") {
                 let rel_path = rel_path_raw.trim().trim_matches('"');
                 let full_path = dir.join(rel_path);
-                if full_path.is_file() {
-                    let content_bytes = std::fs::read(&full_path).unwrap_or_default();
+                let meta = std::fs::symlink_metadata(&full_path)?;
+                let is_link =
+                    meta.file_type().is_symlink() || std::fs::read_link(&full_path).is_ok();
+                if is_link {
+                    // Safe representation: read the symlink target without following outside repo
+                    let target = std::fs::read_link(&full_path)?;
+                    let target_str = target.to_string_lossy().replace('\\', "/");
+                    let mut file_hasher = Sha256::new();
+                    file_hasher.update(target_str.as_bytes());
+                    let file_hash = format!("{:x}", file_hasher.finalize());
+                    untracked_entries.push(format!("{}:symlink:{}", rel_path, file_hash));
+                } else if meta.is_file() {
+                    let content_bytes = std::fs::read(&full_path)?;
                     let mut file_hasher = Sha256::new();
                     file_hasher.update(&content_bytes);
                     let file_hash = format!("{:x}", file_hasher.finalize());
@@ -545,6 +585,108 @@ mod tests {
         assert_ne!(
             state_staged.composite_fingerprint,
             state_unstaged.composite_fingerprint
+        );
+    }
+
+    #[test]
+    fn test_compute_detailed_dirty_state_symlink_and_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path();
+        let adapter = GitAdapter::new().unwrap();
+
+        Command::new("git")
+            .args(["init"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        fs::write(repo_path.join("committed.txt"), "v1").unwrap();
+        Command::new("git")
+            .args(["add", "committed.txt"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        // 1. Untracked directory junction / symlink
+        let target_dir = tempfile::tempdir().unwrap();
+        fs::write(target_dir.path().join("link_file.txt"), "link content 1").unwrap();
+        let link_path = repo_path.join("untracked_link");
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link_path.as_os_str())
+                .arg(target_dir.path().as_os_str())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target_dir.path(), &link_path).unwrap();
+        }
+
+        let state1 = adapter.compute_detailed_dirty_state(repo_path).unwrap();
+        assert!(!state1.is_clean);
+
+        // 2. Change symlink target to a different directory
+        let target_dir2 = tempfile::tempdir().unwrap();
+        fs::write(target_dir2.path().join("link_file.txt"), "link content 2").unwrap();
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "rmdir"])
+                .arg(link_path.as_os_str())
+                .status();
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link_path.as_os_str())
+                .arg(target_dir2.path().as_os_str())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        #[cfg(unix)]
+        {
+            let _ = fs::remove_file(&link_path);
+            std::os::unix::fs::symlink(target_dir2.path(), &link_path).unwrap();
+        }
+
+        let state2 = adapter.compute_detailed_dirty_state(repo_path).unwrap();
+        assert_ne!(
+            state1.composite_fingerprint, state2.composite_fingerprint,
+            "Changing symlink target must alter dirty fingerprint"
+        );
+
+        // Cleanup link on Windows
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "rmdir"])
+                .arg(link_path.as_os_str())
+                .status();
+        }
+
+        // 3. Invalid repository path fails closed
+        let non_repo = tempfile::tempdir().unwrap();
+        let res = adapter.compute_detailed_dirty_state(non_repo.path());
+        assert!(
+            res.is_err(),
+            "compute_detailed_dirty_state on non-repo must fail closed"
         );
     }
 }

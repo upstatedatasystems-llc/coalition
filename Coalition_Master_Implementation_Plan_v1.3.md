@@ -20,7 +20,7 @@ This document is the master implementation plan for Coalition V1.
 
 It is intended to be handed directly to Google Antigravity as the authoritative implementation package for the initial public repository.
 
-**Roadmap revision in Plan v1.3:** Coalition V1 remains organized into five human-facing product stages. Each numbered stage is one human-issued Antigravity implementation assignment. The smaller technical units inside a stage remain mandatory internal checkpoints for scope control, testing, documentation, validation, and recoverable commits, but they are not separate phases and must not require a new human prompt between them. Plan v1.3 also synchronizes the roadmap with the current repository baseline: Stage 1 is complete; the Stage 2 ChatGPT Relay and Architecture Workspace internal checkpoint is complete; the remaining Stage 2 work is Architecture Freeze and Git Boundaries. Antigravity should resume from that remaining Stage 2 checkpoint and continue until the complete Stage 2 exit criteria pass, unless an Architecture Concern, unsupported external-interface contradiction, blocking failure, or explicit human-authority decision requires intervention. macOS remains outside the Windows V1 completion path as the post-V1 V1.1 platform-expansion stage.
+**Roadmap revision in Plan v1.3:** Coalition V1 remains organized into five human-facing product stages. Each numbered stage is one human-issued Antigravity implementation assignment. The smaller technical units inside a stage remain mandatory internal checkpoints for scope control, testing, documentation, validation, and recoverable commits, but they are not separate phases and must not require a new human prompt between them. Plan v1.3 also synchronizes the roadmap with the current repository baseline: Stage 1 and Stage 2 (ChatGPT Relay, Architecture Workspace, Architecture Freeze, and Git Boundaries) are COMPLETE; Stage 3 (Builder Control Plane) is NEXT. macOS remains outside the Windows V1 completion path as the post-V1 V1.1 platform-expansion stage.
 
 The Coalition v0.2 design remains the product and architecture reference. Where this master plan adds detail or changes decisions made after v0.2, **this master plan takes precedence**.
 
@@ -1935,7 +1935,7 @@ It must never execute local commands.
 
 ## 30.2 Internal Checkpoint — Architecture Freeze and Git Boundaries
 
-**Current status at Plan v1.3:** NEXT.
+**Current status at Plan v1.3:** COMPLETE.
 
 **Formerly:** Phase 3
 
@@ -2005,6 +2005,8 @@ Do not begin Stage 3 until both Stage 2 internal checkpoints are verified and th
 ---
 
 # 31. Stage 3 — Builder Control Plane
+
+**Current status at Plan v1.3:** NEXT.
 
 **Product goal:** Turn the Stage 1 Antigravity technical proof into a safe, observable, usable Builder controlled by Coalition.
 
