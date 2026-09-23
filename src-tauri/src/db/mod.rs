@@ -382,6 +382,57 @@ impl DbManager {
                 );
                 CREATE INDEX IF NOT EXISTS idx_validation_overrides_proj ON validation_gate_overrides(project_id, run_id);",
             ),
+            (
+                11,
+                "011_stage4_review_correction_loop",
+                "CREATE TABLE IF NOT EXISTS review_cycles (
+                    cycle_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    cycle_number INTEGER NOT NULL,
+                    architecture_version TEXT NOT NULL,
+                    epoch_id TEXT,
+                    validation_run_id TEXT,
+                    status TEXT NOT NULL,
+                    verdict TEXT,
+                    reviewer_type TEXT NOT NULL,
+                    git_head TEXT,
+                    git_dirty_fingerprint TEXT,
+                    review_packet_hash TEXT NOT NULL,
+                    corrections_packet TEXT,
+                    summary TEXT,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_review_cycles_proj ON review_cycles(project_id, cycle_number);
+
+                CREATE TABLE IF NOT EXISTS review_findings (
+                    finding_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    first_cycle_id TEXT NOT NULL REFERENCES review_cycles(cycle_id) ON DELETE CASCADE,
+                    last_cycle_id TEXT NOT NULL REFERENCES review_cycles(cycle_id) ON DELETE CASCADE,
+                    fingerprint TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    file_path TEXT,
+                    line_range TEXT,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    suggested_fix TEXT,
+                    resolution_cycle_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_review_findings_proj ON review_findings(project_id, status);
+
+                CREATE TABLE IF NOT EXISTS review_cycle_findings (
+                    cycle_id TEXT NOT NULL REFERENCES review_cycles(cycle_id) ON DELETE CASCADE,
+                    finding_id TEXT NOT NULL REFERENCES review_findings(finding_id) ON DELETE CASCADE,
+                    is_repeat INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (cycle_id, finding_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_cycle_findings_cycle ON review_cycle_findings(cycle_id);",
+            ),
         ];
 
         let mut applied = Vec::new();
@@ -1160,7 +1211,7 @@ mod tests {
     fn test_sqlite_in_memory_migrations_and_proof() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let result = db.run_proof().expect("run proof");
-        assert_eq!(result.applied_migrations.len(), 10);
+        assert_eq!(result.applied_migrations.len(), 11);
         assert_eq!(result.applied_migrations[0].version, 1);
         assert_eq!(result.applied_migrations[1].version, 2);
         assert_eq!(result.applied_migrations[2].version, 3);
@@ -1171,6 +1222,7 @@ mod tests {
         assert_eq!(result.applied_migrations[7].version, 8);
         assert_eq!(result.applied_migrations[8].version, 9);
         assert_eq!(result.applied_migrations[9].version, 10);
+        assert_eq!(result.applied_migrations[10].version, 11);
         assert_eq!(result.test_record_id, 1);
         assert_eq!(result.total_records, 1);
 
@@ -1228,7 +1280,7 @@ mod tests {
 
         let mut db = DbManager { conn };
         let applied = db.run_migrations().expect("run forward migrations");
-        assert_eq!(applied.len(), 9);
+        assert_eq!(applied.len(), 10);
         assert_eq!(applied[0].version, 2);
         assert_eq!(applied[1].version, 3);
         assert_eq!(applied[2].version, 4);
@@ -1238,6 +1290,7 @@ mod tests {
         assert_eq!(applied[6].version, 8);
         assert_eq!(applied[7].version, 9);
         assert_eq!(applied[8].version, 10);
+        assert_eq!(applied[9].version, 11);
 
         // Verify Phase 0 data preserved
         let count: i64 = db
@@ -1273,7 +1326,7 @@ mod tests {
     fn test_migrations_already_migrated_is_idempotent() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let applied1 = db.run_migrations().expect("first migration run");
-        assert_eq!(applied1.len(), 10);
+        assert_eq!(applied1.len(), 11);
 
         let applied2 = db.run_migrations().expect("second migration run");
         assert_eq!(applied2.len(), 0);

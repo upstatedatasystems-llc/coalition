@@ -4,6 +4,7 @@ import { ActivityLogView } from '../activity/ActivityLogView';
 import { ArchitectureWorkspaceView } from '../architecture/ArchitectureWorkspaceView';
 import { BuilderControlPlaneView } from '../builder/BuilderControlPlaneView';
 import { ValidationView } from '../validation/ValidationView';
+import { ReviewControlView } from '../review/ReviewControlView';
 
 interface ProjectDetailViewProps {
   details: ProjectDetails;
@@ -22,7 +23,7 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
 }) => {
   const { project, workflow_state, artifact, git, is_available } = details;
   const [activeSubTab, setActiveSubTab] = useState<
-    'workspace' | 'builder' | 'validation' | 'overview'
+    'workspace' | 'builder' | 'validation' | 'review' | 'overview'
   >('workspace');
 
   React.useEffect(() => {
@@ -66,6 +67,14 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
             data-testid="validation-subtab-btn"
           >
             Validation
+          </button>
+          <button
+            className={`subtab-btn ${activeSubTab === 'review' ? 'active' : ''}`}
+            onClick={() => setActiveSubTab('review')}
+            disabled={!is_available}
+            data-testid="review-subtab-btn"
+          >
+            Review & Corrections
           </button>
           <button
             className={`subtab-btn ${activeSubTab === 'overview' ? 'active' : ''}`}
@@ -127,6 +136,16 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
           projectName={project.name}
           workflowState={workflow_state.state}
           onRefreshProject={onRefresh}
+        />
+      )}
+
+      {is_available && activeSubTab === 'review' && (
+        <ReviewControlView
+          projectId={project.project_id}
+          projectName={project.name}
+          workflowState={workflow_state.state}
+          onRefreshProject={onRefresh}
+          onNavigateToBuilder={() => setActiveSubTab('builder')}
         />
       )}
 

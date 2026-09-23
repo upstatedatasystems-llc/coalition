@@ -434,6 +434,55 @@ impl GitAdapter {
         let dirty_state = self.compute_detailed_dirty_state(working_dir)?;
         Ok(dirty_state.composite_fingerprint)
     }
+
+    /// Returns the combined diff (staged and unstaged) relative to HEAD,
+    /// excluding Coalition-internal paths (.coalition/evidence, .coalition/reviews, etc.).
+    /// If HEAD does not exist, returns unstaged + cached diff.
+    pub fn get_implementation_diff<P: AsRef<Path>>(
+        &self,
+        working_dir: P,
+    ) -> Result<String, GitError> {
+        let dir = working_dir.as_ref();
+        let head_check = self.run_git_cmd(&["rev-parse", "HEAD"], Some(dir));
+        let has_head = head_check.map(|o| o.status.success()).unwrap_or(false);
+
+        let args = if has_head {
+            vec![
+                "diff",
+                "HEAD",
+                "--no-ext-diff",
+                "--",
+                ".",
+                ":(exclude).coalition/architecture-versions",
+                ":(exclude).coalition/recovery",
+                ":(exclude).coalition/evidence",
+                ":(exclude).coalition/reviews",
+            ]
+        } else {
+            vec![
+                "diff",
+                "--no-ext-diff",
+                "--",
+                ".",
+                ":(exclude).coalition/architecture-versions",
+                ":(exclude).coalition/recovery",
+                ":(exclude).coalition/evidence",
+                ":(exclude).coalition/reviews",
+            ]
+        };
+
+        let output = self.run_git_cmd(&args, Some(dir))?;
+        if output.status.success() {
+            let diff_str = String::from_utf8_lossy(&output.stdout).to_string();
+            Ok(diff_str)
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(GitError::ExecutionFailed(format!(
+                "Failed to get git diff: {}",
+                stderr.trim()
+            )))
+        }
+    }
 }
 
 #[cfg(test)]

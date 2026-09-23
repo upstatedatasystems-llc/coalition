@@ -1004,6 +1004,11 @@ impl ValidationService {
             );
         }
 
+        {
+            let mut lock = registry.lock().await;
+            lock.unregister(project_id, &run_id);
+        }
+
         Ok(final_record)
     }
 

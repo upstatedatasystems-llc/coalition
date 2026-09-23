@@ -535,3 +535,79 @@ export interface ValidationGateOverrideRecord {
   created_at: string;
 }
 
+// Stage 4 Review & Correction Loop Types
+export type ReviewVerdict = 'ACCEPT' | 'CORRECTIONS_REQUIRED' | 'BLOCK';
+export type ReviewCycleStatus =
+  | 'PENDING'
+  | 'ACCEPTED'
+  | 'CORRECTIONS_REQUIRED'
+  | 'BLOCKED'
+  | 'SUPERSEDED';
+export type ReviewFindingSeverity = 'CRITICAL' | 'MAJOR' | 'MINOR' | 'INFO';
+export type ReviewFindingStatus = 'OPEN' | 'RESOLVED' | 'SUPERSEDED' | 'BLOCKED';
+export type ReviewerType = 'CHATGPT_RELAY' | 'DIAGNOSTIC_FAKE';
+
+export interface ReviewFindingRecord {
+  finding_id: string;
+  project_id: string;
+  first_cycle_id: string;
+  last_cycle_id: string;
+  fingerprint: string;
+  severity: ReviewFindingSeverity;
+  status: ReviewFindingStatus;
+  file_path?: string | null;
+  line_range?: string | null;
+  title: string;
+  description: string;
+  suggested_fix?: string | null;
+  resolution_cycle_id?: string | null;
+  is_repeat: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ReviewCycleRecord {
+  cycle_id: string;
+  project_id: string;
+  cycle_number: number;
+  architecture_version: string;
+  epoch_id?: string | null;
+  validation_run_id?: string | null;
+  status: ReviewCycleStatus;
+  verdict?: ReviewVerdict | null;
+  reviewer_type: ReviewerType;
+  git_head?: string | null;
+  git_dirty_fingerprint?: string | null;
+  review_packet_hash: string;
+  corrections_packet?: string | null;
+  summary?: string | null;
+  started_at: string;
+  completed_at?: string | null;
+  created_at: string;
+  findings: ReviewFindingRecord[];
+}
+
+export interface ParsedReviewFinding {
+  id?: string | null;
+  severity?: string | null;
+  title: string;
+  file?: string | null;
+  lines?: string | null;
+  description: string;
+  suggested_fix?: string | null;
+}
+
+export interface ReviewImportPreview {
+  preview_id: string;
+  project_id: string;
+  cycle_id: string;
+  verdict: ReviewVerdict;
+  summary: string;
+  findings: ParsedReviewFinding[];
+  raw_response_hash: string;
+  git_head?: string | null;
+  git_dirty_fingerprint?: string | null;
+  corrections_preview?: string | null;
+  created_at: string;
+}
+

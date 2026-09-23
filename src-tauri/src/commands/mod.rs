@@ -417,6 +417,24 @@ impl From<crate::core::validation::ValidationError> for CommandError {
     }
 }
 
+impl From<crate::core::review::ReviewError> for CommandError {
+    fn from(err: crate::core::review::ReviewError) -> Self {
+        use crate::core::review::ReviewError;
+        match err {
+            ReviewError::NotFound(e) => Self::new("NOT_FOUND", e),
+            ReviewError::InvalidWorkflowState(e) => Self::new("INVALID_WORKFLOW_STATE", e),
+            ReviewError::ValidationGateBlocked(e) => Self::new("VALIDATION_GATE_BLOCKED", e),
+            ReviewError::StalePreview(e) => Self::new("STALE_REVIEW_PREVIEW_REJECTED", e),
+            ReviewError::ParseError(e) => Self::new("PARSE_ERROR", e),
+            ReviewError::Io(e) => Self::new("IO_ERROR", e.to_string()),
+            ReviewError::Database(e) => Self::new("DATABASE_ERROR", e),
+            ReviewError::Git(e) => Self::new("GIT_ERROR", e),
+            ReviewError::Yaml(e) => Self::new("YAML_ERROR", e.to_string()),
+            ReviewError::Json(e) => Self::new("JSON_ERROR", e.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemDiagnosticInfo {
     pub current_dir: String,
@@ -1710,6 +1728,124 @@ pub async fn submit_for_review(
         db.connection_mut(),
         &project_id,
         WorkflowAction::SubmitForReview,
+        "HUMAN",
+    )
+    .map_err(CommandError::from)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepareReviewPacketResponse {
+    pub cycle: crate::core::review::ReviewCycleRecord,
+    pub packet: String,
+}
+
+#[tauri::command]
+pub async fn prepare_review_packet(
+    state: State<'_, AppState>,
+    project_id: String,
+    reviewer_type: Option<crate::core::review::ReviewerType>,
+) -> Result<PrepareReviewPacketResponse, CommandError> {
+    let repo_path = {
+        let db = state.db.lock().await;
+        get_repo_path_for_project_sync(&db, &project_id)?
+    };
+
+    let db = state.db.lock().await;
+    let r_type = reviewer_type.unwrap_or(crate::core::review::ReviewerType::ChatgptRelay);
+    let (cycle, packet) = crate::core::review::ReviewService::prepare_review_packet(
+        db.connection(),
+        &repo_path,
+        &project_id,
+        r_type,
+    )
+    .map_err(CommandError::from)?;
+
+    Ok(PrepareReviewPacketResponse { cycle, packet })
+}
+
+#[tauri::command]
+pub async fn get_latest_review_cycle(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Option<crate::core::review::ReviewCycleRecord>, CommandError> {
+    let db = state.db.lock().await;
+    crate::core::review::get_latest_review_cycle(db.connection(), &project_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn list_review_cycles(
+    state: State<'_, AppState>,
+    project_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<crate::core::review::ReviewCycleRecord>, CommandError> {
+    let db = state.db.lock().await;
+    crate::core::review::list_review_cycles_for_project(
+        db.connection(),
+        &project_id,
+        limit.unwrap_or(20),
+    )
+    .map_err(CommandError::from)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepareReviewImportPayload {
+    #[serde(alias = "project_id")]
+    pub project_id: String,
+    #[serde(alias = "cycle_id")]
+    pub cycle_id: String,
+    pub raw_response: String,
+}
+
+#[tauri::command]
+pub async fn prepare_review_import(
+    state: State<'_, AppState>,
+    payload: PrepareReviewImportPayload,
+) -> Result<crate::core::review::ReviewImportPreview, CommandError> {
+    let repo_path = {
+        let db = state.db.lock().await;
+        get_repo_path_for_project_sync(&db, &payload.project_id)?
+    };
+
+    let db = state.db.lock().await;
+    crate::core::review::ReviewService::prepare_review_import(
+        db.connection(),
+        &repo_path,
+        &payload.project_id,
+        &payload.cycle_id,
+        &payload.raw_response,
+    )
+    .map_err(CommandError::from)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmReviewImportPayload {
+    #[serde(alias = "project_id")]
+    pub project_id: String,
+    pub preview: crate::core::review::ReviewImportPreview,
+    pub raw_response: String,
+}
+
+#[tauri::command]
+pub async fn confirm_review_import(
+    state: State<'_, AppState>,
+    payload: ConfirmReviewImportPayload,
+) -> Result<crate::core::review::ReviewCycleRecord, CommandError> {
+    let repo_path = {
+        let db = state.db.lock().await;
+        get_repo_path_for_project_sync(&db, &payload.project_id)?
+    };
+
+    let mut db = state.db.lock().await;
+    crate::core::review::ReviewService::confirm_review_import(
+        db.connection_mut(),
+        &repo_path,
+        &payload.project_id,
+        &payload.preview,
+        &payload.raw_response,
         "HUMAN",
     )
     .map_err(CommandError::from)

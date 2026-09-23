@@ -139,6 +139,11 @@ pub fn run() {
             commands::get_validation_run_commands,
             commands::override_validation_gate,
             commands::submit_for_review,
+            commands::prepare_review_packet,
+            commands::get_latest_review_cycle,
+            commands::list_review_cycles,
+            commands::prepare_review_import,
+            commands::confirm_review_import,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
