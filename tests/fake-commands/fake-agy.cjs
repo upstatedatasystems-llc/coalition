@@ -140,6 +140,81 @@ function main() {
         return;
       }
 
+      if (promptContent.includes('trigger_raw_error')) {
+        const errResult = {
+          event: 'result',
+          result: {
+            conversation_id: conversationId,
+            status: 'ERROR',
+            error: 'Provider unrecoverable internal error',
+            duration_seconds: 0.1,
+            num_turns: turnCount,
+            usage: { input_tokens: 100, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 100 }
+          }
+        };
+        console.log(JSON.stringify(errResult));
+        process.exit(0);
+      }
+
+      if (promptContent.includes('trigger_least_privilege_blocked_command')) {
+        process.stderr.write('Warning: tool auto-denied: requires review but running headlessly\n');
+        const toolErrStep = {
+          event: 'step_update',
+          step_update: {
+            conversation_id: conversationId,
+            step_index: turnCount * 2 - 1,
+            state: 'ERROR',
+            step_type: 'tool_error',
+            tool_name: 'run_command',
+            error: 'tool required the "command" permission: auto-denied: cannot prompt in non-interactive mode',
+            duration_seconds: 0.1,
+          }
+        };
+        console.log(JSON.stringify(toolErrStep));
+        const successResult = {
+          event: 'result',
+          result: {
+            conversation_id: conversationId,
+            status: 'SUCCESS',
+            response: 'Completed explanation, but external command action was auto-denied by policy.',
+            duration_seconds: 0.2,
+            num_turns: turnCount,
+            usage: { input_tokens: 200, output_tokens: 50, thinking_tokens: 10, cache_read_tokens: 0, total_tokens: 260 }
+          }
+        };
+        console.log(JSON.stringify(successResult));
+        process.exit(0);
+      }
+
+      if (promptContent.includes('trigger_unicode_completion_report')) {
+        const unicodeStep = {
+          event: 'step_update',
+          step_update: {
+            conversation_id: conversationId,
+            step_index: turnCount * 2 - 1,
+            state: 'DONE',
+            step_type: 'agent_response',
+            text_delta: 'Architecture v1.0 — Completion Report\nBuilding with 🚀 speed and 🔒 security.\n',
+            duration_seconds: 0.2,
+            usage: { input_tokens: 300, output_tokens: 60, thinking_tokens: 20, cache_read_tokens: 0, total_tokens: 380 }
+          }
+        };
+        console.log(JSON.stringify(unicodeStep));
+        const unicodeResult = {
+          event: 'result',
+          result: {
+            conversation_id: conversationId,
+            status: 'SUCCESS',
+            response: 'Architecture v1.0 — Completion Report\nAll tasks completed successfully.\n',
+            duration_seconds: 0.3,
+            num_turns: turnCount,
+            usage: { input_tokens: 300, output_tokens: 60, thinking_tokens: 20, cache_read_tokens: 0, total_tokens: 380 }
+          }
+        };
+        console.log(JSON.stringify(unicodeResult));
+        process.exit(0);
+      }
+
       if (promptContent.includes('trigger_permission_denial')) {
         const errResult = {
           event: 'result',

@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod artifacts;
 pub mod builder;
+pub mod diagnostics;
 pub mod freeze;
 pub mod git;
 pub mod process;

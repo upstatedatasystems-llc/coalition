@@ -726,7 +726,7 @@ async fn test_stage3_governed_builder_service_cancellation_isolation() {
     let (_repo_temp1, db_temp1, project_id1, _) = setup_frozen_test_project();
     let (_repo_temp2, _db_temp2, project_id2, _) = setup_frozen_test_project();
     let db_path = db_temp1.path().join("stage3_test.db");
-    let _db = Arc::new(tokio::sync::Mutex::new(DbManager::open(&db_path).unwrap()));
+    let db = Arc::new(tokio::sync::Mutex::new(DbManager::open(&db_path).unwrap()));
     let registry = Arc::new(tokio::sync::Mutex::new(ActiveBuilderRegistry::new()));
 
     // Register active sessions for both projects
@@ -758,9 +758,10 @@ async fn test_stage3_governed_builder_service_cancellation_isolation() {
     };
 
     // Cancel project 1
-    let canceled_sid = BuilderService::cancel_turn(registry.clone(), Some(&project_id1), None)
-        .await
-        .expect("cancellation should succeed");
+    let canceled_sid =
+        BuilderService::cancel_turn(registry.clone(), db.clone(), Some(&project_id1), None)
+            .await
+            .expect("cancellation should succeed");
     assert_eq!(canceled_sid, "sess-p1");
 
     // Project 1 flag is canceled
@@ -964,9 +965,10 @@ async fn test_stage3_service_cancellation_with_hanging_fake_agy() {
     let sid = session_id.expect("Turn must register in ActiveBuilderRegistry");
 
     // Request cancellation authoritative via BuilderService::cancel_turn
-    let canceled_sid = BuilderService::cancel_turn(registry.clone(), Some(&project_id), None)
-        .await
-        .expect("Cancellation request must succeed");
+    let canceled_sid =
+        BuilderService::cancel_turn(registry.clone(), db.clone(), Some(&project_id), None)
+            .await
+            .expect("Cancellation request must succeed");
     assert_eq!(canceled_sid, sid);
 
     // Await the turn handle

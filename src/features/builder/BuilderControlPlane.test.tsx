@@ -357,7 +357,7 @@ describe('BuilderControlPlaneView', () => {
       payload: {
         projectId: 'proj-stage3',
         model: 'gemini-3.8-flash-high',
-        effort: 'medium',
+        effort: 'high',
       },
     });
 
@@ -694,6 +694,289 @@ describe('BuilderControlPlaneView', () => {
     // After resolution, cancel button disappears and run button is ready
     expect(screen.queryByTestId('cancel-turn-btn')).not.toBeInTheDocument();
     expect(screen.getByTestId('run-turn-btn')).not.toBeDisabled();
+  });
+
+  it('synchronizes and locks reasoning effort when model variant encodes effort', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'list_builder_models') return Promise.resolve(mockModels);
+      if (cmd === 'get_builder_packet') return Promise.resolve(mockBuilderPacket);
+      if (cmd === 'get_contract_drift') return Promise.resolve(mockCleanDriftReport);
+      if (cmd === 'get_icarus_state') return Promise.resolve(mockIcarusInactive);
+      if (cmd === 'get_usage_telemetry') return Promise.resolve(mockTelemetry);
+      if (cmd === 'get_permission_history') return Promise.resolve([]);
+      if (cmd === 'list_builder_sessions') return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    await act(async () => {
+      render(
+        <BuilderControlPlaneView
+          projectId="proj-stage3"
+          projectName="Stage3 Test Project"
+          workflowState="FROZEN"
+          onRefreshProject={vi.fn()}
+        />
+      );
+    });
+
+    const effortSelect = screen.getByTestId('effort-select') as HTMLSelectElement;
+    const modelSelect = screen.getByTestId('model-select') as HTMLSelectElement;
+
+    // gemini-3.8-flash-high was selected initially
+    expect(modelSelect.value).toBe('gemini-3.8-flash-high');
+    expect(effortSelect.value).toBe('high');
+    expect(effortSelect).toBeDisabled();
+    expect(screen.getByTestId('effort-derived-hint')).toBeInTheDocument();
+
+    // Switch to gemini-3.7-flash-medium
+    await act(async () => {
+      fireEvent.change(modelSelect, { target: { value: 'gemini-3.7-flash-medium' } });
+    });
+    expect(effortSelect.value).toBe('medium');
+    expect(effortSelect).toBeDisabled();
+    expect(screen.getByTestId('effort-derived-hint')).toBeInTheDocument();
+
+    // Switch to claude-sonnet-4-6 (no effort suffix)
+    await act(async () => {
+      fireEvent.change(modelSelect, { target: { value: 'claude-sonnet-4-6' } });
+    });
+    expect(effortSelect).not.toBeDisabled();
+    expect(screen.queryByTestId('effort-derived-hint')).not.toBeInTheDocument();
+  });
+
+  it('renders separate Provider SUCCESS and Governance BLOCKED when least-privilege denied an action', async () => {
+    const blockedTurnResp: BuilderTurnResponse = {
+      conversation_id: 'conv-blocked-1',
+      status: 'SUCCESS',
+      text_response: 'Completed successfully but command was blocked.',
+      cumulative_usage: {
+        input_tokens: 500,
+        output_tokens: 50,
+        thinking_tokens: 0,
+        cache_read_tokens: 0,
+        total_tokens: 550,
+      },
+      was_canceled: false,
+      stderr: '',
+      has_blocked_actions: true,
+    };
+
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'start_builder_turn') return Promise.resolve(blockedTurnResp);
+      if (cmd === 'list_builder_models') return Promise.resolve(mockModels);
+      if (cmd === 'get_builder_packet') return Promise.resolve(mockBuilderPacket);
+      if (cmd === 'get_contract_drift') return Promise.resolve(mockCleanDriftReport);
+      if (cmd === 'get_icarus_state') return Promise.resolve(mockIcarusInactive);
+      if (cmd === 'get_usage_telemetry') return Promise.resolve(mockTelemetry);
+      if (cmd === 'get_permission_history') return Promise.resolve([]);
+      if (cmd === 'list_builder_sessions') return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    await act(async () => {
+      render(
+        <BuilderControlPlaneView
+          projectId="proj-stage3"
+          projectName="Stage3 Test Project"
+          workflowState="FROZEN"
+          onRefreshProject={vi.fn()}
+        />
+      );
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('run-turn-btn'));
+    });
+
+    // Check that provider status is SUCCESS and governance is BLOCKED
+    expect(screen.getByTestId('provider-status-badge')).toHaveTextContent('Provider: SUCCESS');
+    expect(screen.getByTestId('governance-status-badge')).toHaveTextContent(
+      'Governance: BLOCKED — Least-Privilege Denial'
+    );
+    expect(screen.getByTestId('governance-blocked-alert')).toBeInTheDocument();
+  });
+
+  it('restores Governance BLOCKED status from permission history upon reload', async () => {
+    const pastSession = {
+      session_id: 'sess-persisted-123',
+      project_id: 'proj-stage3',
+      epoch_id: 'epoch-1',
+      architecture_version: '1.0.0',
+      contract_fingerprint: 'fp-1',
+      git_commit: 'commit-1',
+      model: 'gemini-3.8-flash-high',
+      effort: 'high',
+      icarus_mode: false,
+      status: 'SUCCESS',
+      error_message: null,
+      duration_ms: 12000,
+      usage: {
+        input_tokens: 200,
+        output_tokens: 20,
+        thinking_tokens: 0,
+        cache_read_tokens: 0,
+        total_tokens: 220,
+      },
+      created_at: '2026-09-23T10:00:00Z',
+      completed_at: '2026-09-23T10:00:12Z',
+    };
+
+    const blockedPermission: PermissionRecord = {
+      id: 99,
+      project_id: 'proj-stage3',
+      session_id: 'sess-persisted-123',
+      tool_name: 'run_command',
+      target: 'cargo test',
+      risk_level: 'MUTATING',
+      decision: 'BLOCKED',
+      reason: 'Least-privilege policy auto-denied action without interactive prompt',
+      created_at: '2026-09-23T10:00:05Z',
+    };
+
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'list_builder_models') return Promise.resolve(mockModels);
+      if (cmd === 'get_builder_packet') return Promise.resolve(mockBuilderPacket);
+      if (cmd === 'get_contract_drift') return Promise.resolve(mockCleanDriftReport);
+      if (cmd === 'get_icarus_state') return Promise.resolve(mockIcarusInactive);
+      if (cmd === 'get_usage_telemetry') return Promise.resolve(mockTelemetry);
+      if (cmd === 'get_permission_history') return Promise.resolve([blockedPermission]);
+      if (cmd === 'list_builder_sessions') return Promise.resolve([pastSession]);
+      if (cmd === 'get_builder_events') return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    await act(async () => {
+      render(
+        <BuilderControlPlaneView
+          projectId="proj-stage3"
+          projectName="Stage3 Test Project"
+          workflowState="FROZEN"
+          onRefreshProject={vi.fn()}
+        />
+      );
+    });
+
+    // Correlated by session_id in permissionHistory, displays Governance: BLOCKED
+    expect(screen.getByTestId('provider-status-badge')).toHaveTextContent('Provider: SUCCESS');
+    expect(screen.getByTestId('governance-status-badge')).toHaveTextContent(
+      'Governance: BLOCKED — Least-Privilege Denial'
+    );
+    expect(screen.getByTestId('governance-blocked-alert')).toBeInTheDocument();
+  });
+
+  it('reconciles stale orphan session and clears UI state on cancellation', async () => {
+    const orphanSession = {
+      session_id: 'sess-orphan-999',
+      project_id: 'proj-stage3',
+      epoch_id: 'epoch-1',
+      architecture_version: '1.0.0',
+      contract_fingerprint: 'fp-1',
+      git_commit: 'commit-1',
+      model: 'gemini-3.8-flash-high',
+      effort: 'high',
+      icarus_mode: true,
+      status: 'RUNNING',
+      error_message: null,
+      duration_ms: 5000,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        thinking_tokens: 0,
+        cache_read_tokens: 0,
+        total_tokens: 0,
+      },
+      created_at: '2026-09-23T10:00:00Z',
+      completed_at: null,
+    };
+
+    let sessionStatus = 'RUNNING';
+
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'list_builder_models') return Promise.resolve(mockModels);
+      if (cmd === 'get_builder_packet') return Promise.resolve(mockBuilderPacket);
+      if (cmd === 'get_contract_drift') return Promise.resolve(mockCleanDriftReport);
+      if (cmd === 'get_icarus_state') return Promise.resolve(mockIcarusInactive);
+      if (cmd === 'get_usage_telemetry') return Promise.resolve(mockTelemetry);
+      if (cmd === 'get_permission_history') return Promise.resolve([]);
+      if (cmd === 'list_builder_sessions') {
+        return Promise.resolve([{ ...orphanSession, status: sessionStatus }]);
+      }
+      if (cmd === 'cancel_builder_turn') {
+        // Backend reconciles stale orphan session to INTERRUPTED
+        sessionStatus = 'INTERRUPTED';
+        return Promise.resolve('sess-orphan-999');
+      }
+      return Promise.resolve(null);
+    });
+
+    await act(async () => {
+      render(
+        <BuilderControlPlaneView
+          projectId="proj-stage3"
+          projectName="Stage3 Test Project"
+          workflowState="FROZEN"
+          onRefreshProject={vi.fn()}
+        />
+      );
+    });
+
+    // Initially shows running orphan session with cancel button
+    const cancelBtn = screen.getByTestId('cancel-active-run-btn');
+    expect(cancelBtn).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(cancelBtn);
+    });
+
+    // cancel_builder_turn was invoked, sessions reloaded, and running state cleared
+    expect(mockInvoke).toHaveBeenCalledWith('cancel_builder_turn', {
+      projectId: 'proj-stage3',
+      sessionId: 'sess-orphan-999',
+    });
+    expect(screen.queryByTestId('active-run-icarus-banner')).not.toBeInTheDocument();
+  });
+
+  it('exports project diagnostics and displays feedback with generated file path', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'list_builder_models') return Promise.resolve(mockModels);
+      if (cmd === 'get_builder_packet') return Promise.resolve(mockBuilderPacket);
+      if (cmd === 'get_contract_drift') return Promise.resolve(mockCleanDriftReport);
+      if (cmd === 'get_icarus_state') return Promise.resolve(mockIcarusInactive);
+      if (cmd === 'get_usage_telemetry') return Promise.resolve(mockTelemetry);
+      if (cmd === 'get_permission_history') return Promise.resolve([]);
+      if (cmd === 'list_builder_sessions') return Promise.resolve([]);
+      if (cmd === 'export_project_diagnostics') {
+        return Promise.resolve('C:\\path\\to\\coalition-diagnostics-proj-stage3.zip');
+      }
+      return Promise.resolve(null);
+    });
+
+    await act(async () => {
+      render(
+        <BuilderControlPlaneView
+          projectId="proj-stage3"
+          projectName="Stage3 Test Project"
+          workflowState="FROZEN"
+          onRefreshProject={vi.fn()}
+        />
+      );
+    });
+
+    const exportBtn = screen.getByTestId('export-diagnostics-btn');
+    expect(exportBtn).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(exportBtn);
+    });
+
+    expect(mockInvoke).toHaveBeenCalledWith('export_project_diagnostics', {
+      projectId: 'proj-stage3',
+      destinationDir: null,
+    });
+
+    expect(screen.getByTestId('diagnostic-export-success')).toHaveTextContent(
+      'coalition-diagnostics-proj-stage3.zip'
+    );
   });
 });
 

@@ -378,6 +378,7 @@ impl From<BuilderError> for CommandError {
             BuilderError::NotFrozen(msg) => Self::new("NOT_FROZEN", msg),
             BuilderError::DriftDetected(msg) => Self::new("DRIFT_DETECTED", msg),
             BuilderError::Database(msg) => Self::new("DATABASE_ERROR", msg),
+            BuilderError::SessionNotFound(msg) => Self::new("BUILDER_SESSION_NOT_FOUND", msg),
         }
     }
 }
@@ -853,11 +854,30 @@ pub async fn cancel_builder_turn(
 ) -> Result<String, CommandError> {
     crate::core::builder::BuilderService::cancel_turn(
         state.active_builder_registry.clone(),
+        state.db.clone(),
         project_id.as_deref(),
         session_id.as_deref(),
     )
     .await
     .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn export_project_diagnostics(
+    state: State<'_, AppState>,
+    project_id: String,
+    destination_dir: Option<String>,
+) -> Result<String, CommandError> {
+    let db = state.db.lock().await;
+    let dest_path = destination_dir.as_ref().map(PathBuf::from);
+    let zip_path = crate::core::diagnostics::export_project_diagnostics(
+        &db,
+        &project_id,
+        dest_path.as_deref(),
+    )
+    .map_err(|e| CommandError::new("EXPORT_DIAGNOSTICS_FAILED", e.to_string()))?;
+
+    Ok(zip_path.to_string_lossy().to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

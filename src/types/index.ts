@@ -134,6 +134,7 @@ export interface BuilderTurnResponse {
   cumulative_usage: AgyUsage;
   was_canceled: boolean;
   stderr: string;
+  has_blocked_actions?: boolean;
 }
 
 // Stage 2A ChatGPT Relay & Architecture Workspace Types

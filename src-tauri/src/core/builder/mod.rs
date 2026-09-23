@@ -27,6 +27,8 @@ pub enum BuilderError {
     DriftDetected(String),
     #[error("Database error: {0}")]
     Database(String),
+    #[error("Session not found: {0}")]
+    SessionNotFound(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +86,12 @@ pub struct AgyStepUpdateData {
     pub text_delta: Option<String>,
     pub duration_seconds: Option<f64>,
     pub usage: Option<AgyUsage>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +139,8 @@ pub struct BuilderTurnResponse {
     pub cumulative_usage: AgyUsage,
     pub was_canceled: bool,
     pub stderr: String,
+    #[serde(default)]
+    pub has_blocked_actions: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,6 +318,12 @@ pub fn evaluate_tool_risk(tool_name: &str, content: &str) -> (&'static str, &'st
     }
 }
 
+/// Defensively wraps sanitize_text so an unexpected panic cannot crash operational tasks.
+pub fn safe_sanitize_text(text: &str) -> String {
+    std::panic::catch_unwind(|| sanitize_text(text))
+        .unwrap_or_else(|_| "[REDACTION_FALLBACK: sanitized due to internal error]".to_string())
+}
+
 /// Redacts sensitive credentials, tokens, and authorization headers from strings before persistent logging.
 /// Supported patterns include:
 /// - `Authorization: Bearer <token>` and `Bearer <token>`
@@ -325,12 +341,12 @@ pub fn sanitize_text(text: &str) -> String {
 fn redact_bearer_headers(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
-    let bytes = text.as_bytes();
-    let len = bytes.len();
+    let len = text.len();
+    let mut prev_char: Option<char> = None;
 
     while i < len {
-        if i + 7 <= len && text[i..i + 7].eq_ignore_ascii_case("bearer ") {
-            let prev_char = text[..i].chars().last();
+        let rem_bytes = &text.as_bytes()[i..];
+        if rem_bytes.len() >= 7 && rem_bytes[..7].eq_ignore_ascii_case(b"bearer ") {
             let is_boundary = prev_char
                 .map(|c| !c.is_alphanumeric() && c != '_')
                 .unwrap_or(true);
@@ -338,32 +354,39 @@ fn redact_bearer_headers(text: &str) -> String {
             if is_boundary {
                 out.push_str(&text[i..i + 7]);
                 i += 7;
-                while i < len && bytes[i] == b' ' {
+                while i < len && text.as_bytes()[i] == b' ' {
                     out.push(' ');
                     i += 1;
                 }
                 let token_start = i;
-                while i < len
-                    && !bytes[i].is_ascii_whitespace()
-                    && bytes[i] != b'"'
-                    && bytes[i] != b'\''
-                    && bytes[i] != b';'
-                    && bytes[i] != b','
-                    && bytes[i] != b'}'
-                    && bytes[i] != b']'
-                {
-                    i += 1;
+                let mut token_len = 0;
+                for (rel_idx, ch) in text[token_start..].char_indices() {
+                    if ch.is_ascii_whitespace()
+                        || ch == '"'
+                        || ch == '\''
+                        || ch == ';'
+                        || ch == ','
+                        || ch == '}'
+                        || ch == ']'
+                    {
+                        break;
+                    }
+                    token_len = rel_idx + ch.len_utf8();
                 }
-                if i - token_start >= 8 {
+                let token_end = token_start + token_len;
+                if token_len >= 8 {
                     out.push_str("[REDACTED]");
                 } else {
-                    out.push_str(&text[token_start..i]);
+                    out.push_str(&text[token_start..token_end]);
                 }
+                prev_char = text[token_start..token_end].chars().last();
+                i = token_end;
                 continue;
             }
         }
         let ch = text[i..].chars().next().unwrap();
         out.push(ch);
+        prev_char = Some(ch);
         i += ch.len_utf8();
     }
     out
@@ -407,20 +430,20 @@ fn redact_quoted_key_values(text: &str) -> String {
                         if let Some(val_quote) = after_colon.chars().next() {
                             if val_quote == '"' || val_quote == '\'' {
                                 let val_quote_idx = text.len() - after_colon.len();
-                                let val_content_start = val_quote_idx + val_quote.len_utf8();
+                                let val_content_start = val_quote_idx + 1;
                                 if let Some(val_end_rel) = text[val_content_start..].find(val_quote)
                                 {
                                     let val_content_end = val_content_start + val_end_rel;
                                     let raw_val = &text[val_content_start..val_content_end];
 
                                     out.push_str(&text[i..val_content_start]);
-                                    if raw_val.to_lowercase().starts_with("bearer ") {
+                                    if raw_val.to_ascii_lowercase().starts_with("bearer ") {
                                         out.push_str("Bearer [REDACTED]");
                                     } else {
                                         out.push_str("[REDACTED]");
                                     }
                                     out.push(val_quote);
-                                    i = val_content_end + val_quote.len_utf8();
+                                    i = val_content_end + 1;
                                     continue;
                                 }
                             }
@@ -439,22 +462,22 @@ fn redact_assignments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     let len = text.len();
+    let mut prev_char: Option<char> = None;
 
     while i < len {
-        let prev_char = if i > 0 {
-            text[..i].chars().last()
-        } else {
-            None
-        };
         let is_boundary = prev_char
             .map(|c| !c.is_alphanumeric() && c != '_')
             .unwrap_or(true);
 
         if is_boundary {
             let mut matched_key_len = None;
+            let rem_bytes = &text.as_bytes()[i..];
             for key in SENSITIVE_KEYS {
-                if i + key.len() <= len && text[i..i + key.len()].eq_ignore_ascii_case(key) {
-                    matched_key_len = Some(key.len());
+                let kbytes = key.as_bytes();
+                if rem_bytes.len() >= kbytes.len()
+                    && rem_bytes[..kbytes.len()].eq_ignore_ascii_case(kbytes)
+                {
+                    matched_key_len = Some(kbytes.len());
                     break;
                 }
             }
@@ -480,26 +503,29 @@ fn redact_assignments(text: &str) -> String {
                                 out.push_str("[REDACTED]");
                                 out.push(quote);
                                 i = content_start + rel_close + 1;
+                                prev_char = Some(quote);
                                 continue;
                             }
                         }
                     }
 
-                    let mut val_end = val_start;
-                    let bytes = text.as_bytes();
-                    while val_end < len
-                        && !bytes[val_end].is_ascii_whitespace()
-                        && bytes[val_end] != b'&'
-                        && bytes[val_end] != b';'
-                        && bytes[val_end] != b','
-                        && bytes[val_end] != b'}'
-                        && bytes[val_end] != b']'
-                    {
-                        val_end += 1;
+                    let mut val_len = 0;
+                    for (rel_idx, ch) in text[val_start..].char_indices() {
+                        if ch.is_ascii_whitespace()
+                            || ch == '&'
+                            || ch == ';'
+                            || ch == ','
+                            || ch == '}'
+                            || ch == ']'
+                        {
+                            break;
+                        }
+                        val_len = rel_idx + ch.len_utf8();
                     }
-                    if val_end > val_start {
+                    if val_len > 0 {
                         out.push_str("[REDACTED]");
-                        i = val_end;
+                        i = val_start + val_len;
+                        prev_char = text[val_start..i].chars().last();
                         continue;
                     }
                 }
@@ -508,6 +534,7 @@ fn redact_assignments(text: &str) -> String {
 
         let ch = text[i..].chars().next().unwrap();
         out.push(ch);
+        prev_char = Some(ch);
         i += ch.len_utf8();
     }
     out
@@ -517,49 +544,48 @@ fn redact_standalone_tokens(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     let len = text.len();
-    let bytes = text.as_bytes();
+    let mut prev_char: Option<char> = None;
 
     while i < len {
-        let prev_char = if i > 0 {
-            text[..i].chars().last()
-        } else {
-            None
-        };
         let is_boundary = prev_char
             .map(|c| !c.is_alphanumeric() && c != '_')
             .unwrap_or(true);
 
         if is_boundary {
+            let rem_bytes = &text.as_bytes()[i..];
+
             // OpenAI sk-...
-            if i + 3 <= len && &bytes[i..i + 3] == b"sk-" {
-                let mut end = i + 3;
-                while end < len
-                    && (bytes[end].is_ascii_alphanumeric()
-                        || bytes[end] == b'_'
-                        || bytes[end] == b'-')
+            if rem_bytes.len() >= 3 && &rem_bytes[..3] == b"sk-" {
+                let mut token_len = 3;
+                while token_len < rem_bytes.len()
+                    && (rem_bytes[token_len].is_ascii_alphanumeric()
+                        || rem_bytes[token_len] == b'_'
+                        || rem_bytes[token_len] == b'-')
                 {
-                    end += 1;
+                    token_len += 1;
                 }
-                if end - i >= 15 {
+                if token_len >= 15 {
                     out.push_str("sk-[REDACTED]");
-                    i = end;
+                    i += token_len;
+                    prev_char = Some('-');
                     continue;
                 }
             }
 
             // Google AIza...
-            if i + 4 <= len && &bytes[i..i + 4] == b"AIza" {
-                let mut end = i + 4;
-                while end < len
-                    && (bytes[end].is_ascii_alphanumeric()
-                        || bytes[end] == b'_'
-                        || bytes[end] == b'-')
+            if rem_bytes.len() >= 4 && &rem_bytes[..4] == b"AIza" {
+                let mut token_len = 4;
+                while token_len < rem_bytes.len()
+                    && (rem_bytes[token_len].is_ascii_alphanumeric()
+                        || rem_bytes[token_len] == b'_'
+                        || rem_bytes[token_len] == b'-')
                 {
-                    end += 1;
+                    token_len += 1;
                 }
-                if end - i >= 20 {
+                if token_len >= 20 {
                     out.push_str("AIza[REDACTED]");
-                    i = end;
+                    i += token_len;
+                    prev_char = Some('a');
                     continue;
                 }
             }
@@ -567,6 +593,7 @@ fn redact_standalone_tokens(text: &str) -> String {
 
         let ch = text[i..].chars().next().unwrap();
         out.push(ch);
+        prev_char = Some(ch);
         i += ch.len_utf8();
     }
     out
@@ -588,7 +615,7 @@ pub fn sanitize_and_bound_event_record(
             sanitized_init.cwd = None; // Strip developer machine-local path!
             let details = serde_json::to_string(&sanitized_init)
                 .ok()
-                .map(|d| sanitize_text(truncate_utf8_safe(&d, 32 * 1024)));
+                .map(|d| safe_sanitize_text(truncate_utf8_safe(&d, 32 * 1024)));
             (
                 "INIT".to_string(),
                 None,
@@ -601,13 +628,22 @@ pub fn sanitize_and_bound_event_record(
             let mut bounded_step = step_update.clone();
             let bounded_delta = bounded_step.text_delta.as_ref().map(|d| {
                 let safe = truncate_utf8_safe(d, 16 * 1024);
-                sanitize_text(safe)
+                safe_sanitize_text(safe)
             });
             bounded_step.text_delta = bounded_delta.clone();
 
+            if let Some(ref err) = bounded_step.error {
+                let safe = truncate_utf8_safe(err, 16 * 1024);
+                bounded_step.error = Some(safe_sanitize_text(safe));
+            }
+
             let details = serde_json::to_string(&bounded_step)
                 .ok()
-                .map(|d| sanitize_text(truncate_utf8_safe(&d, 32 * 1024)));
+                .map(|d| safe_sanitize_text(truncate_utf8_safe(&d, 32 * 1024)));
+
+            let content = bounded_delta
+                .or_else(|| bounded_step.error.clone())
+                .or_else(|| bounded_step.tool_name.clone());
 
             (
                 step_update
@@ -616,7 +652,7 @@ pub fn sanitize_and_bound_event_record(
                     .unwrap_or_else(|| "STEP_UPDATE".to_string()),
                 step_update.step_index,
                 step_update.state.clone(),
-                bounded_delta,
+                content,
                 details,
             )
         }
@@ -624,16 +660,16 @@ pub fn sanitize_and_bound_event_record(
             let mut bounded_result = result.clone();
             bounded_result.response = bounded_result.response.as_ref().map(|r| {
                 let safe = truncate_utf8_safe(r, 16 * 1024);
-                sanitize_text(safe)
+                safe_sanitize_text(safe)
             });
             bounded_result.error = bounded_result.error.as_ref().map(|e| {
                 let safe = truncate_utf8_safe(e, 16 * 1024);
-                sanitize_text(safe)
+                safe_sanitize_text(safe)
             });
 
             let details = serde_json::to_string(&bounded_result)
                 .ok()
-                .map(|d| sanitize_text(truncate_utf8_safe(&d, 32 * 1024)));
+                .map(|d| safe_sanitize_text(truncate_utf8_safe(&d, 32 * 1024)));
 
             (
                 "RESULT".to_string(),
@@ -947,9 +983,13 @@ impl AntigravityCliAdapter {
             args.push(model.clone());
         }
 
-        if let Some(ref effort) = request.effort {
+        let model_str = request.model.as_deref().unwrap_or("");
+        let (effective_effort, pass_effort_flag) =
+            resolve_effective_effort(model_str, request.effort.as_deref());
+
+        if pass_effort_flag {
             args.push("--effort".to_string());
-            args.push(effort.clone());
+            args.push(effective_effort);
         }
 
         if request.icarus_mode {
@@ -1085,6 +1125,7 @@ impl AntigravityCliAdapter {
                 cumulative_usage,
                 was_canceled: true,
                 stderr: stderr_buffer,
+                has_blocked_actions: false,
             });
         }
 
@@ -1096,6 +1137,7 @@ impl AntigravityCliAdapter {
                 cumulative_usage,
                 was_canceled: false,
                 stderr: stderr_buffer,
+                has_blocked_actions: false,
             });
         }
 
@@ -1113,23 +1155,127 @@ impl AntigravityCliAdapter {
             }
         }
 
-        if final_status == "SUCCESS" {
-            final_status = STATUS_SUCCESS.to_string();
-        } else if final_status == "ERROR" {
-            final_status = STATUS_FAILED.to_string();
-        } else if final_status == "CANCELED" {
-            final_status = STATUS_CANCELLED.to_string();
-        }
+        let canonical_status = normalize_session_status(&final_status, proc_res.canceled);
 
         Ok(BuilderTurnResponse {
             conversation_id: active_conversation_id,
-            status: final_status,
+            status: canonical_status.to_string(),
             text_response: final_text,
             cumulative_usage,
             was_canceled: false,
             stderr: stderr_buffer,
+            has_blocked_actions: false,
         })
     }
+}
+
+pub fn normalize_session_status(provider_status: &str, was_canceled: bool) -> &'static str {
+    if was_canceled || provider_status == STATUS_CANCELLED || provider_status == "CANCELED" {
+        STATUS_CANCELLED
+    } else if provider_status == STATUS_TIMEOUT {
+        STATUS_TIMEOUT
+    } else if provider_status == "SUCCESS" || provider_status == "COMPLETED" {
+        STATUS_SUCCESS
+    } else {
+        STATUS_FAILED
+    }
+}
+
+pub fn resolve_effective_effort(model: &str, requested_effort: Option<&str>) -> (String, bool) {
+    let lower = model.to_lowercase();
+    if lower.ends_with("-high") || lower.ends_with("_high") {
+        ("high".to_string(), false)
+    } else if lower.ends_with("-medium") || lower.ends_with("_medium") {
+        ("medium".to_string(), false)
+    } else if lower.ends_with("-low") || lower.ends_with("_low") {
+        ("low".to_string(), false)
+    } else {
+        let eff = requested_effort
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("medium")
+            .to_string();
+        (eff, true)
+    }
+}
+
+pub fn detect_permission_refusal(
+    stderr: &str,
+    text_response: &str,
+    events: &[AgyEvent],
+) -> Vec<(String, String)> {
+    let mut refusals: Vec<(String, String)> = Vec::new();
+
+    let phrases = [
+        "auto-denied",
+        "cannot prompt",
+        "tool required the \"command\" permission",
+        "tool required the 'command' permission",
+        "requires review but running headlessly",
+        "permission denied",
+        "tool execution denied",
+        "confirmation rejected",
+    ];
+
+    let combined_text = format!(
+        "{}\n{}",
+        stderr.to_lowercase(),
+        text_response.to_lowercase()
+    );
+
+    // 1. Structured event analysis for tool specific denials
+    for ev in events {
+        if let AgyEvent::StepUpdate { step_update } = ev {
+            let is_err = step_update.state.as_deref() == Some("ERROR")
+                || step_update.step_type.as_deref() == Some("tool_error")
+                || step_update.error.is_some();
+
+            let err_text = step_update
+                .error
+                .as_deref()
+                .or(step_update.text_delta.as_deref())
+                .unwrap_or("")
+                .to_lowercase();
+
+            let contains_refusal = phrases.iter().any(|p| err_text.contains(p));
+
+            if is_err && contains_refusal {
+                let tool = step_update
+                    .tool_name
+                    .clone()
+                    .or_else(|| {
+                        step_update
+                            .extra
+                            .get("tool")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| "UNCLASSIFIED_EXTERNAL_ACTION".to_string());
+
+                if !refusals.iter().any(|(t, _)| t == &tool) {
+                    refusals.push((
+                        tool,
+                        format!(
+                            "Tool execution refusal reported in Antigravity step update: {}",
+                            err_text
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // 2. Generic refusal fallback (deduplicated: at most one generic refusal)
+    if refusals.is_empty() {
+        let has_generic = phrases.iter().any(|p| combined_text.contains(p));
+        if has_generic {
+            refusals.push((
+                "UNCLASSIFIED_EXTERNAL_ACTION".to_string(),
+                "Antigravity CLI reported a permission denial for an unclassified external action in headless mode. Review security requirements or authorize Icarus mode to grant autonomous tool execution.".to_string(),
+            ));
+        }
+    }
+
+    refusals
 }
 
 pub fn validate_builder_preflight(
@@ -1322,7 +1468,9 @@ impl BuilderService {
                 }
             }
         };
-        let effort_level = effort.clone();
+        let (effective_effort, pass_effort_flag) =
+            resolve_effective_effort(&model_name, effort.as_deref());
+        let effort_level = Some(effective_effort.clone());
 
         let session_id = uuid::Uuid::new_v4().to_string();
         let started_at = chrono::Utc::now().to_rfc3339();
@@ -1405,9 +1553,13 @@ impl BuilderService {
         let session_id_clone = session_id.clone();
         let project_id_clone = project_id.to_string();
         let db_clone = db_arc.clone();
+        let captured_events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured_events_clone = captured_events.clone();
 
         let persist_handle = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
+                captured_events_clone.lock().await.push(event.clone());
+
                 if let Some(ref sink) = sink_clone {
                     sink(
                         "coalition:builder-event",
@@ -1432,7 +1584,7 @@ impl BuilderService {
             prompt: turn_prompt,
             conversation_id: existing_conv_id,
             model: Some(model_name.clone()),
-            effort: effort_level,
+            effort: if pass_effort_flag { effort_level } else { None },
             icarus_mode,
             working_dir: Some(repo_path.to_string_lossy().to_string()),
         };
@@ -1461,7 +1613,7 @@ impl BuilderService {
             // Unregister execution from registry
             exec_guard.unregister().await;
 
-            let sanitized_err = sanitize_text(&persist_err);
+            let sanitized_err = safe_sanitize_text(&persist_err);
             {
                 let db = db_arc.lock().await;
                 let _ = db.update_builder_session_status(
@@ -1494,20 +1646,14 @@ impl BuilderService {
         // Unregister active execution from registry
         exec_guard.unregister().await;
 
-        match execution_result {
-            Ok(resp) => {
-                let db = db_arc.lock().await;
-                let final_status = if resp.was_canceled {
-                    STATUS_CANCELLED
-                } else if resp.status == "SUCCESS" || resp.status == "COMPLETED" {
-                    STATUS_SUCCESS
-                } else if resp.status == "TIMEOUT" {
-                    STATUS_TIMEOUT
-                } else {
-                    &resp.status
-                };
+        let session_events = captured_events.lock().await.clone();
 
-                let sanitized_response = sanitize_text(&resp.text_response);
+        match execution_result {
+            Ok(mut resp) => {
+                let db = db_arc.lock().await;
+                let final_status = normalize_session_status(&resp.status, resp.was_canceled);
+                let sanitized_response = safe_sanitize_text(&resp.text_response);
+
                 db.update_builder_session_status(
                     &session_id,
                     final_status,
@@ -1528,11 +1674,11 @@ impl BuilderService {
                 let meta = serde_json::json!({
                     "session_id": session_id,
                     "status": final_status,
+                    "provider_status": resp.status,
                     "duration_ms": duration_ms,
                     "tokens": resp.cumulative_usage.total_tokens,
                     "conversation_id": resp.conversation_id,
                 });
-                // Policy: Activity log records are best-effort informational audit records; failures do not abort the governed turn.
                 let _ = crate::core::activity::ActivityManager::record_event(
                     db.connection(),
                     project_id,
@@ -1554,23 +1700,21 @@ impl BuilderService {
                     Some(&meta),
                 );
 
-                // Honest permission inspection:
-                let lower_stderr = resp.stderr.to_lowercase();
-                if lower_stderr.contains("permission denied")
-                    || lower_stderr.contains("tool execution denied")
-                    || lower_stderr.contains("confirmation rejected")
-                {
+                // Permission refusal inspection & deduplicated history recording
+                let refusals =
+                    detect_permission_refusal(&resp.stderr, &resp.text_response, &session_events);
+                resp.has_blocked_actions = !refusals.is_empty();
+
+                for (tool_name, reason) in refusals {
                     let perm_rec = PermissionRecord {
                         id: 0,
                         project_id: project_id.to_string(),
                         session_id: Some(session_id.clone()),
-                        tool_name: "UNCLASSIFIED_EXTERNAL_ACTION".to_string(),
+                        tool_name,
                         target: None,
                         risk_level: "HIGH_RISK".to_string(),
                         decision: "BLOCKED".to_string(),
-                        reason: Some(
-                            "Antigravity CLI reported a permission denial for an unclassified external action in headless mode. Review security requirements or authorize Icarus mode to grant autonomous tool execution.".to_string(),
-                        ),
+                        reason: Some(reason),
                         created_at: completed_at.clone(),
                     };
                     let _ = db.record_permission_history(&perm_rec);
@@ -1580,8 +1724,26 @@ impl BuilderService {
             }
             Err(e) => {
                 let err_str = e.to_string();
-                let sanitized_err = sanitize_text(&err_str);
+                let sanitized_err = safe_sanitize_text(&err_str);
                 let db = db_arc.lock().await;
+
+                // Also check if the failure was caused by a permission refusal
+                let refusals = detect_permission_refusal(&err_str, "", &session_events);
+                for (tool_name, reason) in refusals {
+                    let perm_rec = PermissionRecord {
+                        id: 0,
+                        project_id: project_id.to_string(),
+                        session_id: Some(session_id.clone()),
+                        tool_name,
+                        target: None,
+                        risk_level: "HIGH_RISK".to_string(),
+                        decision: "BLOCKED".to_string(),
+                        reason: Some(reason),
+                        created_at: completed_at.clone(),
+                    };
+                    let _ = db.record_permission_history(&perm_rec);
+                }
+
                 db.update_builder_session_status(
                     &session_id,
                     STATUS_FAILED,
@@ -1604,7 +1766,6 @@ impl BuilderService {
                     "error": sanitized_err,
                     "duration_ms": duration_ms,
                 });
-                // Policy: Activity log records are best-effort informational audit records; failures do not abort the governed turn.
                 let _ = crate::core::activity::ActivityManager::record_event(
                     db.connection(),
                     project_id,
@@ -1621,26 +1782,134 @@ impl BuilderService {
 
     pub async fn cancel_turn(
         registry_arc: Arc<tokio::sync::Mutex<ActiveBuilderRegistry>>,
+        db_arc: Arc<tokio::sync::Mutex<crate::db::DbManager>>,
         project_id: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<String, BuilderError> {
-        let registry = registry_arc.lock().await;
-        let (_canceled_project_id, target_session_id) = if let Some(sid) = session_id {
-            let pid = registry.cancel_session(sid)?;
-            (pid, sid.to_string())
-        } else if let Some(pid) = project_id {
-            let sid = registry.cancel_project(pid)?;
-            (pid.to_string(), sid)
-        } else {
-            return Err(BuilderError::ExecutionFailed(
-                "Either project_id or session_id must be provided to cancel execution".to_string(),
-            ));
+        // 1. Try cancelling active execution in memory first
+        let active_cancel_result = {
+            let registry = registry_arc.lock().await;
+            if let Some(sid) = session_id {
+                registry
+                    .cancel_session(sid)
+                    .map(|pid| (pid, sid.to_string()))
+            } else if let Some(pid) = project_id {
+                registry
+                    .cancel_project(pid)
+                    .map(|sid| (pid.to_string(), sid))
+            } else {
+                return Err(BuilderError::ExecutionFailed(
+                    "Either project_id or session_id must be provided to cancel execution"
+                        .to_string(),
+                ));
+            }
         };
-        // Authoritative invariant: cancel_turn requests cancellation of the active execution
-        // via the registry, but does NOT independently finalize the database session.
-        // start_governed_turn remains the single authoritative owner of final session status
-        // after ProcessRunner terminates the process tree and returns.
-        Ok(target_session_id)
+
+        if let Ok((_pid, sid)) = active_cancel_result {
+            // Process tree termination signaled to active worker
+            return Ok(sid);
+        }
+
+        // 2. Active registry had no live execution. Reconcile stale RUNNING rows in SQLite.
+        let db = db_arc.lock().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        if let Some(sid) = session_id {
+            let row: Result<(String, String), _> = db.connection().query_row(
+                "SELECT session_id, project_id FROM builder_sessions WHERE session_id = ?1 AND status = 'RUNNING'",
+                rusqlite::params![sid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            );
+
+            match row {
+                Ok((target_sid, proj_id)) => {
+                    if let Some(pid) = project_id {
+                        if proj_id != pid {
+                            return Err(BuilderError::ExecutionFailed(format!(
+                                "Session '{}' belongs to project '{}', not '{}'",
+                                target_sid, proj_id, pid
+                            )));
+                        }
+                    }
+
+                    db.connection().execute(
+                        "UPDATE builder_sessions SET status = ?1, completed_at = ?2 WHERE session_id = ?3",
+                        rusqlite::params![STATUS_INTERRUPTED, now, target_sid],
+                    ).map_err(|e| BuilderError::Database(e.to_string()))?;
+
+                    let meta = serde_json::json!({
+                        "session_id": target_sid,
+                        "reconciled_status": STATUS_INTERRUPTED,
+                    });
+                    let _ = crate::core::activity::ActivityManager::record_event(
+                        db.connection(),
+                        &proj_id,
+                        "BUILDER_TURN_INTERRUPTED",
+                        "HUMAN",
+                        &format!(
+                            "Reconciled orphaned running Builder session '{}' to interrupted",
+                            target_sid
+                        ),
+                        Some(&meta),
+                    );
+
+                    Ok(target_sid)
+                }
+                Err(_) => Err(BuilderError::SessionNotFound(format!(
+                    "No running or active session found with ID '{}'",
+                    sid
+                ))),
+            }
+        } else if let Some(pid) = project_id {
+            let mut stmt = db.connection().prepare(
+                "SELECT session_id FROM builder_sessions WHERE project_id = ?1 AND status = 'RUNNING'"
+            ).map_err(|e| BuilderError::Database(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(rusqlite::params![pid], |r| r.get::<_, String>(0))
+                .map_err(|e| BuilderError::Database(e.to_string()))?;
+
+            let mut orphaned_ids = Vec::new();
+            for r in rows {
+                orphaned_ids.push(r.map_err(|e| BuilderError::Database(e.to_string()))?);
+            }
+
+            if orphaned_ids.is_empty() {
+                return Err(BuilderError::SessionNotFound(format!(
+                    "No active or stale running sessions found for project '{}'",
+                    pid
+                )));
+            }
+
+            for sid in &orphaned_ids {
+                db.connection().execute(
+                    "UPDATE builder_sessions SET status = ?1, completed_at = ?2 WHERE session_id = ?3",
+                    rusqlite::params![STATUS_INTERRUPTED, now, sid],
+                ).map_err(|e| BuilderError::Database(e.to_string()))?;
+
+                let meta = serde_json::json!({
+                    "session_id": sid,
+                    "reconciled_status": STATUS_INTERRUPTED,
+                });
+                let _ = crate::core::activity::ActivityManager::record_event(
+                    db.connection(),
+                    pid,
+                    "BUILDER_TURN_INTERRUPTED",
+                    "HUMAN",
+                    &format!(
+                        "Reconciled orphaned running Builder session '{}' to interrupted",
+                        sid
+                    ),
+                    Some(&meta),
+                );
+            }
+
+            Ok(orphaned_ids.join(", "))
+        } else {
+            Err(BuilderError::ExecutionFailed(
+                "Project ID required".to_string(),
+            ))
+        }
     }
 }
 
@@ -1955,6 +2224,9 @@ CLI flag: --api_key=mysecretpass123 --token="quoted-secret" password=my-pass; ne
                 )),
                 duration_seconds: Some(0.5),
                 usage: None,
+                tool_name: None,
+                error: None,
+                extra: Default::default(),
             },
         };
 
@@ -2007,5 +2279,369 @@ CLI flag: --api_key=mysecretpass123 --token="quoted-secret" password=my-pass; ne
         assert!(!sanitized_err.contains("mysecret"));
         assert!(sanitized_err.contains("AIza[REDACTED]"));
         assert!(sanitized_err.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_utf8_sanitizer_with_em_dash_completion_report() {
+        let text_with_em_dash = "Architecture v1.0 — Completion Report";
+        let sanitized = sanitize_text(text_with_em_dash);
+        assert_eq!(sanitized, "Architecture v1.0 — Completion Report");
+
+        // The exact panic message from the live incident
+        let incident_panic = "thread 'tokio-rt-worker' panicked at src\\core\\builder\\mod.rs:332:32:\nend byte index 19 is not a char boundary; it is inside '—' (bytes 17..20) of `Architecture v1.0 — Completion Report`";
+        let sanitized_panic = safe_sanitize_text(incident_panic);
+        assert!(sanitized_panic.contains("Architecture v1.0 — Completion Report"));
+    }
+
+    #[test]
+    fn test_utf8_sanitizer_multibyte_characters_and_adjacent_secrets() {
+        let complex_unicode = r#"
+Status: 🚀 Launching architecture v1.0 – preliminary review…
+Quotes: “Bearer secret-token-inside-quotes” and ‘sk-12345678901234567’
+CJK: 日本語のテスト and 中文测试 with api_key=“my-cjk-secret-pass”
+Em-dash adjacent: —Bearer em-dash-secret-token—
+Accented: café and español with password=secret-password-123; next=val
+"#;
+
+        let sanitized = sanitize_text(complex_unicode);
+        assert!(!sanitized.contains("secret-token-inside-quotes"));
+        assert!(!sanitized.contains("sk-12345678901234567"));
+        assert!(!sanitized.contains("my-cjk-secret-pass"));
+        assert!(!sanitized.contains("em-dash-secret-token"));
+        assert!(!sanitized.contains("secret-password-123"));
+        assert!(sanitized.contains("🚀"));
+        assert!(sanitized.contains("–"));
+        assert!(sanitized.contains("日本語のテスト"));
+        assert!(sanitized.contains("café"));
+    }
+
+    #[test]
+    fn test_effective_effort_resolution() {
+        // Model with suffix overrides requested effort and omits CLI flag
+        let (eff1, pass1) = resolve_effective_effort("gemini-3.8-flash-high", Some("medium"));
+        assert_eq!(eff1, "high");
+        assert!(!pass1, "Must omit --effort when model encodes suffix");
+
+        let (eff2, pass2) = resolve_effective_effort("gemini-3.8-flash-low", None);
+        assert_eq!(eff2, "low");
+        assert!(!pass2);
+
+        let (eff3, pass3) = resolve_effective_effort("gpt-oss-120b_medium", Some("high"));
+        assert_eq!(eff3, "medium");
+        assert!(!pass3);
+
+        // Standard model without suffix honors requested effort and passes CLI flag
+        let (eff4, pass4) = resolve_effective_effort("claude-sonnet-4-6", Some("high"));
+        assert_eq!(eff4, "high");
+        assert!(pass4, "Must pass --effort for standard models");
+
+        let (eff5, pass5) = resolve_effective_effort("claude-sonnet-4-6", None);
+        assert_eq!(eff5, "medium");
+        assert!(pass5);
+    }
+
+    #[test]
+    fn test_canonical_session_status_normalization() {
+        assert_eq!(normalize_session_status("SUCCESS", false), STATUS_SUCCESS);
+        assert_eq!(normalize_session_status("COMPLETED", false), STATUS_SUCCESS);
+        assert_eq!(normalize_session_status("ERROR", false), STATUS_FAILED);
+        assert_eq!(
+            normalize_session_status("UNKNOWN_ERROR", false),
+            STATUS_FAILED
+        );
+        assert_eq!(normalize_session_status("TIMEOUT", false), STATUS_TIMEOUT);
+        assert_eq!(
+            normalize_session_status("CANCELLED", false),
+            STATUS_CANCELLED
+        );
+        assert_eq!(
+            normalize_session_status("CANCELED", false),
+            STATUS_CANCELLED
+        );
+        assert_eq!(normalize_session_status("SUCCESS", true), STATUS_CANCELLED);
+    }
+
+    #[test]
+    fn test_permission_refusal_detection_and_deduplication() {
+        let stderr = "Warning: tool auto-denied: requires review but running headlessly\n";
+        let step = AgyEvent::StepUpdate {
+            step_update: AgyStepUpdateData {
+                conversation_id: Some("c-1".to_string()),
+                step_index: Some(1),
+                state: Some("ERROR".to_string()),
+                step_type: Some("tool_error".to_string()),
+                text_delta: None,
+                duration_seconds: None,
+                usage: None,
+                tool_name: Some("run_command".to_string()),
+                error: Some("tool required the \"command\" permission: auto-denied".to_string()),
+                extra: std::collections::HashMap::new(),
+            },
+        };
+
+        let refusals = detect_permission_refusal(stderr, "response text", &[step]);
+        assert_eq!(
+            refusals.len(),
+            1,
+            "Must deduplicate and record specific tool refusal"
+        );
+        assert_eq!(refusals[0].0, "run_command");
+
+        // Generic fallback test when no structured tool is specified
+        let generic_stderr = "Error: action was auto-denied by security governance";
+        let generic_refusals = detect_permission_refusal(generic_stderr, "", &[]);
+        assert_eq!(generic_refusals.len(), 1);
+        assert_eq!(generic_refusals[0].0, "UNCLASSIFIED_EXTERNAL_ACTION");
+    }
+
+    #[tokio::test]
+    async fn test_stale_cancellation_reconciles_multiple_orphaned_running_sessions() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("test_orphan.db");
+        let mut db = crate::db::DbManager::open(&db_path).expect("init db");
+        db.run_migrations().expect("run migrations");
+        let project_id = "proj-multi-orphan";
+
+        db.connection()
+            .execute(
+                "INSERT INTO projects (project_id, name, repository_path, created_at, updated_at, last_opened_at) VALUES (?1, ?2, ?3, ?4, ?4, ?4)",
+                rusqlite::params![project_id, "Orphan Project", "/fake/repo", "2026-09-23T00:00:00Z"],
+            )
+            .expect("insert project");
+
+        let sess1 = BuilderSessionRecord {
+            session_id: "sess-orphan-1".to_string(),
+            project_id: project_id.to_string(),
+            epoch_id: "epoch-1".to_string(),
+            conversation_id: None,
+            model: "gemini-3.8-flash-high".to_string(),
+            effort: Some("high".to_string()),
+            icarus_mode: false,
+            status: STATUS_RUNNING.to_string(),
+            prompt: "prompt 1".to_string(),
+            response_text: None,
+            error_message: None,
+            started_at: "2026-09-23T10:00:00Z".to_string(),
+            completed_at: None,
+            duration_ms: 0,
+            usage: AgyUsage::default(),
+        };
+        db.insert_builder_session(&sess1).expect("insert sess1");
+
+        let sess2 = BuilderSessionRecord {
+            session_id: "sess-orphan-2".to_string(),
+            project_id: project_id.to_string(),
+            epoch_id: "epoch-1".to_string(),
+            conversation_id: None,
+            model: "gemini-3.8-flash-high".to_string(),
+            effort: Some("high".to_string()),
+            icarus_mode: false,
+            status: STATUS_RUNNING.to_string(),
+            prompt: "prompt 2".to_string(),
+            response_text: None,
+            error_message: None,
+            started_at: "2026-09-23T10:05:00Z".to_string(),
+            completed_at: None,
+            duration_ms: 0,
+            usage: AgyUsage::default(),
+        };
+        db.insert_builder_session(&sess2).expect("insert sess2");
+
+        let registry = Arc::new(tokio::sync::Mutex::new(ActiveBuilderRegistry::new()));
+        let db_arc = Arc::new(tokio::sync::Mutex::new(db));
+
+        // Reconcile project-scoped stale sessions
+        let res =
+            BuilderService::cancel_turn(registry.clone(), db_arc.clone(), Some(project_id), None)
+                .await
+                .expect("reconcile stale sessions");
+
+        assert!(res.contains("sess-orphan-1"));
+        assert!(res.contains("sess-orphan-2"));
+
+        let db_guard = db_arc.lock().await;
+        let s1 = db_guard
+            .get_builder_session("sess-orphan-1")
+            .expect("get s1")
+            .unwrap();
+        let s2 = db_guard
+            .get_builder_session("sess-orphan-2")
+            .expect("get s2")
+            .unwrap();
+
+        assert_eq!(s1.status, STATUS_INTERRUPTED);
+        assert_eq!(s2.status, STATUS_INTERRUPTED);
+        assert!(s1.completed_at.is_some());
+        assert!(s2.completed_at.is_some());
+
+        let reg_guard = registry.lock().await;
+        assert!(!reg_guard.is_active(project_id));
+    }
+
+    #[tokio::test]
+    async fn test_provider_raw_error_normalizes_to_failed() {
+        let fake_agy_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("fake-commands")
+            .join(if cfg!(windows) {
+                "fake-agy.cmd"
+            } else {
+                "fake-agy"
+            });
+
+        if !fake_agy_path.exists() {
+            return;
+        }
+
+        let adapter = AntigravityCliAdapter::with_path(fake_agy_path);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let res = adapter
+            .run_turn(
+                BuilderTurnRequest {
+                    prompt: "trigger_raw_error".to_string(),
+                    conversation_id: None,
+                    model: Some("gemini-3.8-flash-high".to_string()),
+                    effort: None,
+                    icarus_mode: false,
+                    working_dir: None,
+                },
+                cancel,
+                None,
+            )
+            .await
+            .expect("should return turn response");
+
+        assert_eq!(
+            res.status, STATUS_FAILED,
+            "Raw provider ERROR must normalize to canonical FAILED"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_live_incident_full_sequence_regression() {
+        let fake_agy_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("fake-commands")
+            .join(if cfg!(windows) {
+                "fake-agy.cmd"
+            } else {
+                "fake-agy"
+            });
+
+        if !fake_agy_path.exists() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("test_incident.db");
+        let mut db = crate::db::DbManager::open(&db_path).expect("init db");
+        db.run_migrations().expect("run migrations");
+        let project_id = "proj-incident-regress";
+
+        db.connection()
+            .execute(
+                "INSERT INTO projects (project_id, name, repository_path, created_at, updated_at, last_opened_at) VALUES (?1, ?2, ?3, ?4, ?4, ?4)",
+                rusqlite::params![project_id, "Incident Project", dir.path().to_string_lossy(), "2026-09-23T00:00:00Z"],
+            )
+            .expect("insert project");
+
+        let adapter = AntigravityCliAdapter::with_path(fake_agy_path);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = mpsc::channel::<AgyEvent>(100);
+
+        // Turn 1: Least-privilege run with auto-denied command
+        let res1 = adapter
+            .run_turn(
+                BuilderTurnRequest {
+                    prompt: "trigger_least_privilege_blocked_command".to_string(),
+                    conversation_id: None,
+                    model: Some("gemini-3.8-flash-high".to_string()),
+                    effort: Some("medium".to_string()), // Contradictory effort: should be ignored in favor of -high
+                    icarus_mode: false,
+                    working_dir: None,
+                },
+                cancel.clone(),
+                Some(tx),
+            )
+            .await
+            .expect("run turn 1");
+
+        let mut events1 = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events1.push(ev);
+        }
+
+        let refusals = detect_permission_refusal(&res1.stderr, &res1.text_response, &events1);
+        assert_eq!(refusals.len(), 1, "Must detect exactly one tool refusal");
+        assert_eq!(
+            refusals[0].0, "run_command",
+            "Must capture structured tool name"
+        );
+
+        // Record to DB as start_governed_turn does
+        for (tool_name, reason) in &refusals {
+            let perm_rec = PermissionRecord {
+                id: 0,
+                project_id: project_id.to_string(),
+                session_id: Some("sess-turn-1".to_string()),
+                tool_name: tool_name.clone(),
+                target: None,
+                risk_level: "HIGH_RISK".to_string(),
+                decision: "BLOCKED".to_string(),
+                reason: Some(reason.clone()),
+                created_at: "2026-09-23T11:00:00Z".to_string(),
+            };
+            db.record_permission_history(&perm_rec)
+                .expect("record refusal");
+        }
+
+        let db_perms = db
+            .list_permission_history(project_id, 10)
+            .expect("list perms");
+        assert_eq!(db_perms.len(), 1);
+        assert_eq!(db_perms[0].decision, "BLOCKED");
+        assert_eq!(db_perms[0].tool_name, "run_command");
+
+        // Canonical session status remains SUCCESS even though action was blocked
+        assert_eq!(res1.status, STATUS_SUCCESS);
+
+        // Turn 2: User enables Icarus mode, response contains Unicode em-dash and completion report
+        let (tx2, mut rx2) = mpsc::channel::<AgyEvent>(100);
+        let res2 = adapter
+            .run_turn(
+                BuilderTurnRequest {
+                    prompt: "trigger_unicode_completion_report".to_string(),
+                    conversation_id: None,
+                    model: Some("gemini-3.8-flash-high".to_string()),
+                    effort: None,
+                    icarus_mode: true,
+                    working_dir: None,
+                },
+                cancel.clone(),
+                Some(tx2),
+            )
+            .await
+            .expect("run turn 2");
+
+        let mut events2 = Vec::new();
+        while let Ok(ev) = rx2.try_recv() {
+            events2.push(ev);
+        }
+
+        // Test that event record sanitization does not panic on em dash
+        for ev in &events2 {
+            let rec = sanitize_and_bound_event_record(ev, "sess-turn-2", project_id);
+            assert!(rec.content.is_some() || rec.details_json.is_some());
+        }
+
+        assert_eq!(res2.status, STATUS_SUCCESS);
+        assert!(res2
+            .text_response
+            .contains("Architecture v1.0 — Completion Report"));
     }
 }

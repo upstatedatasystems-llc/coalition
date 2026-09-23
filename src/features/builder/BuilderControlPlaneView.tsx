@@ -39,6 +39,21 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
   const [modelError, setModelError] = useState<string | null>(null);
   const [effort, setEffort] = useState<'low' | 'medium' | 'high'>('medium');
 
+  // Derive effort from model suffix when model variant specifies it (e.g. -low, -medium, -high)
+  const derivedEffort = React.useMemo<'low' | 'medium' | 'high' | null>(() => {
+    const lower = selectedModel.toLowerCase();
+    if (lower.endsWith('-low') || lower.endsWith('_low')) return 'low';
+    if (lower.endsWith('-medium') || lower.endsWith('_medium')) return 'medium';
+    if (lower.endsWith('-high') || lower.endsWith('_high')) return 'high';
+    return null;
+  }, [selectedModel]);
+
+  useEffect(() => {
+    if (derivedEffort) {
+      setEffort(derivedEffort);
+    }
+  }, [derivedEffort]);
+
   // Status & Telemetry
   const [builderPacket, setBuilderPacket] = useState<BuilderPacket | null>(null);
   const [driftReport, setDriftReport] = useState<DriftReport | null>(null);
@@ -55,6 +70,10 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
   const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
   const [lastResponse, setLastResponse] = useState<BuilderTurnResponse | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // Diagnostics Export
+  const [isExporting, setIsExporting] = useState<boolean>(false);
+  const [diagnosticExportPath, setDiagnosticExportPath] = useState<string | null>(null);
 
   // Modals & Controls
   const [showIcarusModal, setShowIcarusModal] = useState<boolean>(false);
@@ -343,11 +362,59 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
         projectId,
         sessionId: activeSessionId,
       });
-      // Do NOT clear isRunning, activeSessionId, or activeRunIcarus here!
-      // They remain active until the running start_builder_turn invocation actually resolves in handleRunTurn.
+      // Do NOT immediately clear isRunning, activeSessionId, or activeRunIcarus for active processes!
+      // They remain active until the running start_builder_turn invocation resolves in handleRunTurn.
     } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : JSON.stringify(err);
       console.error('Failed to cancel turn:', err);
-      setIsCancelling(false);
+      setErrorMessage(`Cancellation failed: ${msg}`);
+      setTerminalLogs((prev) => {
+        const next = [...prev, `❌ Cancellation Error: ${msg}`];
+        return next.length > 1000 ? next.slice(next.length - 1000) : next;
+      });
+    } finally {
+      // Re-fetch sessions to reconcile stale or orphaned state if process was dead
+      try {
+        const sess = await invoke<BuilderSessionRecord[]>('list_builder_sessions', {
+          projectId,
+          limit: 10,
+        });
+        setSessions(sess);
+        const runningSession = sess.find((s) => s.status === 'RUNNING');
+        if (!runningSession) {
+          setIsRunning(false);
+          setIsCancelling(false);
+          setActiveSessionId(null);
+          setActiveRunIcarus(null);
+        }
+      } catch (_) {
+        setIsCancelling(false);
+      }
+    }
+  };
+
+  const handleExportDiagnostics = async () => {
+    setIsExporting(true);
+    setDiagnosticExportPath(null);
+    try {
+      const exportedPath = await invoke<string>('export_project_diagnostics', {
+        projectId,
+        destinationDir: null,
+      });
+      setDiagnosticExportPath(exportedPath);
+      setTerminalLogs((prev) => [
+        ...prev,
+        `📦 Diagnostics exported: ${exportedPath}`,
+      ]);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : JSON.stringify(err);
+      setErrorMessage(`Failed to export diagnostics: ${msg}`);
+      setTerminalLogs((prev) => [
+        ...prev,
+        `❌ Diagnostic Export Error: ${msg}`,
+      ]);
+    } finally {
+      setIsExporting(false);
     }
   };
 
@@ -392,6 +459,13 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
   };
 
   const latestSession = sessions.length > 0 ? sessions[0] : null;
+  const currentSessionId = latestSession?.session_id || lastResponse?.conversation_id;
+  const sessionPermissions = currentSessionId
+    ? permissionHistory.filter((p) => p.session_id === currentSessionId)
+    : [];
+  const hasBlockedActions =
+    lastResponse?.has_blocked_actions === true ||
+    sessionPermissions.some((p) => p.decision === 'BLOCKED' || p.decision === 'DENIED');
 
   return (
     <div className="builder-control-plane" data-testid="builder-control-plane">
@@ -511,6 +585,15 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
             Inspect Frozen Builder Packet
           </button>
         )}
+
+        <button
+          className="secondary-btn export-diagnostics-btn"
+          onClick={handleExportDiagnostics}
+          disabled={isLoading || isExporting}
+          data-testid="export-diagnostics-btn"
+        >
+          {isExporting ? 'Exporting...' : 'Export Diagnostics'}
+        </button>
       </div>
 
       {/* Contract Invalidation / Non-Frozen Guard */}
@@ -534,6 +617,19 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
             since the contract was frozen. You must reconcile drift in the Architecture Workspace before
             running the Builder.
           </p>
+        </div>
+      )}
+
+      {diagnosticExportPath && (
+        <div className="builder-success-alert" role="status" data-testid="diagnostic-export-success">
+          <strong>Diagnostics Exported:</strong> <code>{diagnosticExportPath}</code>
+          <button
+            className="link-btn"
+            onClick={() => setDiagnosticExportPath(null)}
+            style={{ marginLeft: '12px', cursor: 'pointer' }}
+          >
+            Dismiss
+          </button>
         </div>
       )}
 
@@ -586,13 +682,23 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
                   className="select-input"
                   value={effort}
                   onChange={(e) => setEffort(e.target.value as 'low' | 'medium' | 'high')}
-                  disabled={isRunning || !isFrozen}
+                  disabled={isRunning || !isFrozen || Boolean(derivedEffort)}
+                  title={derivedEffort ? 'Effort is configured directly by model variant (e.g., -high)' : undefined}
                   data-testid="effort-select"
                 >
                   <option value="low">Low</option>
                   <option value="medium">Medium</option>
                   <option value="high">High</option>
                 </select>
+                {derivedEffort && (
+                  <span
+                    className="field-hint"
+                    title="Effort is configured directly by model variant (e.g., -high)"
+                    data-testid="effort-derived-hint"
+                  >
+                    Effort is configured directly by model variant (e.g., -high)
+                  </span>
+                )}
               </div>
             </div>
 
@@ -642,10 +748,38 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
             <section className="builder-card completion-report-card" data-testid="completion-report">
               <div className="report-header">
                 <h3>Latest Builder Session Report</h3>
-                <span className={`status-badge status-${(latestSession?.status || lastResponse?.status || '').toLowerCase()}`}>
-                  {latestSession?.status || lastResponse?.status}
-                </span>
+                <div className="report-status-badges">
+                  {hasBlockedActions ? (
+                    <>
+                      <span
+                        className={`status-badge status-${(latestSession?.status || lastResponse?.status || '').toLowerCase()}`}
+                        data-testid="provider-status-badge"
+                      >
+                        Provider: {latestSession?.status || lastResponse?.status}
+                      </span>
+                      <span
+                        className="status-badge status-blocked"
+                        data-testid="governance-status-badge"
+                      >
+                        Governance: BLOCKED — Least-Privilege Denial
+                      </span>
+                    </>
+                  ) : (
+                    <span
+                      className={`status-badge status-${(latestSession?.status || lastResponse?.status || '').toLowerCase()}`}
+                      data-testid="session-status-badge"
+                    >
+                      {latestSession?.status || lastResponse?.status}
+                    </span>
+                  )}
+                </div>
               </div>
+
+              {hasBlockedActions && (
+                <div className="governance-blocked-alert" role="alert" data-testid="governance-blocked-alert">
+                  <strong>⚠️ Least-Privilege Policy Blocked Action:</strong> The agent concluded its turn (provider reported {latestSession?.status || lastResponse?.status}), but one or more mutating tool calls were blocked because Icarus Mode was disabled. Check the Tool Permissions list below or authorize Icarus Mode for autonomous tool execution.
+                </div>
+              )}
               <div className="report-metrics-grid">
                 <div className="metric-item">
                   <span className="metric-label">Session ID:</span>

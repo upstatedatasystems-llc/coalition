@@ -122,6 +122,7 @@ pub fn run() {
             commands::restore_drifted_artifact,
             commands::restore_all_drifted_artifacts,
             commands::get_builder_packet,
+            commands::export_project_diagnostics,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
