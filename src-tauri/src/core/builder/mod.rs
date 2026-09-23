@@ -135,6 +135,8 @@ pub struct BuilderTurnRequest {
 pub struct BuilderTurnResponse {
     pub conversation_id: Option<String>,
     pub status: String,
+    #[serde(default)]
+    pub provider_status: Option<String>,
     pub text_response: String,
     pub cumulative_usage: AgyUsage,
     pub was_canceled: bool,
@@ -1121,6 +1123,7 @@ impl AntigravityCliAdapter {
             return Ok(BuilderTurnResponse {
                 conversation_id: active_conversation_id,
                 status: STATUS_CANCELLED.to_string(),
+                provider_status: Some("CANCELLED".to_string()),
                 text_response: final_text,
                 cumulative_usage,
                 was_canceled: true,
@@ -1133,6 +1136,7 @@ impl AntigravityCliAdapter {
             return Ok(BuilderTurnResponse {
                 conversation_id: active_conversation_id,
                 status: STATUS_TIMEOUT.to_string(),
+                provider_status: Some("TIMEOUT".to_string()),
                 text_response: final_text,
                 cumulative_usage,
                 was_canceled: false,
@@ -1155,11 +1159,13 @@ impl AntigravityCliAdapter {
             }
         }
 
-        let canonical_status = normalize_session_status(&final_status, proc_res.canceled);
+        let raw_provider_status = final_status.clone();
+        let canonical_status = normalize_session_status(&raw_provider_status, proc_res.canceled);
 
         Ok(BuilderTurnResponse {
             conversation_id: active_conversation_id,
             status: canonical_status.to_string(),
+            provider_status: Some(raw_provider_status),
             text_response: final_text,
             cumulative_usage,
             was_canceled: false,
@@ -1671,10 +1677,11 @@ impl BuilderService {
                     ))
                 })?;
 
+                let raw_provider = resp.provider_status.as_deref().unwrap_or(&resp.status);
                 let meta = serde_json::json!({
                     "session_id": session_id,
                     "status": final_status,
-                    "provider_status": resp.status,
+                    "provider_status": raw_provider,
                     "duration_ms": duration_ms,
                     "tokens": resp.cumulative_usage.total_tokens,
                     "conversation_id": resp.conversation_id,
@@ -1717,7 +1724,37 @@ impl BuilderService {
                         reason: Some(reason),
                         created_at: completed_at.clone(),
                     };
-                    let _ = db.record_permission_history(&perm_rec);
+                    if let Err(audit_err) = db.record_permission_history(&perm_rec) {
+                        let err_msg = format!(
+                            "Governance audit persistence failure: could not persist permission refusal: {}",
+                            audit_err
+                        );
+                        let sanitized_err = safe_sanitize_text(&err_msg);
+                        let _ = db.update_builder_session_status(
+                            &session_id,
+                            STATUS_FAILED,
+                            None,
+                            Some(&sanitized_err),
+                            Some(&completed_at),
+                            duration_ms,
+                            &resp.cumulative_usage,
+                            resp.conversation_id.as_deref(),
+                        );
+                        let err_meta = serde_json::json!({
+                            "session_id": session_id,
+                            "error": sanitized_err,
+                            "governance_audit_failure": true,
+                        });
+                        let _ = crate::core::activity::ActivityManager::record_event(
+                            db.connection(),
+                            project_id,
+                            "BUILDER_AUDIT_PERSISTENCE_FAILED",
+                            "GOVERNANCE",
+                            &err_msg,
+                            Some(&err_meta),
+                        );
+                        return Err(BuilderError::Database(err_msg));
+                    }
                 }
 
                 Ok(resp)
@@ -1741,7 +1778,37 @@ impl BuilderService {
                         reason: Some(reason),
                         created_at: completed_at.clone(),
                     };
-                    let _ = db.record_permission_history(&perm_rec);
+                    if let Err(audit_err) = db.record_permission_history(&perm_rec) {
+                        let err_msg = format!(
+                            "Governance audit persistence failure: could not persist permission refusal: {}",
+                            audit_err
+                        );
+                        let sanitized_err = safe_sanitize_text(&err_msg);
+                        let _ = db.update_builder_session_status(
+                            &session_id,
+                            STATUS_FAILED,
+                            None,
+                            Some(&sanitized_err),
+                            Some(&completed_at),
+                            duration_ms,
+                            &AgyUsage::default(),
+                            None,
+                        );
+                        let err_meta = serde_json::json!({
+                            "session_id": session_id,
+                            "error": sanitized_err,
+                            "governance_audit_failure": true,
+                        });
+                        let _ = crate::core::activity::ActivityManager::record_event(
+                            db.connection(),
+                            project_id,
+                            "BUILDER_AUDIT_PERSISTENCE_FAILED",
+                            "GOVERNANCE",
+                            &err_msg,
+                            Some(&err_meta),
+                        );
+                        return Err(BuilderError::Database(err_msg));
+                    }
                 }
 
                 db.update_builder_session_status(
@@ -2517,6 +2584,11 @@ Accented: café and español with password=secret-password-123; next=val
         assert_eq!(
             res.status, STATUS_FAILED,
             "Raw provider ERROR must normalize to canonical FAILED"
+        );
+        assert_eq!(
+            res.provider_status.as_deref(),
+            Some("ERROR"),
+            "Raw provider status must preserve 'ERROR'"
         );
     }
 

@@ -978,5 +978,82 @@ describe('BuilderControlPlaneView', () => {
       'coalition-diagnostics-proj-stage3.zip'
     );
   });
+
+  it('preserves and displays raw provider ERROR separately while canonical status is FAILED', async () => {
+    const errorTurnResp: BuilderTurnResponse = {
+      conversation_id: 'conv-err-1',
+      status: 'FAILED',
+      provider_status: 'ERROR',
+      text_response: 'Provider engine crashed unexpectedly',
+      cumulative_usage: {
+        input_tokens: 100,
+        output_tokens: 0,
+        thinking_tokens: 0,
+        cache_read_tokens: 0,
+        total_tokens: 100,
+      },
+      was_canceled: false,
+      stderr: 'raw error',
+      has_blocked_actions: true,
+    };
+
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'start_builder_turn') return Promise.resolve(errorTurnResp);
+      if (cmd === 'list_builder_models') return Promise.resolve(mockModels);
+      if (cmd === 'get_builder_packet') return Promise.resolve(mockBuilderPacket);
+      if (cmd === 'get_contract_drift') return Promise.resolve(mockCleanDriftReport);
+      if (cmd === 'get_icarus_state') return Promise.resolve(mockIcarusInactive);
+      if (cmd === 'get_usage_telemetry') return Promise.resolve(mockTelemetry);
+      if (cmd === 'get_permission_history') return Promise.resolve([]);
+      if (cmd === 'list_builder_sessions') {
+        return Promise.resolve([
+          {
+            session_id: 'sess-persisted-err',
+            project_id: 'proj-stage3',
+            epoch_id: 'epoch-1',
+            architecture_version: '1.0.0',
+            contract_fingerprint: 'fp-1',
+            git_commit: 'commit-1',
+            model: 'gemini-3.8-flash-high',
+            effort: 'high',
+            icarus_mode: false,
+            status: 'FAILED',
+            error_message: 'Provider error',
+            duration_ms: 1000,
+            usage: {
+              input_tokens: 100,
+              output_tokens: 0,
+              thinking_tokens: 0,
+              cache_read_tokens: 0,
+              total_tokens: 100,
+            },
+            created_at: '2026-09-23T10:00:00Z',
+            completed_at: '2026-09-23T10:00:01Z',
+          },
+        ]);
+      }
+      return Promise.resolve(null);
+    });
+
+    await act(async () => {
+      render(
+        <BuilderControlPlaneView
+          projectId="proj-stage3"
+          projectName="Stage3 Test Project"
+          workflowState="FROZEN"
+          onRefreshProject={vi.fn()}
+        />
+      );
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('run-turn-btn'));
+    });
+
+    expect(screen.getByTestId('provider-status-badge')).toHaveTextContent('Provider: ERROR');
+    expect(screen.getByTestId('governance-status-badge')).toHaveTextContent(
+      'Governance: BLOCKED — Least-Privilege Denial'
+    );
+  });
 });
 

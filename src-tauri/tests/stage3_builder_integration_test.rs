@@ -16,6 +16,12 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 fn setup_frozen_test_project() -> (tempfile::TempDir, tempfile::TempDir, String, PathBuf) {
+    setup_frozen_test_project_with_extra(None)
+}
+
+fn setup_frozen_test_project_with_extra(
+    extra_spec: Option<&str>,
+) -> (tempfile::TempDir, tempfile::TempDir, String, PathBuf) {
     let repo_temp = tempdir().unwrap();
     let repo_path = repo_temp.path();
 
@@ -87,11 +93,13 @@ fn setup_frozen_test_project() -> (tempfile::TempDir, tempfile::TempDir, String,
             )
             .unwrap();
         } else {
-            fs::write(
-                &full_path,
-                "# Architecture Spec\nSubstantive architecture content for Stage 3 validation testing.\n",
-            )
-            .unwrap();
+            let mut content = "# Architecture Spec\nSubstantive architecture content for Stage 3 validation testing.\n".to_string();
+            if let Some(extra) = extra_spec {
+                content.push('\n');
+                content.push_str(extra);
+                content.push('\n');
+            }
+            fs::write(&full_path, content).unwrap();
         }
     }
 
@@ -1162,6 +1170,96 @@ async fn test_stage3_registry_cleanup_on_injected_persistence_and_session_failur
         assert!(
             reg.get_active_execution(&project_id).is_none(),
             "ActiveBuilderRegistry must be cleaned up after successful turn"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_stage3_injected_permission_history_persistence_failure_fails_safely() {
+    let (_repo_temp, db_temp, project_id, fake_agy) =
+        setup_frozen_test_project_with_extra(Some("trigger_least_privilege_blocked_command"));
+    let db_path = db_temp.path().join("stage3_test.db");
+    let db = Arc::new(tokio::sync::Mutex::new(DbManager::open(&db_path).unwrap()));
+    let registry = Arc::new(tokio::sync::Mutex::new(ActiveBuilderRegistry::new()));
+    let adapter = AntigravityCliAdapter::with_path(fake_agy);
+
+    // Injected SQLite trigger: abort on insert into builder_permission_history
+    {
+        let db_lock = db.lock().await;
+        db_lock
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_perm_history_trigger BEFORE INSERT ON builder_permission_history
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected permission history persistence error');
+                 END;",
+            )
+            .unwrap();
+    }
+
+    // Run governed turn
+    let turn_res = BuilderService::start_governed_turn(
+        db.clone(),
+        registry.clone(),
+        None,
+        &project_id,
+        Some("gemini-3.8-flash-high".to_string()),
+        None,
+        Some(adapter),
+    )
+    .await;
+
+    // Caller receives clear database/governance audit error
+    assert!(
+        turn_res.is_err(),
+        "Turn must fail on permission audit failure"
+    );
+    let err_str = turn_res.err().unwrap().to_string();
+    assert!(
+        err_str.contains("Governance audit persistence failure")
+            || err_str.contains("injected permission history persistence error"),
+        "Error message must specify governance audit persistence failure: {}",
+        err_str
+    );
+
+    // Active registry entry is NOT stranded
+    {
+        let reg = registry.lock().await;
+        assert!(
+            reg.get_active_execution(&project_id).is_none(),
+            "ActiveBuilderRegistry must NOT have stranded execution for project"
+        );
+    }
+
+    // SQLite session does NOT remain RUNNING; must be FAILED with error message
+    {
+        let db_lock = db.lock().await;
+        let sessions = db_lock.list_builder_sessions(&project_id, 10).unwrap();
+        assert!(!sessions.is_empty(), "Session must exist");
+        assert_eq!(
+            sessions[0].status, "FAILED",
+            "Session must be FAILED, never RUNNING"
+        );
+        assert!(
+            sessions[0]
+                .error_message
+                .as_ref()
+                .is_some_and(|m| m.contains("Governance audit persistence failure")),
+            "Session error_message must document the audit failure"
+        );
+
+        // Activity log records BUILDER_AUDIT_PERSISTENCE_FAILED
+        let count: i64 = db_lock
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM activity_events WHERE project_id = ?1 AND event_type = 'BUILDER_AUDIT_PERSISTENCE_FAILED'",
+                rusqlite::params![project_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            count > 0,
+            "Activity event BUILDER_AUDIT_PERSISTENCE_FAILED must be recorded"
         );
     }
 }

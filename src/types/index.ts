@@ -130,6 +130,7 @@ export interface AgyEvent {
 export interface BuilderTurnResponse {
   conversation_id?: string | null;
   status: string;
+  provider_status?: string | null;
   text_response: string;
   cumulative_usage: AgyUsage;
   was_canceled: boolean;

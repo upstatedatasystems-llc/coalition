@@ -752,10 +752,10 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
                   {hasBlockedActions ? (
                     <>
                       <span
-                        className={`status-badge status-${(latestSession?.status || lastResponse?.status || '').toLowerCase()}`}
+                        className={`status-badge status-${(lastResponse?.provider_status || latestSession?.status || lastResponse?.status || '').toLowerCase()}`}
                         data-testid="provider-status-badge"
                       >
-                        Provider: {latestSession?.status || lastResponse?.status}
+                        Provider: {lastResponse?.provider_status || latestSession?.status || lastResponse?.status}
                       </span>
                       <span
                         className="status-badge status-blocked"
@@ -777,7 +777,7 @@ export const BuilderControlPlaneView: React.FC<BuilderControlPlaneViewProps> = (
 
               {hasBlockedActions && (
                 <div className="governance-blocked-alert" role="alert" data-testid="governance-blocked-alert">
-                  <strong>⚠️ Least-Privilege Policy Blocked Action:</strong> The agent concluded its turn (provider reported {latestSession?.status || lastResponse?.status}), but one or more mutating tool calls were blocked because Icarus Mode was disabled. Check the Tool Permissions list below or authorize Icarus Mode for autonomous tool execution.
+                  <strong>⚠️ Least-Privilege Policy Blocked Action:</strong> The agent concluded its turn (provider reported {lastResponse?.provider_status || latestSession?.status || lastResponse?.status}), but one or more mutating tool calls were blocked because Icarus Mode was disabled. Check the Tool Permissions list below or authorize Icarus Mode for autonomous tool execution.
                 </div>
               )}
               <div className="report-metrics-grid">
