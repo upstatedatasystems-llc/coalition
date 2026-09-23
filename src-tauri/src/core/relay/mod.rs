@@ -508,40 +508,93 @@ impl RelayParser {
         Ok(payload)
     }
 
-    fn extract_structured_block(text: &str) -> Result<String, RelayError> {
-        // 1. Check for markdown code fences (```yaml ... ``` or ```json ... ``` or plain ``` ... ```)
-        let lines: Vec<&str> = text.lines().collect();
-        let mut in_fence = false;
-        let mut fence_lines = Vec::new();
-        let mut candidates = Vec::new();
+    fn parse_fence_opener(line: &str) -> Option<(char, usize, usize, &str)> {
+        let mut leading_spaces = 0;
+        let mut chars = line.chars();
+        while let Some(' ') = chars.clone().next() {
+            leading_spaces += 1;
+            chars.next();
+        }
+        let rest = chars.as_str();
+        if leading_spaces > 3 || rest.starts_with('\t') {
+            return None;
+        }
+        let fence_char = rest.chars().next()?;
+        if fence_char != '`' && fence_char != '~' {
+            return None;
+        }
+        let len = rest.chars().take_while(|c| *c == fence_char).count();
+        if len < 3 {
+            return None;
+        }
+        let info = rest[len..].trim();
+        // In CommonMark, backtick code fences cannot contain backticks in info string
+        if fence_char == '`' && info.contains('`') {
+            return None;
+        }
+        Some((fence_char, len, leading_spaces, info))
+    }
 
-        for line in &lines {
-            let trimmed = line.trim();
-            if trimmed.starts_with("```") {
-                if in_fence {
-                    // Close fence
-                    let block = fence_lines.join("\n");
-                    candidates.push(block);
-                    fence_lines.clear();
-                    in_fence = false;
+    fn is_matching_closing_fence(line: &str, fence_char: char, fence_len: usize) -> bool {
+        let mut leading_spaces = 0;
+        let mut chars = line.chars();
+        while let Some(' ') = chars.clone().next() {
+            leading_spaces += 1;
+            chars.next();
+        }
+        let rest = chars.as_str();
+        if leading_spaces > 3 || rest.starts_with('\t') {
+            return false;
+        }
+        let count = rest.chars().take_while(|c| *c == fence_char).count();
+        if count < fence_len {
+            return false;
+        }
+        let remainder = &rest[count..];
+        remainder.trim().is_empty()
+    }
+
+    fn extract_structured_block(text: &str) -> Result<String, RelayError> {
+        let mut closed_candidates: Vec<String> = Vec::new();
+        let mut current_fence: Option<(char, usize, usize, Vec<&str>)> = None;
+
+        for line in text.lines() {
+            if let Some((f_char, f_len, _f_indent, ref mut f_lines)) = current_fence {
+                if Self::is_matching_closing_fence(line, f_char, f_len) {
+                    let block = f_lines.join("\n");
+                    closed_candidates.push(block);
+                    current_fence = None;
                 } else {
-                    // Open fence
-                    in_fence = true;
+                    f_lines.push(line);
                 }
-            } else if in_fence {
-                fence_lines.push(*line);
+            } else if let Some((f_char, f_len, f_indent, _info)) = Self::parse_fence_opener(line) {
+                current_fence = Some((f_char, f_len, f_indent, Vec::new()));
             }
         }
 
-        for candidate in candidates {
+        // 1. Check if any legitimately closed block contains the structured response
+        for candidate in &closed_candidates {
             if candidate.contains("coalition_response:")
                 || candidate.contains("\"coalition_response\"")
             {
-                return Ok(candidate);
+                return Ok(candidate.clone());
             }
         }
 
-        // 2. Check if raw text contains coalition_response:
+        // 2. Check if an outer structured response fence was opened but never closed
+        if let Some((_, _, _, ref f_lines)) = current_fence {
+            let unclosed_content = f_lines.join("\n");
+            if unclosed_content.contains("coalition_response:")
+                || unclosed_content.contains("\"coalition_response\"")
+            {
+                return Err(RelayError::ParseError(
+                    "Outer structured response code fence was opened but never legitimately closed. Ensure the complete ChatGPT response including the closing fence (```) was copied."
+                        .to_string(),
+                ));
+            }
+        }
+
+        // 3. Fallback: raw text without outer code fences
         if let Some(idx) = text.find("coalition_response:") {
             let sub = &text[idx..];
             return Ok(sub.to_string());
@@ -3540,5 +3593,259 @@ mod tests {
             post_details.workflow_state.state,
             WorkflowState::ReadyToFreeze
         );
+    }
+
+    #[test]
+    fn test_nested_markdown_code_fences_preserved() {
+        let (dir, mut db, pid) = setup_test_project();
+        let pkt =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+
+        let response_text = format!(
+            r#"```yaml
+coalition_response:
+  schema: 1
+  project_id: "{}"
+  packet_id: "{}"
+  response_type: "ARCHITECT_UPDATE"
+  summary: "Nested code fence test with multiple artifacts"
+  artifacts:
+    - path: "design/architecture.md"
+      action: "CREATE"
+      content: |
+        ## Repository Layout
+
+        ```text
+        .
+        ├── package.json
+        └── src/
+        ```
+        Architecture design continues here with substantive text.
+    - path: "design/constraints.md"
+      action: "CREATE"
+      content: |
+        # Constraints
+        Offline first local architecture with zero cloud dependencies.
+    - path: "implementation/test-plan.md"
+      action: "CREATE"
+      content: |
+        ## Test Plan
+        Execute the deterministic test command below:
+        ```bash
+        cargo test --all
+        npm test
+        ```
+        All tests must pass cleanly.
+  open_questions: []
+```"#,
+            pid, pkt.metadata.packet_id
+        );
+
+        // 1. Parser extracts full payload without truncation
+        let parsed =
+            RelayParser::parse_response(&response_text, &pid, Some(&pkt.metadata.packet_id))
+                .unwrap();
+        assert_eq!(parsed.artifacts.len(), 3);
+        assert!(parsed.open_questions.is_empty());
+
+        // Verify nested code blocks are preserved exactly in artifact content
+        let arch_art = parsed
+            .artifacts
+            .iter()
+            .find(|a| a.path == "design/architecture.md")
+            .unwrap();
+        assert!(arch_art
+            .content
+            .contains("```text\n.\n├── package.json\n└── src/\n```"));
+        let test_art = parsed
+            .artifacts
+            .iter()
+            .find(|a| a.path == "implementation/test-plan.md")
+            .unwrap();
+        assert!(test_art
+            .content
+            .contains("```bash\ncargo test --all\nnpm test\n```"));
+
+        // 2. Process import preview
+        let preview =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &response_text)
+                .unwrap();
+        assert_eq!(preview.artifacts.len(), 3);
+        assert_eq!(preview.open_questions.len(), 0);
+
+        // 3. Accept import and verify files on disk
+        let report =
+            RelayService::accept_import(db.connection(), dir.path(), &pid, &preview.import_id)
+                .unwrap();
+        assert_eq!(report.artifacts.len(), 10);
+
+        let arch_content = ArtifactManager::read_artifact(dir.path(), "design/architecture.md")
+            .unwrap()
+            .unwrap();
+        assert!(arch_content.contains("```text\n.\n├── package.json\n└── src/\n```"));
+
+        let test_content =
+            ArtifactManager::read_artifact(dir.path(), "implementation/test-plan.md")
+                .unwrap()
+                .unwrap();
+        assert!(test_content.contains("```bash\ncargo test --all\nnpm test\n```"));
+    }
+
+    #[test]
+    fn test_unclosed_outer_fence_fails_parse() {
+        let (_dir, _db, pid) = setup_test_project();
+        let unclosed = format!(
+            r#"```yaml
+coalition_response:
+  schema: 1
+  project_id: "{}"
+  packet_id: "pkt-1"
+  response_type: "ARCHITECT_UPDATE"
+  summary: "Truncated response"
+  artifacts:
+    - path: "design/architecture.md"
+      action: "CREATE"
+      content: |
+        ## Layout
+        ```text
+        .
+"#,
+            pid
+        );
+
+        let err = RelayParser::parse_response(&unclosed, &pid, None).unwrap_err();
+        match err {
+            RelayError::ParseError(msg) => {
+                assert!(msg.contains("never legitimately closed"));
+            }
+            other => panic!("Expected ParseError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stage3_acceptance_nested_fence_eight_artifacts_fixture() {
+        let (dir, mut db, pid) = setup_test_project();
+
+        // 1. Ensure Product Vision exists with substantive markdown
+        ArtifactManager::write_artifact_atomic(
+            dir.path(),
+            "design/product-vision.md",
+            "# Product Vision\nCoalition is a local-first desktop control plane for governed AI-assisted software development.",
+        )
+        .unwrap();
+
+        // Prepare packet
+        let pkt =
+            RelayService::prepare_architect_packet(db.connection_mut(), dir.path(), &pid, None)
+                .unwrap();
+
+        // 8 remaining required artifacts with nested fences in Architecture and Test Plan
+        let response_text = format!(
+            r#"```yaml
+coalition_response:
+  schema: 1
+  project_id: "{}"
+  packet_id: "{}"
+  response_type: "ARCHITECT_UPDATE"
+  summary: "Propose 8 remaining required artifacts to reach readiness"
+  artifacts:
+    - path: "design/requirements.md"
+      action: "CREATE"
+      content: |
+        # Requirements
+        REQ-1: Machine-side authoritative state management in Rust.
+        REQ-2: Human-mediated relay to ChatGPT without direct DOM scraping.
+    - path: "design/architecture.md"
+      action: "CREATE"
+      content: |
+        # System Architecture
+        ## Repository Layout
+
+        ```text
+        .
+        ├── package.json
+        ├── src/
+        └── src-tauri/
+        ```
+        Substantive layered architecture description following Coalition Master Plan.
+    - path: "design/constraints.md"
+      action: "CREATE"
+      content: |
+        # Constraints
+        Zero cloud API dependencies in V1. Local SQLite operational state with Git-backed truth.
+    - path: "design/interfaces.md"
+      action: "CREATE"
+      content: |
+        # Interfaces & Protocols
+        Typed Tauri IPC commands and serialization envelopes between Rust backend and React frontend.
+    - path: "design/security.md"
+      action: "CREATE"
+      content: |
+        # Security & Boundaries
+        Least privilege process management, explicit human review of high risk operations, and Icarus mode indication.
+    - path: "implementation/implementation-plan.md"
+      action: "CREATE"
+      content: |
+        # Implementation Plan
+        Sequential phased execution with automated verification gates and human acceptance checkpoints.
+    - path: "implementation/acceptance-criteria.yaml"
+      action: "CREATE"
+      content: |
+        criteria:
+          - id: AC-01
+            description: Relay parser handles nested Markdown fences without premature truncation
+            status: PASSED
+          - id: AC-02
+            description: Full set of 8 artifacts parsed and accepted successfully
+            status: PASSED
+    - path: "implementation/test-plan.md"
+      action: "CREATE"
+      content: |
+        # Test Plan
+        Execute automated regression suite:
+        ```bash
+        cargo test
+        npm test -- --run
+        npm run build
+        ```
+        Validate all 9 required artifacts reach substantive readiness.
+  open_questions: []
+```"#,
+            pid, pkt.metadata.packet_id
+        );
+
+        // 2. Preview must show exactly 8 new artifacts
+        let preview =
+            RelayService::process_import(db.connection(), dir.path(), &pid, &response_text)
+                .unwrap();
+        assert_eq!(preview.artifacts.len(), 8);
+        for art in &preview.artifacts {
+            assert_eq!(art.status, ArtifactDiffStatus::New);
+            assert_eq!(art.action, ArtifactAction::Create);
+        }
+        assert_eq!(preview.open_questions.len(), 0);
+
+        // 3. Accept import
+        let report =
+            RelayService::accept_import(db.connection(), dir.path(), &pid, &preview.import_id)
+                .unwrap();
+
+        // 4. Acceptance must result in READY_TO_FREEZE (9/9)
+        assert_eq!(report.overall_readiness, OverallReadiness::ReadyToFreeze);
+        assert_eq!(report.ready_required_count, 9);
+        assert_eq!(report.total_required_count, 9);
+        assert!(!report.has_open_questions);
+
+        // Verify workflow_state transitioned to READY_TO_FREEZE
+        let state_str: String = db
+            .connection()
+            .query_row(
+                "SELECT state FROM workflow_state WHERE project_id = ?1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_str, "READY_TO_FREEZE");
     }
 }

@@ -103,4 +103,63 @@ describe('Coalition Phase 0 Diagnostics App', () => {
     expect(matches).not.toBeNull();
     expect(matches?.length).toBe(1);
   });
+
+  it('defaults appearance to System and applies data-theme immediately', async () => {
+    localStorage.clear();
+    await act(async () => {
+      render(<App />);
+    });
+
+    const select = screen.getByLabelText('Appearance Theme') as HTMLSelectElement;
+    expect(select.value).toBe('system');
+    expect(document.documentElement.getAttribute('data-theme')).toBe('system');
+    expect(localStorage.getItem('coalition:appearance')).toBe('system');
+  });
+
+  it('switches appearance between System, Dark, and Light with persistence', async () => {
+    localStorage.clear();
+    const { fireEvent } = await import('@testing-library/react');
+
+    await act(async () => {
+      render(<App />);
+    });
+
+    const select = screen.getByLabelText('Appearance Theme') as HTMLSelectElement;
+
+    // Switch to Dark
+    await act(async () => {
+      fireEvent.change(select, { target: { value: 'dark' } });
+    });
+    expect(select.value).toBe('dark');
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark');
+    expect(localStorage.getItem('coalition:appearance')).toBe('dark');
+
+    // Switch to Light
+    await act(async () => {
+      fireEvent.change(select, { target: { value: 'light' } });
+    });
+    expect(select.value).toBe('light');
+    expect(document.documentElement.getAttribute('data-theme')).toBe('light');
+    expect(localStorage.getItem('coalition:appearance')).toBe('light');
+
+    // Switch back to System
+    await act(async () => {
+      fireEvent.change(select, { target: { value: 'system' } });
+    });
+    expect(select.value).toBe('system');
+    expect(document.documentElement.getAttribute('data-theme')).toBe('system');
+    expect(localStorage.getItem('coalition:appearance')).toBe('system');
+  });
+
+  it('restores persisted appearance preference on initial load', async () => {
+    localStorage.setItem('coalition:appearance', 'dark');
+
+    await act(async () => {
+      render(<App />);
+    });
+
+    const select = screen.getByLabelText('Appearance Theme') as HTMLSelectElement;
+    expect(select.value).toBe('dark');
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark');
+  });
 });

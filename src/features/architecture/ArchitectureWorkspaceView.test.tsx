@@ -539,11 +539,85 @@ describe('ArchitectureWorkspaceView', () => {
 
     expect(mockInvoke).toHaveBeenCalledWith('save_artifact_content', {
       projectId: 'test-proj-1',
-      path: 'design/product-vision.md',
+      artifactPath: 'design/product-vision.md',
       content: '# Vision\nManually updated substantive content.',
       expectedFingerprint: 'fp-12345',
     });
     expect(onRefreshMock).toHaveBeenCalled();
+  });
+
+  it('regression: save_artifact_content payload uses artifactPath instead of path', async () => {
+    let capturedArgs: unknown = null;
+    mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === 'get_architecture_workspace_state') return mockInitialWorkspace;
+      if (cmd === 'get_artifact_content') {
+        return {
+          path: 'design/architecture.md',
+          content: 'Architecture initial content',
+          fingerprint: 'fp-arch-99',
+          exists: true,
+        };
+      }
+      if (cmd === 'save_artifact_content') {
+        capturedArgs = args;
+        return {
+          overall_readiness: 'READY_TO_FREEZE',
+          ready_required_count: 9,
+          total_required_count: 9,
+          artifacts: [],
+          has_open_questions: false,
+        };
+      }
+      return {};
+    });
+
+    await act(async () => {
+      render(
+        <ArchitectureWorkspaceView
+          projectId="proj-reg-123"
+          projectName="Regression Project"
+          workflowState="ARCHITECTING"
+          onRefreshProject={onRefreshMock}
+        />
+      );
+    });
+
+    const archCard = screen.getByText('System Architecture');
+    await act(async () => {
+      fireEvent.click(archCard);
+    });
+
+    const editBtn = screen.getByRole('button', { name: 'Edit' });
+    await act(async () => {
+      fireEvent.click(editBtn);
+    });
+
+    const editor = screen.getByLabelText('Artifact Content Editor');
+    await act(async () => {
+      fireEvent.change(editor, {
+        target: { value: 'Rust and React updated architecture content' },
+      });
+    });
+
+    const saveBtn = screen.getByRole('button', { name: 'Save' });
+    await act(async () => {
+      fireEvent.click(saveBtn);
+    });
+
+    expect(mockInvoke).toHaveBeenCalledWith('save_artifact_content', {
+      projectId: 'proj-reg-123',
+      artifactPath: 'design/architecture.md',
+      content: 'Rust and React updated architecture content',
+      expectedFingerprint: 'fp-arch-99',
+    });
+
+    expect(capturedArgs).toEqual({
+      projectId: 'proj-reg-123',
+      artifactPath: 'design/architecture.md',
+      content: 'Rust and React updated architecture content',
+      expectedFingerprint: 'fp-arch-99',
+    });
+    expect(capturedArgs).not.toHaveProperty('path');
   });
 
   it('displays conflict error when saving stale artifact content', async () => {
@@ -863,5 +937,107 @@ describe('ArchitectureWorkspaceView', () => {
     expect(screen.getByText(/Builder Implementation Packet \(v1\.0\)/)).toBeInTheDocument();
     expect(screen.getByText('High level system summary')).toBeInTheDocument();
     expect(screen.getByText('Strict rules for the builder')).toBeInTheDocument();
+  });
+
+  it('renders compact summary above import preview', async () => {
+    const previewWorkspace: WorkspaceState = {
+      ...mockInitialWorkspace,
+      pending_preview: {
+        import_id: 'imp-compact-1',
+        project_id: 'test-proj-1',
+        packet_id: 'pkt-1',
+        summary: 'Propose new changes',
+        artifacts: [
+          {
+            path: 'design/architecture.md',
+            title: 'System Architecture',
+            action: 'CREATE',
+            status: 'NEW',
+            current_content: null,
+            proposed_content: '# Arch',
+            baseline_fingerprint: null,
+            baseline_exists: false,
+          },
+          {
+            path: 'design/constraints.md',
+            title: 'Constraints',
+            action: 'CREATE',
+            status: 'NEW',
+            current_content: null,
+            proposed_content: '# Constraints',
+            baseline_fingerprint: null,
+            baseline_exists: false,
+          },
+        ],
+        open_questions: [],
+        raw_response: 'raw...',
+      },
+    };
+
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_architecture_workspace_state') return previewWorkspace;
+      return {};
+    });
+
+    await act(async () => {
+      render(
+        <ArchitectureWorkspaceView
+          projectId="test-proj-1"
+          projectName="Alpha Project"
+          workflowState="ARCHITECTING"
+          onRefreshProject={onRefreshMock}
+        />
+      );
+    });
+
+    expect(screen.getByText('2 artifact changes • 0 open questions')).toBeInTheDocument();
+    expect(screen.getByText('Proposed Architecture Changes')).toBeInTheDocument();
+  });
+
+  it('disables artifact editing and displays guidance in DRAFT workflow state', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_architecture_workspace_state') return mockInitialWorkspace;
+      if (cmd === 'get_artifact_content') {
+        return {
+          path: 'design/product-vision.md',
+          content: '# Vision\nExisting draft vision',
+          fingerprint: 'fp-draft-1',
+          exists: true,
+        };
+      }
+      return {};
+    });
+
+    await act(async () => {
+      render(
+        <ArchitectureWorkspaceView
+          projectId="test-proj-1"
+          projectName="Alpha Project"
+          workflowState="DRAFT"
+          onRefreshProject={onRefreshMock}
+        />
+      );
+    });
+
+    // In DRAFT mode, cards show "View ↗"
+    expect(screen.getAllByText('View ↗').length).toBeGreaterThan(0);
+
+    const visionCard = screen.getByText('Product Vision');
+    await act(async () => {
+      fireEvent.click(visionCard);
+    });
+
+    // Modal opens, Edit button is disabled with guidance tooltip
+    const editBtn = screen.getByRole('button', { name: 'Edit' });
+    expect(editBtn).toBeDisabled();
+    expect(editBtn).toHaveAttribute(
+      'title',
+      'Prepare Architect Prompt to begin architecting'
+    );
+
+    // Guidance banner is visible
+    expect(
+      screen.getByText('Prepare Architect Prompt to begin architecting')
+    ).toBeInTheDocument();
   });
 });

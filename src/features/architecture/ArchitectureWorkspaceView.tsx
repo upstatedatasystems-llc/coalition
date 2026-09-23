@@ -243,7 +243,7 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
     try {
       await invoke<ReadinessReport>('save_artifact_content', {
         projectId,
-        path: viewingArtifact.path,
+        artifactPath: viewingArtifact.path,
         content: viewingArtifact.editedContent,
         expectedFingerprint: viewingArtifact.fingerprint,
       });
@@ -630,6 +630,12 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
             <div className="import-preview-card" role="region" aria-label="Proposed Changes Preview">
               <div className="preview-header">
                 <h3>Proposed Architecture Changes</h3>
+                <div className="preview-compact-summary">
+                  {workspace.pending_preview.artifacts.length}{' '}
+                  {workspace.pending_preview.artifacts.length === 1 ? 'artifact change' : 'artifact changes'}{' '}
+                  • {workspace.pending_preview.open_questions.length}{' '}
+                  {workspace.pending_preview.open_questions.length === 1 ? 'open question' : 'open questions'}
+                </div>
                 <span className="preview-summary-text">{workspace.pending_preview.summary}</span>
               </div>
 
@@ -826,7 +832,7 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
                     <span className="char-count">
                       {isMissing ? 'Missing' : `${art.character_count} chars`}
                     </span>
-                    <span className="view-link">View / Edit ↗</span>
+                    <span className="view-link">{workflowState === 'DRAFT' ? 'View ↗' : 'View / Edit ↗'}</span>
                   </div>
                 </div>
               );
@@ -850,6 +856,12 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
                 {!viewingArtifact.isEditing ? (
                   <button
                     className="secondary-btn edit-artifact-btn"
+                    disabled={workflowState === 'DRAFT'}
+                    title={
+                      workflowState === 'DRAFT'
+                        ? 'Prepare Architect Prompt to begin architecting'
+                        : 'Edit'
+                    }
                     onClick={() =>
                       setViewingArtifact({
                         ...viewingArtifact,
@@ -895,6 +907,12 @@ export const ArchitectureWorkspaceView: React.FC<ArchitectureWorkspaceViewProps>
                 </button>
               </div>
             </div>
+
+            {workflowState === 'DRAFT' && (
+              <div className="draft-guidance-banner" role="note">
+                Prepare Architect Prompt to begin architecting
+              </div>
+            )}
 
             {viewingArtifact.saveError && (
               <div className="artifact-edit-error-banner" role="alert">

@@ -13,6 +13,9 @@ import { OpenProjectModal } from './features/projects/OpenProjectModal';
 import { DiagnosticsView } from './features/diagnostics/DiagnosticsView';
 import './App.css';
 
+export type ThemePreference = 'system' | 'light' | 'dark';
+const THEME_STORAGE_KEY = 'coalition:appearance';
+
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'projects' | 'diagnostics'>('projects');
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -20,12 +23,34 @@ export const App: React.FC = () => {
   const [projectDetails, setProjectDetails] = useState<ProjectDetails | null>(null);
   const [projectActivity, setProjectActivity] = useState<ActivityEventRecord[]>([]);
 
+  const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
+    try {
+      const stored = localStorage.getItem(THEME_STORAGE_KEY);
+      if (stored === 'light' || stored === 'dark' || stored === 'system') {
+        return stored;
+      }
+    } catch {
+      // Ignore storage errors in restricted contexts
+    }
+    return 'system';
+  });
+
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalError, setModalError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [globalError, setGlobalError] = useState<CommandError | null>(null);
   const [relayToast, setRelayToast] = useState<string | null>(null);
+
+  // Sync theme with document element and persistence
+  useEffect(() => {
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, themePreference);
+    } catch {
+      // Ignore storage errors
+    }
+    document.documentElement.setAttribute('data-theme', themePreference);
+  }, [themePreference]);
 
   // On mount: load projects and restore last-opened project if possible
   useEffect(() => {
@@ -233,20 +258,36 @@ export const App: React.FC = () => {
           <span className="app-logo">COALITION</span>
           <span className="app-tagline">Governed AI Software Development</span>
         </div>
-        <nav className="app-nav">
-          <button
-            className={`nav-btn ${activeTab === 'projects' ? 'active' : ''}`}
-            onClick={() => setActiveTab('projects')}
-          >
-            Projects
-          </button>
-          <button
-            className={`nav-btn ${activeTab === 'diagnostics' ? 'active' : ''}`}
-            onClick={() => setActiveTab('diagnostics')}
-          >
-            Diagnostics
-          </button>
-        </nav>
+        <div className="app-header-controls">
+          <div className="theme-toggle-group">
+            <label htmlFor="theme-select" className="theme-select-label">Theme:</label>
+            <select
+              id="theme-select"
+              aria-label="Appearance Theme"
+              className="theme-select"
+              value={themePreference}
+              onChange={(e) => setThemePreference(e.target.value as ThemePreference)}
+            >
+              <option value="system">System</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </div>
+          <nav className="app-nav">
+            <button
+              className={`nav-btn ${activeTab === 'projects' ? 'active' : ''}`}
+              onClick={() => setActiveTab('projects')}
+            >
+              Projects
+            </button>
+            <button
+              className={`nav-btn ${activeTab === 'diagnostics' ? 'active' : ''}`}
+              onClick={() => setActiveTab('diagnostics')}
+            >
+              Diagnostics
+            </button>
+          </nav>
+        </div>
       </header>
 
       {globalError && (
