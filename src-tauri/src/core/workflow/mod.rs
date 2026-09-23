@@ -202,9 +202,10 @@ pub fn compute_transition(
         }
 
         // Review Correction loop
-        (WorkflowState::WaitingForReview, WorkflowAction::RequestCorrections) => {
-            Ok((WorkflowState::CorrectionsRequired, None))
-        }
+        (
+            WorkflowState::WaitingForReview | WorkflowState::Validating,
+            WorkflowAction::RequestCorrections,
+        ) => Ok((WorkflowState::CorrectionsRequired, None)),
         (WorkflowState::CorrectionsRequired, WorkflowAction::StartBuild) => {
             Ok((WorkflowState::Building, None))
         }
@@ -275,6 +276,7 @@ pub fn compute_transition(
         (
             WorkflowState::Building
             | WorkflowState::Validating
+            | WorkflowState::WaitingForReview
             | WorkflowState::CorrectionsRequired,
             WorkflowAction::Block,
         ) => Ok((WorkflowState::Blocked, Some(current))),

@@ -3,6 +3,7 @@ import { ProjectDetails, ActivityEventRecord } from '../../types';
 import { ActivityLogView } from '../activity/ActivityLogView';
 import { ArchitectureWorkspaceView } from '../architecture/ArchitectureWorkspaceView';
 import { BuilderControlPlaneView } from '../builder/BuilderControlPlaneView';
+import { ValidationView } from '../validation/ValidationView';
 
 interface ProjectDetailViewProps {
   details: ProjectDetails;
@@ -20,7 +21,9 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
   isRefreshing,
 }) => {
   const { project, workflow_state, artifact, git, is_available } = details;
-  const [activeSubTab, setActiveSubTab] = useState<'workspace' | 'builder' | 'overview'>('workspace');
+  const [activeSubTab, setActiveSubTab] = useState<
+    'workspace' | 'builder' | 'validation' | 'overview'
+  >('workspace');
 
   React.useEffect(() => {
     const handleRelayImported = () => {
@@ -55,6 +58,14 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
             data-testid="builder-subtab-btn"
           >
             Builder Control Plane
+          </button>
+          <button
+            className={`subtab-btn ${activeSubTab === 'validation' ? 'active' : ''}`}
+            onClick={() => setActiveSubTab('validation')}
+            disabled={!is_available}
+            data-testid="validation-subtab-btn"
+          >
+            Validation
           </button>
           <button
             className={`subtab-btn ${activeSubTab === 'overview' ? 'active' : ''}`}
@@ -103,6 +114,15 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
 
       {is_available && activeSubTab === 'builder' && (
         <BuilderControlPlaneView
+          projectId={project.project_id}
+          projectName={project.name}
+          workflowState={workflow_state.state}
+          onRefreshProject={onRefresh}
+        />
+      )}
+
+      {is_available && activeSubTab === 'validation' && (
+        <ValidationView
           projectId={project.project_id}
           projectName={project.name}
           workflowState={workflow_state.state}

@@ -28,6 +28,9 @@ pub fn run() {
                 let mut d = DbManager::open(db_path).expect("Failed to open operational database");
                 d.run_migrations().expect("Failed to run migrations");
                 let _ = d.reconcile_orphaned_sessions();
+                let _ = crate::core::validation::ValidationService::reconcile_interrupted_runs(
+                    d.connection_mut(),
+                );
                 d
             };
 
@@ -38,6 +41,9 @@ pub fn run() {
                 active_project_id: Mutex::new(None),
                 active_builder_registry: Arc::new(Mutex::new(
                     crate::core::builder::ActiveBuilderRegistry::new(),
+                )),
+                active_validation_registry: Arc::new(Mutex::new(
+                    crate::core::validation::ActiveValidationRegistry::new(),
                 )),
             };
 
@@ -123,6 +129,16 @@ pub fn run() {
             commands::restore_all_drifted_artifacts,
             commands::get_builder_packet,
             commands::export_project_diagnostics,
+            commands::get_validation_config,
+            commands::start_validation_run,
+            commands::stop_validation_command,
+            commands::stop_validation_run,
+            commands::get_active_validation_run,
+            commands::get_validation_history,
+            commands::get_validation_run_details,
+            commands::get_validation_run_commands,
+            commands::override_validation_gate,
+            commands::submit_for_review,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

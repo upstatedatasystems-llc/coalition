@@ -71,9 +71,27 @@ pub async fn terminate_process_tree(pid: u32) {
         .await;
 }
 
+#[cfg(target_os = "windows")]
+pub async fn request_process_graceful_stop(pid: u32) {
+    // Windows taskkill without /F requests graceful termination
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string()])
+        .output()
+        .await;
+}
+
 #[cfg(not(target_os = "windows"))]
-pub async fn terminate_process_tree(_pid: u32) {
-    // Unix fallback
+pub async fn terminate_process_tree(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub async fn request_process_graceful_stop(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
 }
 
 pub struct ProcessRunner;
@@ -88,7 +106,49 @@ impl ProcessRunner {
         cancel_flag: Arc<AtomicBool>,
         event_sender: Option<mpsc::Sender<ProcessOutputLine>>,
     ) -> Result<ProcessResult, ProcessError> {
+        Self::run_turn_stream_advanced(
+            program,
+            args,
+            cwd,
+            stdin_payload,
+            timeout_duration,
+            cancel_flag,
+            event_sender,
+            None,
+            Duration::from_millis(1500),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_turn_stream_advanced(
+        program: &Path,
+        args: &[String],
+        cwd: Option<&Path>,
+        stdin_payload: Option<&str>,
+        timeout_duration: Duration,
+        cancel_flag: Arc<AtomicBool>,
+        event_sender: Option<mpsc::Sender<ProcessOutputLine>>,
+        disk_log_path: Option<&Path>,
+        grace_period: Duration,
+    ) -> Result<ProcessResult, ProcessError> {
         let start_time = tokio::time::Instant::now();
+
+        // If disk logging is requested, open file asynchronously
+        let mut disk_file: Option<tokio::fs::File> = if let Some(path) = disk_log_path {
+            if let Some(parent) = path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open(path)
+                .await
+                .ok()
+        } else {
+            None
+        };
 
         let mut cmd = Command::new(program);
         cmd.args(args);
@@ -139,13 +199,19 @@ impl ProcessRunner {
         let mut exit_status = None;
 
         loop {
-            // Check cancellation flag
+            // Check cancellation flag with two-phase graceful-first policy
             if cancel_flag.load(Ordering::Relaxed) {
                 was_canceled = true;
                 if let Some(pid) = child.id() {
-                    terminate_process_tree(pid).await;
+                    request_process_graceful_stop(pid).await;
+                    let wait_grace = tokio::time::timeout(grace_period, child.wait()).await;
+                    if wait_grace.is_err() {
+                        terminate_process_tree(pid).await;
+                        let _ = child.kill().await;
+                    }
+                } else {
+                    let _ = child.kill().await;
                 }
-                let _ = child.kill().await;
                 break;
             }
 
@@ -169,6 +235,11 @@ impl ProcessRunner {
                                 line,
                                 timestamp_ms: chrono::Utc::now().timestamp_millis(),
                             };
+                            if let Some(ref mut f) = disk_file {
+                                let line_data = format!("[{}] [OUT] {}\n", out.timestamp_ms, out.line);
+                                let _ = f.write_all(line_data.as_bytes()).await;
+                                let _ = f.flush().await;
+                            }
                             if let Some(tx) = &event_sender {
                                 let _ = tx.send(out.clone()).await;
                             }
@@ -199,6 +270,11 @@ impl ProcessRunner {
                                 line,
                                 timestamp_ms: chrono::Utc::now().timestamp_millis(),
                             };
+                            if let Some(ref mut f) = disk_file {
+                                let line_data = format!("[{}] [ERR] {}\n", out.timestamp_ms, out.line);
+                                let _ = f.write_all(line_data.as_bytes()).await;
+                                let _ = f.flush().await;
+                            }
                             if let Some(tx) = &event_sender {
                                 let _ = tx.send(out.clone()).await;
                             }
@@ -232,6 +308,11 @@ impl ProcessRunner {
                                     line,
                                     timestamp_ms: chrono::Utc::now().timestamp_millis(),
                                 };
+                                if let Some(ref mut f) = disk_file {
+                                    let line_data = format!("[{}] [OUT] {}\n", out.timestamp_ms, out.line);
+                                    let _ = f.write_all(line_data.as_bytes()).await;
+                                    let _ = f.flush().await;
+                                }
                                 if let Some(tx) = &event_sender {
                                     let _ = tx.send(out.clone()).await;
                                 }
@@ -251,6 +332,11 @@ impl ProcessRunner {
                                     line,
                                     timestamp_ms: chrono::Utc::now().timestamp_millis(),
                                 };
+                                if let Some(ref mut f) = disk_file {
+                                    let line_data = format!("[{}] [ERR] {}\n", out.timestamp_ms, out.line);
+                                    let _ = f.write_all(line_data.as_bytes()).await;
+                                    let _ = f.flush().await;
+                                }
                                 if let Some(tx) = &event_sender {
                                     let _ = tx.send(out.clone()).await;
                                 }
@@ -270,6 +356,10 @@ impl ProcessRunner {
                 }
                 _ = tokio::time::sleep(poll_interval) => {}
             }
+        }
+
+        if let Some(ref mut f) = disk_file {
+            let _ = f.flush().await;
         }
 
         let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -638,5 +728,89 @@ mod tests {
         let stdout_str = String::from_utf8_lossy(&out.stdout);
         assert!(stdout_str.contains("sync-bounded-ok"));
         assert!(out.stdout.len() <= MAX_ACCUMULATED_BYTES);
+    }
+
+    #[tokio::test]
+    async fn test_process_runner_disk_streaming() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let temp_dir = tempfile::tempdir().unwrap();
+        let log_file = temp_dir.path().join("sub").join("output.log");
+
+        #[cfg(target_os = "windows")]
+        let (cmd, args) = (
+            "cmd.exe",
+            vec![
+                "/C".to_string(),
+                "echo disk-streaming-line-1& echo disk-streaming-line-2".to_string(),
+            ],
+        );
+        #[cfg(not(target_os = "windows"))]
+        let (cmd, args) = (
+            "sh",
+            vec![
+                "-c".to_string(),
+                "echo disk-streaming-line-1; echo disk-streaming-line-2".to_string(),
+            ],
+        );
+
+        let result = ProcessRunner::run_turn_stream_advanced(
+            Path::new(cmd),
+            &args,
+            None,
+            None,
+            Duration::from_secs(5),
+            cancel,
+            None,
+            Some(&log_file),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("run turn stream advanced with disk log");
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(log_file.exists());
+        let log_contents = std::fs::read_to_string(&log_file).expect("read disk log");
+        assert!(log_contents.contains("disk-streaming-line-1"));
+        assert!(log_contents.contains("disk-streaming-line-2"));
+        assert!(log_contents.contains("[OUT]"));
+    }
+
+    #[tokio::test]
+    async fn test_process_runner_graceful_cancellation() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = cancel.clone();
+
+        #[cfg(target_os = "windows")]
+        let (cmd, args) = (
+            "powershell.exe",
+            vec![
+                "-Command".to_string(),
+                "Start-Sleep -Seconds 10".to_string(),
+            ],
+        );
+        #[cfg(not(target_os = "windows"))]
+        let (cmd, args) = ("sleep", vec!["10".to_string()]);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            cancel_clone.store(true, Ordering::Relaxed);
+        });
+
+        let result = ProcessRunner::run_turn_stream_advanced(
+            Path::new(cmd),
+            &args,
+            None,
+            None,
+            Duration::from_secs(5),
+            cancel,
+            None,
+            None,
+            Duration::from_millis(300),
+        )
+        .await
+        .expect("run process");
+
+        assert!(result.canceled);
+        assert!(result.duration_ms < 5000);
     }
 }

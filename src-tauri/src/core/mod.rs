@@ -7,4 +7,5 @@ pub mod git;
 pub mod process;
 pub mod projects;
 pub mod relay;
+pub mod validation;
 pub mod workflow;

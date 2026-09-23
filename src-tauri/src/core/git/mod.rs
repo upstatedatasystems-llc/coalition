@@ -290,6 +290,8 @@ impl GitAdapter {
                     let norm = path.trim().trim_matches('"').replace('\\', "/");
                     !norm.starts_with(".coalition/architecture-versions")
                         && !norm.starts_with(".coalition/recovery")
+                        && !norm.starts_with(".coalition/evidence")
+                        && !norm.starts_with(".coalition/reviews")
                         && !norm.contains(".staging-")
                 } else {
                     true
@@ -300,8 +302,20 @@ impl GitAdapter {
 
         let counts = Self::parse_porcelain_status(&filtered_porcelain);
 
-        // 2. Unstaged diff hash
-        let unstaged_diff = self.run_git_cmd(&["diff", "--no-ext-diff"], Some(dir))?;
+        // 2. Unstaged diff hash (excluding Coalition-generated evidence/reviews/recovery)
+        let unstaged_diff = self.run_git_cmd(
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--",
+                ".",
+                ":(exclude).coalition/architecture-versions",
+                ":(exclude).coalition/recovery",
+                ":(exclude).coalition/evidence",
+                ":(exclude).coalition/reviews",
+            ],
+            Some(dir),
+        )?;
 
         if !unstaged_diff.status.success() {
             let stderr = String::from_utf8_lossy(&unstaged_diff.stderr);
@@ -316,8 +330,21 @@ impl GitAdapter {
         hasher.update(&unstaged_diff.stdout);
         let unstaged_diff_hash = format!("{:x}", hasher.finalize());
 
-        // 3. Staged / cached diff hash
-        let staged_diff = self.run_git_cmd(&["diff", "--cached", "--no-ext-diff"], Some(dir))?;
+        // 3. Staged / cached diff hash (excluding Coalition-generated evidence/reviews/recovery)
+        let staged_diff = self.run_git_cmd(
+            &[
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--",
+                ".",
+                ":(exclude).coalition/architecture-versions",
+                ":(exclude).coalition/recovery",
+                ":(exclude).coalition/evidence",
+                ":(exclude).coalition/reviews",
+            ],
+            Some(dir),
+        )?;
 
         if !staged_diff.status.success() {
             let stderr = String::from_utf8_lossy(&staged_diff.stderr);
@@ -395,6 +422,17 @@ impl GitAdapter {
             untracked_fingerprint,
             composite_fingerprint,
         })
+    }
+
+    /// Computes the stable implementation fingerprint for the repository.
+    /// Excludes .coalition/evidence, .coalition/reviews, .coalition/architecture-versions, and .coalition/recovery
+    /// so Coalition's own generated evidence or review artifacts never invalidate the code state they describe.
+    pub fn compute_implementation_fingerprint<P: AsRef<Path>>(
+        &self,
+        working_dir: P,
+    ) -> Result<String, GitError> {
+        let dirty_state = self.compute_detailed_dirty_state(working_dir)?;
+        Ok(dirty_state.composite_fingerprint)
     }
 }
 
@@ -693,6 +731,83 @@ mod tests {
         assert!(
             res.is_err(),
             "compute_detailed_dirty_state on non-repo must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_coalition_evidence_and_reviews_do_not_affect_implementation_fingerprint() {
+        let adapter = GitAdapter::new().unwrap();
+        let dir = tempdir().unwrap();
+        let repo_path = dir.path();
+
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        fs::write(repo_path.join("committed.txt"), "v1").unwrap();
+        Command::new("git")
+            .args(["add", "committed.txt"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        // Baseline fingerprint before any evidence or reviews exist
+        let base_fp = adapter
+            .compute_implementation_fingerprint(repo_path)
+            .unwrap();
+        assert_eq!(base_fp, "CLEAN");
+
+        // Write validation evidence into .coalition/evidence/validation-1/
+        let evidence_dir = repo_path
+            .join(".coalition")
+            .join("evidence")
+            .join("validation-1");
+        fs::create_dir_all(&evidence_dir).unwrap();
+        fs::write(
+            evidence_dir.join("summary.yaml"),
+            "run_id: val-1\nstatus: PASS\n",
+        )
+        .unwrap();
+
+        // Write review cycle artifact into .coalition/reviews/cycle-1/
+        let review_dir = repo_path.join(".coalition").join("reviews").join("cycle-1");
+        fs::create_dir_all(&review_dir).unwrap();
+        fs::write(review_dir.join("verdict.yaml"), "verdict: ACCEPT\n").unwrap();
+
+        // The fingerprint MUST remain completely unchanged!
+        let post_evidence_fp = adapter
+            .compute_implementation_fingerprint(repo_path)
+            .unwrap();
+        assert_eq!(
+            base_fp, post_evidence_fp,
+            "Writing Coalition evidence or review artifacts must never invalidate the implementation fingerprint"
+        );
+
+        // However, modifying a real source file MUST change the fingerprint
+        fs::write(repo_path.join("committed.txt"), "v2").unwrap();
+        let modified_fp = adapter
+            .compute_implementation_fingerprint(repo_path)
+            .unwrap();
+        assert_ne!(
+            base_fp, modified_fp,
+            "Modifying source code must change the implementation fingerprint"
         );
     }
 }

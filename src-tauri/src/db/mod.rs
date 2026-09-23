@@ -331,6 +331,57 @@ impl DbManager {
                 ALTER TABLE chatgpt_usage_records ADD COLUMN chars_per_token REAL NOT NULL DEFAULT 4.0;
                 UPDATE builder_sessions SET status = 'SUCCESS' WHERE status = 'COMPLETED';",
             ),
+            (
+                10,
+                "010_stage4_validation_engine",
+                "CREATE TABLE IF NOT EXISTS validation_runs (
+                    run_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    architecture_version TEXT NOT NULL,
+                    epoch_id TEXT,
+                    trigger_source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    is_gate_passed INTEGER NOT NULL DEFAULT 0,
+                    has_override INTEGER NOT NULL DEFAULT 0,
+                    git_head TEXT,
+                    git_dirty_fingerprint TEXT,
+                    config_fingerprint TEXT,
+                    log_path TEXT,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    duration_ms INTEGER DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_validation_runs_proj ON validation_runs(project_id, started_at);
+
+                CREATE TABLE IF NOT EXISTS validation_commands (
+                    execution_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES validation_runs(run_id) ON DELETE CASCADE,
+                    command_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    command_str TEXT NOT NULL,
+                    working_dir TEXT,
+                    required INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL,
+                    exit_code INTEGER,
+                    duration_ms INTEGER DEFAULT 0,
+                    is_truncated INTEGER NOT NULL DEFAULT 0,
+                    log_path TEXT,
+                    started_at TEXT,
+                    completed_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_validation_commands_run ON validation_commands(run_id);
+
+                CREATE TABLE IF NOT EXISTS validation_gate_overrides (
+                    override_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    run_id TEXT NOT NULL REFERENCES validation_runs(run_id) ON DELETE CASCADE,
+                    git_fingerprint TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    authorized_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_validation_overrides_proj ON validation_gate_overrides(project_id, run_id);",
+            ),
         ];
 
         let mut applied = Vec::new();
@@ -1045,6 +1096,60 @@ impl DbManager {
         )?;
         Ok(rows > 0)
     }
+
+    pub fn insert_validation_run(
+        &self,
+        record: &crate::core::validation::ValidationRunRecord,
+    ) -> Result<(), DbError> {
+        crate::core::validation::insert_validation_run(&self.conn, record)
+            .map_err(|e| DbError::Migration(e.to_string()))
+    }
+
+    pub fn update_validation_run(
+        &self,
+        record: &crate::core::validation::ValidationRunRecord,
+    ) -> Result<(), DbError> {
+        crate::core::validation::update_validation_run(&self.conn, record)
+            .map_err(|e| DbError::Migration(e.to_string()))
+    }
+
+    pub fn get_validation_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::core::validation::ValidationRunRecord>, DbError> {
+        crate::core::validation::get_validation_run(&self.conn, run_id)
+            .map_err(|e| DbError::Migration(e.to_string()))
+    }
+
+    pub fn get_latest_validation_run(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<crate::core::validation::ValidationRunRecord>, DbError> {
+        crate::core::validation::get_latest_validation_run(&self.conn, project_id)
+            .map_err(|e| DbError::Migration(e.to_string()))
+    }
+
+    pub fn list_validation_runs(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::core::validation::ValidationRunRecord>, DbError> {
+        crate::core::validation::list_validation_runs_for_project(&self.conn, project_id, limit)
+            .map_err(|e| DbError::Migration(e.to_string()))
+    }
+
+    pub fn insert_validation_override(
+        &self,
+        record: &crate::core::validation::ValidationGateOverrideRecord,
+    ) -> Result<(), DbError> {
+        crate::core::validation::insert_validation_override(&self.conn, record)
+            .map_err(|e| DbError::Migration(e.to_string()))
+    }
+
+    pub fn reconcile_interrupted_validation_runs(&mut self) -> Result<usize, DbError> {
+        crate::core::validation::ValidationService::reconcile_interrupted_runs(&mut self.conn)
+            .map_err(|e| DbError::Migration(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -1055,7 +1160,7 @@ mod tests {
     fn test_sqlite_in_memory_migrations_and_proof() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let result = db.run_proof().expect("run proof");
-        assert_eq!(result.applied_migrations.len(), 9);
+        assert_eq!(result.applied_migrations.len(), 10);
         assert_eq!(result.applied_migrations[0].version, 1);
         assert_eq!(result.applied_migrations[1].version, 2);
         assert_eq!(result.applied_migrations[2].version, 3);
@@ -1065,6 +1170,7 @@ mod tests {
         assert_eq!(result.applied_migrations[6].version, 7);
         assert_eq!(result.applied_migrations[7].version, 8);
         assert_eq!(result.applied_migrations[8].version, 9);
+        assert_eq!(result.applied_migrations[9].version, 10);
         assert_eq!(result.test_record_id, 1);
         assert_eq!(result.total_records, 1);
 
@@ -1122,7 +1228,7 @@ mod tests {
 
         let mut db = DbManager { conn };
         let applied = db.run_migrations().expect("run forward migrations");
-        assert_eq!(applied.len(), 8);
+        assert_eq!(applied.len(), 9);
         assert_eq!(applied[0].version, 2);
         assert_eq!(applied[1].version, 3);
         assert_eq!(applied[2].version, 4);
@@ -1131,6 +1237,7 @@ mod tests {
         assert_eq!(applied[5].version, 7);
         assert_eq!(applied[6].version, 8);
         assert_eq!(applied[7].version, 9);
+        assert_eq!(applied[8].version, 10);
 
         // Verify Phase 0 data preserved
         let count: i64 = db
@@ -1166,7 +1273,7 @@ mod tests {
     fn test_migrations_already_migrated_is_idempotent() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let applied1 = db.run_migrations().expect("first migration run");
-        assert_eq!(applied1.len(), 9);
+        assert_eq!(applied1.len(), 10);
 
         let applied2 = db.run_migrations().expect("second migration run");
         assert_eq!(applied2.len(), 0);

@@ -436,5 +436,102 @@ export interface StartBuilderTurnPayload {
   projectId: string;
   model?: string | null;
   effort?: string | null;
+  instructionSource?: BuilderInstructionSource | null;
+}
+
+export type BuilderInstructionSource =
+  | { type: 'INITIAL_FROZEN' }
+  | { type: 'REVIEW_CORRECTION'; review_cycle_id: string }
+  | { type: 'VALIDATION_DIAGNOSTIC'; validation_run_id: string };
+
+export type ValidationTriggerSource =
+  | 'MANUAL'
+  | 'POST_BUILD'
+  | 'BUILDER_REQUESTED'
+  | 'PRE_REVIEW'
+  | 'FINAL_VALIDATION';
+
+export type ValidationRunStatus =
+  | 'RUNNING'
+  | 'PASS'
+  | 'FAIL'
+  | 'CANCELED'
+  | 'INTERRUPTED';
+
+export type ValidationCommandStatus =
+  | 'PENDING'
+  | 'RUNNING'
+  | 'PASS'
+  | 'FAIL'
+  | 'TIMEOUT'
+  | 'CANCELED'
+  | 'SKIPPED';
+
+export interface ValidationCommandConfig {
+  id: string;
+  name: string;
+  command: string;
+  cwd?: string | null;
+  timeout_seconds?: number | null;
+  required?: boolean;
+}
+
+export interface ValidationPolicyConfig {
+  gate_review_on_required_failure: boolean;
+  grace_period_seconds: number;
+}
+
+export interface ValidationConfig {
+  schema_version: number;
+  enabled: boolean;
+  commands: ValidationCommandConfig[];
+  policy: ValidationPolicyConfig;
+}
+
+export interface ValidationCommandExecutionRecord {
+  id: number;
+  run_id: string;
+  command_id: string;
+  name: string;
+  command: string;
+  cwd: string;
+  required: boolean;
+  status: ValidationCommandStatus;
+  exit_code?: number | null;
+  duration_ms: number;
+  stdout_preview?: string | null;
+  stderr_preview?: string | null;
+  log_path?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+export interface ValidationRunRecord {
+  run_id: string;
+  project_id: string;
+  architecture_version: string;
+  epoch_id?: string | null;
+  trigger_source: ValidationTriggerSource;
+  status: ValidationRunStatus;
+  is_gate_passed: boolean;
+  has_override: boolean;
+  git_head?: string | null;
+  git_dirty_fingerprint?: string | null;
+  config_fingerprint?: string | null;
+  log_path?: string | null;
+  started_at: string;
+  completed_at?: string | null;
+  duration_ms: number;
+  commands: ValidationCommandExecutionRecord[];
+}
+
+export interface ValidationGateOverrideRecord {
+  override_id: string;
+  project_id: string;
+  run_id: string;
+  git_fingerprint: string;
+  reason: string;
+  authorized_by: string;
+  created_at: string;
 }
 

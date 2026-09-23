@@ -1,4 +1,5 @@
 use crate::core::process::{ProcessOutputKind, ProcessOutputLine, ProcessRunner};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -129,6 +130,17 @@ pub struct BuilderTurnRequest {
     pub effort: Option<String>,
     pub icarus_mode: bool,
     pub working_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type")]
+pub enum BuilderInstructionSource {
+    #[serde(rename = "INITIAL_FROZEN", alias = "InitialFrozen")]
+    InitialFrozen,
+    #[serde(rename = "REVIEW_CORRECTION", alias = "ReviewCorrection")]
+    ReviewCorrection { review_cycle_id: String },
+    #[serde(rename = "VALIDATION_DIAGNOSTIC", alias = "ValidationDiagnostic")]
+    ValidationDiagnostic { validation_run_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1373,6 +1385,30 @@ impl BuilderService {
         effort: Option<String>,
         custom_adapter: Option<AntigravityCliAdapter>,
     ) -> Result<BuilderTurnResponse, BuilderError> {
+        Self::start_governed_turn_with_source(
+            db_arc,
+            registry_arc,
+            event_sink,
+            project_id,
+            model,
+            effort,
+            custom_adapter,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_governed_turn_with_source(
+        db_arc: Arc<tokio::sync::Mutex<crate::db::DbManager>>,
+        registry_arc: Arc<tokio::sync::Mutex<ActiveBuilderRegistry>>,
+        event_sink: Option<BuilderEventSink>,
+        project_id: &str,
+        model: Option<String>,
+        effort: Option<String>,
+        custom_adapter: Option<AntigravityCliAdapter>,
+        instruction_source: Option<BuilderInstructionSource>,
+    ) -> Result<BuilderTurnResponse, BuilderError> {
         // 1. Check current workflow state: must be FROZEN, BUILDING, or CORRECTIONS_REQUIRED
         let current_wf_state = {
             let db = db_arc.lock().await;
@@ -1429,8 +1465,53 @@ impl BuilderService {
             .map_err(|e| BuilderError::ExecutionFailed(e.to_string()))?;
         }
 
-        // 5. Invariant: Stage 3 Builder input comes 100% from the frozen Builder Packet.
-        let turn_prompt = builder_packet.prompt.clone();
+        // 5. Invariant: Builder input comes authoritatively from frozen packet, review corrections, or validation diagnostics.
+        let turn_prompt = match &instruction_source {
+            Some(BuilderInstructionSource::ValidationDiagnostic { validation_run_id }) => {
+                let db = db_arc.lock().await;
+                let diagnostic =
+                    crate::core::validation::ValidationService::generate_diagnostic_packet_for_run(
+                        db.connection(),
+                        validation_run_id,
+                        50_000,
+                    )
+                    .map_err(|e| {
+                        BuilderError::ExecutionFailed(format!(
+                            "Failed to load validation diagnostic: {}",
+                            e
+                        ))
+                    })?;
+                format!(
+                    "{}\n\n=== VALIDATION DIAGNOSTIC REPORT ===\n{}",
+                    builder_packet.prompt, diagnostic
+                )
+            }
+            Some(BuilderInstructionSource::ReviewCorrection { review_cycle_id }) => {
+                let db = db_arc.lock().await;
+                let correction_text: Option<String> = db
+                    .connection()
+                    .query_row(
+                        "SELECT corrections_packet FROM review_cycles WHERE cycle_id = ?1",
+                        rusqlite::params![review_cycle_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .unwrap_or(None);
+
+                if let Some(text) = correction_text {
+                    format!(
+                        "{}\n\n=== REVIEW CORRECTION REQUEST ===\n{}",
+                        builder_packet.prompt, text
+                    )
+                } else {
+                    format!(
+                        "{}\n\n=== REVIEW CORRECTION REQUEST (Cycle: {}) ===",
+                        builder_packet.prompt, review_cycle_id
+                    )
+                }
+            }
+            _ => builder_packet.prompt.clone(),
+        };
 
         // 6. Check for existing conversation in this epoch only and Icarus state
         let (existing_conv_id, icarus_mode) = {
@@ -1755,6 +1836,17 @@ impl BuilderService {
                         );
                         return Err(BuilderError::Database(err_msg));
                     }
+                }
+
+                if resp.text_response.contains("COALITION_REQUEST_VALIDATION") {
+                    let _ = crate::core::activity::ActivityManager::record_event(
+                        db.connection(),
+                        project_id,
+                        "BUILDER_REQUESTED_VALIDATION",
+                        "BUILDER",
+                        "Builder signaled intent to validate project via COALITION_REQUEST_VALIDATION",
+                        None,
+                    );
                 }
 
                 Ok(resp)

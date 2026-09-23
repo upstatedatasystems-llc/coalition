@@ -27,6 +27,7 @@ pub struct AppState {
     pub agy: Mutex<Option<AntigravityCliAdapter>>,
     pub active_project_id: Mutex<Option<String>>,
     pub active_builder_registry: Arc<Mutex<ActiveBuilderRegistry>>,
+    pub active_validation_registry: Arc<Mutex<crate::core::validation::ActiveValidationRegistry>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -389,6 +390,33 @@ impl From<String> for CommandError {
     }
 }
 
+impl From<crate::core::validation::ValidationError> for CommandError {
+    fn from(err: crate::core::validation::ValidationError) -> Self {
+        use crate::core::validation::ValidationError;
+        match err {
+            ValidationError::UnsupportedSchemaVersion(v) => Self::new(
+                "UNSUPPORTED_SCHEMA_VERSION",
+                format!("Unsupported validation schema version {}", v),
+            ),
+            ValidationError::DuplicateCommandId(id) => Self::new(
+                "DUPLICATE_COMMAND_ID",
+                format!("Duplicate validation command ID: {}", id),
+            ),
+            ValidationError::InvalidWorkingDirectory(dir) => Self::new(
+                "INVALID_WORKING_DIRECTORY",
+                format!("Invalid working directory: {}", dir),
+            ),
+            ValidationError::Io(e) => Self::new("IO_ERROR", e.to_string()),
+            ValidationError::Yaml(e) => Self::new("YAML_ERROR", e.to_string()),
+            ValidationError::Database(e) => Self::new("DATABASE_ERROR", e),
+            ValidationError::Git(e) => Self::new("GIT_ERROR", e),
+            ValidationError::Execution(e) => Self::new("VALIDATION_EXECUTION_ERROR", e),
+            ValidationError::NotFound(e) => Self::new("NOT_FOUND", e),
+            ValidationError::StaleEvidence(e) => Self::new("STALE_EVIDENCE", e),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemDiagnosticInfo {
     pub current_dir: String,
@@ -625,10 +653,23 @@ pub fn apply_workflow_action_impl(
     project_id: &str,
     action: WorkflowAction,
 ) -> Result<WorkflowStateRecord, CommandError> {
-    // Invariant: Builder execution cannot start if repository resolution, restoration reconciliation,
-    // frozen snapshot integrity, or contract drift checks fail.
-    if action == WorkflowAction::StartBuild {
-        validate_builder_preflight(db, project_id)?;
+    // Stage 4 governance guard: prevent arbitrary frontend bypass of governance gates!
+    match action {
+        WorkflowAction::SubmitForReview
+        | WorkflowAction::AcceptReview
+        | WorkflowAction::RequestCorrections => {
+            return Err(CommandError::new(
+                "STAGE4_GOVERNANCE_BYPASS_FORBIDDEN",
+                format!(
+                    "Action {:?} cannot be invoked directly through generic workflow endpoint. Use dedicated governed service.",
+                    action
+                ),
+            ));
+        }
+        WorkflowAction::StartBuild => {
+            validate_builder_preflight(db, project_id)?;
+        }
+        _ => {}
     }
 
     workflow::apply_workflow_action(db.connection_mut(), project_id, action, "HUMAN")
@@ -759,6 +800,7 @@ pub struct StartBuilderTurnPayload {
     pub project_id: String,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub instruction_source: Option<crate::core::builder::BuilderInstructionSource>,
 }
 
 #[tauri::command]
@@ -833,7 +875,7 @@ pub async fn start_builder_turn(
         let _ = app_handle.emit(evt, val);
     });
 
-    crate::core::builder::BuilderService::start_governed_turn(
+    crate::core::builder::BuilderService::start_governed_turn_with_source(
         state.db.clone(),
         state.active_builder_registry.clone(),
         Some(sink),
@@ -841,6 +883,7 @@ pub async fn start_builder_turn(
         payload.model,
         payload.effort,
         Some(adapter),
+        payload.instruction_source,
     )
     .await
     .map_err(CommandError::from)
@@ -1462,6 +1505,214 @@ pub async fn get_builder_packet(
     }
     crate::core::freeze::FreezeService::get_builder_packet(&repo_path, version.as_deref())
         .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_validation_config(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<crate::core::validation::ValidationConfig, CommandError> {
+    let db = state.db.lock().await;
+    let repo_path = get_repo_path_for_project_sync(&db, &project_id)?;
+    crate::core::validation::ValidationService::read_validation_config(&repo_path)
+        .map_err(CommandError::from)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartValidationPayload {
+    #[serde(alias = "project_id")]
+    pub project_id: String,
+    pub trigger: Option<crate::core::validation::ValidationTriggerSource>,
+    pub command_ids: Option<Vec<String>>,
+}
+
+#[tauri::command]
+pub async fn start_validation_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    payload: StartValidationPayload,
+) -> Result<crate::core::validation::ValidationRunRecord, CommandError> {
+    let repo_path = {
+        let db = state.db.lock().await;
+        get_repo_path_for_project_sync(&db, &payload.project_id)?
+    };
+
+    let app_handle = app.clone();
+    let sink: crate::core::validation::ValidationEventSink = Arc::new(move |evt, val| {
+        use tauri::Emitter;
+        let _ = app_handle.emit(evt, val);
+    });
+
+    use tauri::Manager;
+    let app_dir = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
+
+    let trigger = payload
+        .trigger
+        .unwrap_or(crate::core::validation::ValidationTriggerSource::Manual);
+
+    crate::core::validation::ValidationService::execute_validation_run(
+        state.db.clone(),
+        state.active_validation_registry.clone(),
+        &payload.project_id,
+        &repo_path,
+        trigger,
+        payload.command_ids,
+        Some(sink),
+        &app_dir,
+    )
+    .await
+    .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn stop_validation_command(
+    state: State<'_, AppState>,
+    run_id: String,
+    _command_id: Option<String>,
+) -> Result<String, CommandError> {
+    let registry = state.active_validation_registry.lock().await;
+    registry.stop_current(&run_id).map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn stop_validation_run(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<String, CommandError> {
+    let registry = state.active_validation_registry.lock().await;
+    registry.stop_all(&run_id).map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_active_validation_run(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Option<crate::core::validation::ValidationRunRecord>, CommandError> {
+    let run_id = {
+        let registry = state.active_validation_registry.lock().await;
+        registry.get_active_run_id(&project_id)
+    };
+
+    if let Some(id) = run_id {
+        let db = state.db.lock().await;
+        crate::core::validation::get_validation_run(db.connection(), &id)
+            .map_err(CommandError::from)
+    } else {
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+pub async fn get_validation_history(
+    state: State<'_, AppState>,
+    project_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<crate::core::validation::ValidationRunRecord>, CommandError> {
+    let db = state.db.lock().await;
+    crate::core::validation::list_validation_runs_for_project(
+        db.connection(),
+        &project_id,
+        limit.unwrap_or(20),
+    )
+    .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_validation_run_details(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<crate::core::validation::ValidationRunRecord, CommandError> {
+    let db = state.db.lock().await;
+    crate::core::validation::get_validation_run(db.connection(), &run_id)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| {
+            CommandError::new("NOT_FOUND", format!("Validation run {} not found", run_id))
+        })
+}
+
+#[tauri::command]
+pub async fn get_validation_run_commands(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<Vec<crate::core::validation::ValidationCommandExecutionRecord>, CommandError> {
+    let db = state.db.lock().await;
+    crate::core::validation::list_validation_commands_for_run(db.connection(), &run_id)
+        .map_err(CommandError::from)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverrideValidationGatePayload {
+    #[serde(alias = "project_id")]
+    pub project_id: String,
+    #[serde(alias = "run_id")]
+    pub run_id: String,
+    pub reason: String,
+}
+
+#[tauri::command]
+pub async fn override_validation_gate(
+    state: State<'_, AppState>,
+    payload: OverrideValidationGatePayload,
+) -> Result<crate::core::validation::ValidationGateOverrideRecord, CommandError> {
+    if payload.reason.trim().is_empty() {
+        return Err(CommandError::new(
+            "VALIDATION_ERROR",
+            "Override rationale cannot be empty",
+        ));
+    }
+
+    let repo_path = {
+        let db = state.db.lock().await;
+        get_repo_path_for_project_sync(&db, &payload.project_id)?
+    };
+
+    let mut db = state.db.lock().await;
+    crate::core::validation::ValidationService::override_validation_gate(
+        db.connection_mut(),
+        &repo_path,
+        &payload.project_id,
+        &payload.run_id,
+        &payload.reason,
+        "HUMAN",
+    )
+    .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn submit_for_review(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<WorkflowStateRecord, CommandError> {
+    let mut db = state.db.lock().await;
+
+    // 1. Authoritative preflight: repo, architecture version, builder packet
+    let (repo_path, arch_version, builder_packet) =
+        validate_builder_preflight(&mut db, &project_id)?;
+    let epoch_id = builder_packet.metadata.builder_epoch_id;
+
+    // 2. Directive 4: check required validation gate
+    crate::core::validation::ValidationService::check_review_gate(
+        db.connection(),
+        &repo_path,
+        &project_id,
+        &arch_version,
+        &epoch_id,
+    )
+    .map_err(|e| CommandError::new("VALIDATION_GATE_BLOCKED", e.to_string()))?;
+
+    // 3. Transition workflow to WAITING_FOR_REVIEW
+    workflow::apply_workflow_action(
+        db.connection_mut(),
+        &project_id,
+        WorkflowAction::SubmitForReview,
+        "HUMAN",
+    )
+    .map_err(CommandError::from)
 }
 
 #[cfg(test)]
