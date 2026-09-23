@@ -44,37 +44,77 @@ pub struct BoundsSummary {
     pub field_max_bytes: usize,
 }
 
-/// Redacts local developer filesystem paths (Windows drive paths, UNC paths, and Unix user home paths)
-/// while strictly preserving ordinary architecture-relative paths such as `src/log-analyzer.js`
-/// or `design/architecture.md`.
-pub fn redact_local_paths(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
+/// Identifies all non-overlapping byte ranges corresponding to absolute developer local paths,
+/// file:// URIs, extended paths, and user-home directory paths while preserving relative paths.
+pub fn find_local_path_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
     let chars: Vec<(usize, char)> = text.char_indices().collect();
-    let n = chars.len();
+    let num_chars = chars.len();
+    let n = text.len();
     let mut i = 0;
 
-    while i < n {
+    while i < num_chars {
         let (byte_idx, ch) = chars[i];
+        let remaining = &text[byte_idx..];
 
-        // 1. Windows drive letter: [A-Za-z]:\ or [A-Za-z]:/ or escaped [A-Za-z]:\\
-        let is_drive = ch.is_ascii_alphabetic()
-            && i + 1 < n
+        let prev_is_alnum = if i > 0 {
+            chars[i - 1].1.is_ascii_alphanumeric()
+        } else {
+            false
+        };
+
+        let is_file_uri = !prev_is_alnum
+            && (remaining.starts_with("file:///")
+                || remaining.starts_with("file://")
+                || remaining.starts_with("file:/"));
+
+        let is_extended_path = remaining.starts_with(r"\\?\")
+            || remaining.starts_with(r"\\.\")
+            || remaining.starts_with(r"\\\\?\\")
+            || remaining.starts_with(r"\\\\.\\");
+
+        let is_unc_path = (ch == '\\' && i + 1 < num_chars && chars[i + 1].1 == '\\')
+            && !prev_is_alnum
+            && i + 2 < num_chars
+            && (chars[i + 2].1.is_ascii_alphanumeric() || chars[i + 2].1 == '\\');
+
+        let is_drive_path = !prev_is_alnum
+            && ch.is_ascii_alphabetic()
+            && i + 1 < num_chars
             && chars[i + 1].1 == ':'
-            && i + 2 < n
+            && i + 2 < num_chars
             && (chars[i + 2].1 == '\\' || chars[i + 2].1 == '/');
 
-        // 2. UNC path: \\server\share or escaped \\\\server\\share
-        let is_unc = ch == '\\' && i + 1 < n && chars[i + 1].1 == '\\';
-
-        // 3. Unix user home paths: /home/ or /Users/
-        let remaining = &text[byte_idx..];
         let is_unix_home = remaining.starts_with("/home/") || remaining.starts_with("/Users/");
 
-        if is_drive || is_unc || is_unix_home {
+        let is_user_prefix = !prev_is_alnum
+            && (remaining.starts_with("Users/") || remaining.starts_with("home/"))
+            && {
+                let prefix_len = if remaining.starts_with("Users/") {
+                    6
+                } else {
+                    5
+                };
+                let after_prefix = &remaining[prefix_len..];
+                !after_prefix.is_empty()
+                    && after_prefix
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphanumeric())
+            };
+
+        let is_local_path = is_file_uri
+            || is_extended_path
+            || is_unc_path
+            || is_drive_path
+            || is_unix_home
+            || is_user_prefix;
+
+        if is_local_path {
+            let start_byte = byte_idx;
             let mut j = i;
-            while j < n {
+            while j < num_chars {
                 let (_, c) = chars[j];
-                // Delimiters for path in plain text or JSON
                 if c.is_whitespace()
                     || c == '"'
                     || c == '\''
@@ -87,6 +127,9 @@ pub fn redact_local_paths(text: &str) -> String {
                     || c == '>'
                     || c == ')'
                     || c == '('
+                    || c == '`'
+                    || c == '|'
+                    || c == '^'
                     || c.is_control()
                 {
                     break;
@@ -100,15 +143,106 @@ pub fn redact_local_paths(text: &str) -> String {
                 j -= 1;
             }
 
-            if j - i >= 3 {
-                result.push_str("[REDACTED_LOCAL_PATH]");
-                i = j;
+            let end_byte = if j < num_chars { chars[j].0 } else { n };
+
+            if end_byte > start_byte && (end_byte - start_byte) >= 3 {
+                spans.push(start_byte..end_byte);
+                i = j.max(i + 1);
                 continue;
             }
         }
 
-        result.push(ch);
         i += 1;
+    }
+
+    spans
+}
+
+/// Redacts detected path spans from a sequence of streaming chunks, projecting
+/// any multi-event spanning path cleanly back across the individual chunk boundaries.
+pub fn redact_stream_chunks(chunks: &[&str], spans: &[std::ops::Range<usize>]) -> Vec<String> {
+    if spans.is_empty() {
+        return chunks.iter().map(|s| s.to_string()).collect();
+    }
+
+    let mut chunk_offsets = Vec::with_capacity(chunks.len());
+    let mut current_offset = 0;
+    for chunk in chunks {
+        let len = chunk.len();
+        chunk_offsets.push((current_offset, current_offset + len));
+        current_offset += len;
+    }
+
+    let mut result = Vec::with_capacity(chunks.len());
+
+    for (k, &(c_start, c_end)) in chunk_offsets.iter().enumerate() {
+        if c_start == c_end {
+            result.push(String::new());
+            continue;
+        }
+
+        let mut out = String::new();
+        let chunk_str = chunks[k];
+        let mut curr = c_start;
+
+        for span in spans {
+            if span.end <= curr || span.start >= c_end {
+                continue;
+            }
+
+            // If there are bytes before the span starts in this chunk
+            if span.start > curr {
+                let keep_start = curr - c_start;
+                let keep_end = span.start - c_start;
+                out.push_str(&chunk_str[keep_start..keep_end]);
+                curr = span.start;
+            }
+
+            // If this chunk contains the start of the span, emit [REDACTED_LOCAL_PATH]
+            if span.start >= c_start && span.start < c_end && curr == span.start {
+                out.push_str("[REDACTED_LOCAL_PATH]");
+            }
+
+            // Advance curr to the end of the span (bounded by c_end)
+            if span.end > curr {
+                curr = span.end.min(c_end);
+            }
+        }
+
+        // Any remaining bytes after all spans in this chunk
+        if curr < c_end {
+            let keep_start = curr - c_start;
+            out.push_str(&chunk_str[keep_start..]);
+        }
+
+        result.push(out);
+    }
+
+    result
+}
+
+/// Redacts local developer filesystem paths (Windows drive paths, UNC paths, and Unix user home paths)
+/// while strictly preserving ordinary architecture-relative paths such as `src/log-analyzer.js`
+/// or `design/architecture.md`.
+pub fn redact_local_paths(text: &str) -> String {
+    let spans = find_local_path_spans(text);
+    if spans.is_empty() {
+        return text.to_string();
+    }
+
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+
+    for span in spans {
+        if span.start > last_end {
+            result.push_str(&text[last_end..span.start]);
+        }
+        result.push_str("[REDACTED_LOCAL_PATH]");
+        last_end = span.end;
+    }
+
+    if last_end < text.len() {
+        result.push_str(&text[last_end..]);
     }
 
     result
@@ -120,6 +254,159 @@ pub fn sanitize_diagnostics_field(text: &str, max_bytes: usize) -> String {
     let bounded = crate::core::process::truncate_utf8_safe(text, max_bytes);
     let secrets_redacted = safe_sanitize_text(bounded);
     redact_local_paths(&secrets_redacted)
+}
+
+#[derive(Debug, Clone)]
+pub struct RawEventItem {
+    pub id: i64,
+    pub session_id: String,
+    pub step_index: Option<i64>,
+    pub event_type: String,
+    pub state: Option<String>,
+    pub content: Option<String>,
+    pub details_json: Option<String>,
+    pub timestamp: String,
+}
+
+fn is_streaming_delta_event(e: &RawEventItem) -> bool {
+    if let Some(ref dj) = e.details_json {
+        if dj.contains("\"text_delta\"") {
+            return true;
+        }
+    }
+    e.event_type == "agent_response" || e.event_type == "thought" || e.event_type == "step_update"
+}
+
+fn extract_event_delta(e: &RawEventItem) -> String {
+    if let Some(ref dj) = e.details_json {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(dj) {
+            if let Some(delta) = val.get("text_delta").and_then(|v| v.as_str()) {
+                return delta.to_string();
+            }
+        }
+    }
+    if let Some(ref c) = e.content {
+        return c.clone();
+    }
+    String::new()
+}
+
+fn sanitize_details_json(details_raw: Option<&str>, redacted_delta: &str) -> Option<String> {
+    let dj = details_raw?;
+    if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(dj) {
+        if val.get("text_delta").is_some() {
+            val["text_delta"] = serde_json::Value::String(redacted_delta.to_string());
+        }
+        if let Some(err_val) = val.get("error").and_then(|v| v.as_str()) {
+            val["error"] =
+                serde_json::Value::String(sanitize_diagnostics_field(err_val, 16 * 1024));
+        }
+        let serialized = serde_json::to_string(&val).unwrap_or_else(|_| dj.to_string());
+        Some(sanitize_diagnostics_field(&serialized, 32 * 1024))
+    } else {
+        Some(sanitize_diagnostics_field(dj, 32 * 1024))
+    }
+}
+
+/// Reconstructs adjacent streaming context per session and step to identify and redact
+/// multi-event fragmented local path spans before emitting sanitized event JSON.
+pub fn sanitize_and_redact_events(events: Vec<RawEventItem>) -> Vec<serde_json::Value> {
+    let mut output_events = Vec::with_capacity(events.len());
+    let mut i = 0;
+    let n = events.len();
+
+    while i < n {
+        if !is_streaming_delta_event(&events[i]) {
+            let e = &events[i];
+            let content_sanitized = e
+                .content
+                .as_deref()
+                .map(|c| sanitize_diagnostics_field(c, 16 * 1024));
+            let details_sanitized = e
+                .details_json
+                .as_deref()
+                .map(|d| sanitize_diagnostics_field(d, 32 * 1024));
+            output_events.push(serde_json::json!({
+                "id": e.id,
+                "session_id": e.session_id,
+                "step_index": e.step_index,
+                "event_type": e.event_type,
+                "state": e.state,
+                "content": content_sanitized,
+                "details_json": details_sanitized,
+                "timestamp": e.timestamp,
+            }));
+            i += 1;
+            continue;
+        }
+
+        let start_idx = i;
+        let session_id = events[i].session_id.clone();
+        let step_index = events[i].step_index;
+
+        while i < n && events[i].session_id == session_id && is_streaming_delta_event(&events[i]) {
+            let curr_step = events[i].step_index;
+            let step_compatible =
+                curr_step == step_index || curr_step.is_none() || step_index.is_none();
+            if !step_compatible {
+                break;
+            }
+            i += 1;
+        }
+
+        let end_idx = i;
+        let run = &events[start_idx..end_idx];
+
+        if run.len() == 1 {
+            let e = &run[0];
+            let delta = extract_event_delta(e);
+            let redacted_delta = redact_local_paths(&delta);
+            let content_sanitized = e
+                .content
+                .as_ref()
+                .map(|_| sanitize_diagnostics_field(&redacted_delta, 16 * 1024));
+            let details_sanitized =
+                sanitize_details_json(e.details_json.as_deref(), &redacted_delta);
+            output_events.push(serde_json::json!({
+                "id": e.id,
+                "session_id": e.session_id,
+                "step_index": e.step_index,
+                "event_type": e.event_type,
+                "state": e.state,
+                "content": content_sanitized,
+                "details_json": details_sanitized,
+                "timestamp": e.timestamp,
+            }));
+        } else {
+            let deltas: Vec<String> = run.iter().map(extract_event_delta).collect();
+            let chunk_refs: Vec<&str> = deltas.iter().map(|s| s.as_str()).collect();
+            let combined = chunk_refs.concat();
+            let spans = find_local_path_spans(&combined);
+            let redacted_chunks = redact_stream_chunks(&chunk_refs, &spans);
+
+            for (k, e) in run.iter().enumerate() {
+                let redacted_delta = &redacted_chunks[k];
+                let content_sanitized = e
+                    .content
+                    .as_ref()
+                    .map(|_| sanitize_diagnostics_field(redacted_delta, 16 * 1024));
+                let details_sanitized =
+                    sanitize_details_json(e.details_json.as_deref(), redacted_delta);
+                output_events.push(serde_json::json!({
+                    "id": e.id,
+                    "session_id": e.session_id,
+                    "step_index": e.step_index,
+                    "event_type": e.event_type,
+                    "state": e.state,
+                    "content": content_sanitized,
+                    "details_json": details_sanitized,
+                    "timestamp": e.timestamp,
+                }));
+            }
+        }
+    }
+
+    output_events
 }
 
 pub fn export_project_diagnostics(
@@ -326,37 +613,30 @@ pub fn export_project_diagnostics(
 
     let event_rows = stmt
         .query_map(params![project_id], |r| {
-            let content_raw: Option<String> = r.get(5)?;
-            let content_sanitized = content_raw
-                .as_deref()
-                .map(|c| sanitize_diagnostics_field(c, 16 * 1024));
-
-            let details_raw: Option<String> = r.get(6)?;
-            let details_sanitized = details_raw
-                .as_deref()
-                .map(|d| sanitize_diagnostics_field(d, 16 * 1024));
-
-            Ok(serde_json::json!({
-                "id": r.get::<_, i64>(0)?,
-                "session_id": r.get::<_, String>(1)?,
-                "step_index": r.get::<_, Option<i64>>(2)?,
-                "event_type": r.get::<_, String>(3)?,
-                "state": r.get::<_, Option<String>>(4)?,
-                "content": content_sanitized,
-                "details_json": details_sanitized,
-                "timestamp": r.get::<_, String>(7)?,
-            }))
+            Ok(RawEventItem {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                step_index: r.get(2)?,
+                event_type: r.get(3)?,
+                state: r.get(4)?,
+                content: r.get(5)?,
+                details_json: r.get(6)?,
+                timestamp: r.get(7)?,
+            })
         })
         .map_err(|e| DiagnosticsError::Database(e.to_string()))?;
 
-    let mut events = Vec::new();
+    let mut raw_events = Vec::new();
     for row in event_rows {
-        events.push(row.map_err(|e| DiagnosticsError::Database(e.to_string()))?);
+        raw_events.push(row.map_err(|e| DiagnosticsError::Database(e.to_string()))?);
     }
     // Restore chronological ordering for exported output
-    events.reverse();
+    raw_events.reverse();
+
+    let sanitized_events = sanitize_and_redact_events(raw_events);
+
     zip.start_file("events.json", options)?;
-    let events_json = serde_json::to_string_pretty(&events)?;
+    let events_json = serde_json::to_string_pretty(&sanitized_events)?;
     zip.write_all(events_json.as_bytes())?;
 
     // 7. Permission History (Bounded & Sanitized)
@@ -720,5 +1000,229 @@ mod tests {
                 .expect("read events.json");
             assert!(evt_content.contains("[REDACTED_LOCAL_PATH]"));
         }
+    }
+
+    #[test]
+    fn test_export_diagnostics_fragmented_streaming_paths_redacted() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("test_stream_redact.db");
+        let mut db = DbManager::open(&db_path).expect("init db");
+        db.run_migrations().expect("run migrations");
+        let project_id = "proj-stream-redact";
+
+        // Insert project
+        db.connection()
+            .execute(
+                "INSERT INTO projects (project_id, name, repository_path, created_at, updated_at, last_opened_at) VALUES (?1, ?2, ?3, ?4, ?4, ?4)",
+                params![project_id, "Stream Redact Project", r"C:\Users\mikea\Documents\coalition-test", "2026-09-23T00:00:00Z"],
+            )
+            .expect("insert project");
+
+        // Insert session record to satisfy foreign key constraint
+        db.connection()
+            .execute(
+                "INSERT INTO builder_sessions (session_id, project_id, epoch_id, model, icarus_mode, status, prompt, response_text, error_message, started_at, duration_ms, input_tokens, output_tokens, thinking_tokens, cache_read_tokens, total_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    "sess-1",
+                    project_id,
+                    "epoch-stream-1",
+                    "gemini-3.8-flash-high",
+                    false,
+                    "SUCCESS",
+                    "Stream prompt",
+                    None::<String>,
+                    None::<String>,
+                    "2026-09-23T00:00:00Z",
+                    1000,
+                    10,
+                    20,
+                    0,
+                    0,
+                    30
+                ],
+            )
+            .expect("insert session");
+
+        // 1. Sequential Builder events whose text deltas form:
+        // "See [`file.js`](file:///C:/Users/mikea/Documents/coalition-test/src/file.js)"
+        let c1_events = [
+            r#"See [`file.js`](file:///C:/"#,
+            r#"Users/mikea/"#,
+            r#"Documents/coalition-test/src/file.js)"#,
+        ];
+        for (i, delta) in c1_events.iter().enumerate() {
+            let dj = serde_json::json!({
+                "conversation_id": "c1",
+                "step_index": 1,
+                "state": "ACTIVE",
+                "step_type": "agent_response",
+                "text_delta": delta,
+            })
+            .to_string();
+            db.connection()
+                .execute(
+                    "INSERT INTO builder_events (project_id, session_id, step_index, event_type, state, content, details_json, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![project_id, "sess-1", 1, "agent_response", "ACTIVE", delta, dj, format!("2026-09-23T00:00:0{}Z", i)],
+                )
+                .expect("insert c1 event");
+        }
+
+        // 2. Sequential Builder events for Jane:
+        // "/Users/jane/" and "Projects/example/file.js"
+        let c2_events = ["/Users/jane/", "Projects/example/file.js"];
+        for (i, delta) in c2_events.iter().enumerate() {
+            let dj = serde_json::json!({
+                "conversation_id": "c2",
+                "step_index": 2,
+                "state": "ACTIVE",
+                "step_type": "agent_response",
+                "text_delta": delta,
+            })
+            .to_string();
+            db.connection()
+                .execute(
+                    "INSERT INTO builder_events (project_id, session_id, step_index, event_type, state, content, details_json, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![project_id, "sess-1", 2, "agent_response", "ACTIVE", delta, dj, format!("2026-09-23T00:01:0{}Z", i)],
+                )
+                .expect("insert c2 event");
+        }
+
+        // 3. Sequential Builder events for Alice:
+        // "/home/" and "alice/project/file.js"
+        let c3_events = ["/home/", "alice/project/file.js"];
+        for (i, delta) in c3_events.iter().enumerate() {
+            let dj = serde_json::json!({
+                "conversation_id": "c3",
+                "step_index": 3,
+                "state": "ACTIVE",
+                "step_type": "agent_response",
+                "text_delta": delta,
+            })
+            .to_string();
+            db.connection()
+                .execute(
+                    "INSERT INTO builder_events (project_id, session_id, step_index, event_type, state, content, details_json, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![project_id, "sess-1", 3, "agent_response", "ACTIVE", delta, dj, format!("2026-09-23T00:02:0{}Z", i)],
+                )
+                .expect("insert c3 event");
+        }
+
+        // 4. Ordinary relative paths: must remain visible
+        let rel_event =
+            "Updated relative architecture files: src/file.js and design/architecture.md.";
+        let rel_dj = serde_json::json!({
+            "conversation_id": "c4",
+            "step_index": 4,
+            "state": "DONE",
+            "step_type": "agent_response",
+            "text_delta": rel_event,
+        })
+        .to_string();
+        db.connection()
+            .execute(
+                "INSERT INTO builder_events (project_id, session_id, step_index, event_type, state, content, details_json, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![project_id, "sess-1", 4, "agent_response", "DONE", rel_event, rel_dj, "2026-09-23T00:03:00Z"],
+            )
+            .expect("insert rel event");
+
+        let export_dir = dir.path().join("exports");
+        let zip_path = export_project_diagnostics(&db, project_id, Some(&export_dir))
+            .expect("export diagnostics");
+
+        let file = File::open(&zip_path).expect("open zip");
+        let mut archive = zip::ZipArchive::new(file).expect("read zip archive");
+
+        // Concatenate all exported textual JSON members
+        let mut combined_json = String::new();
+        for i in 0..archive.len() {
+            let mut zip_file = archive.by_index(i).expect("get zip entry");
+            let mut content = String::new();
+            zip_file
+                .read_to_string(&mut content)
+                .expect("read zip entry text");
+            combined_json.push_str(&content);
+            combined_json.push('\n');
+        }
+
+        // Assert that developer-identifying local path fragments do NOT occur across the entire ZIP
+        assert!(
+            !combined_json.contains("mikea"),
+            "Fragment 'mikea' found in exported diagnostics ZIP!"
+        );
+        assert!(
+            !combined_json.contains("Users/mikea"),
+            "Fragment 'Users/mikea' found in exported diagnostics ZIP!"
+        );
+        assert!(
+            !combined_json.contains("C:/Users"),
+            "Fragment 'C:/Users' found in exported diagnostics ZIP!"
+        );
+        assert!(
+            !combined_json.contains(r"C:\Users"),
+            r"Fragment 'C:\Users' found in exported diagnostics ZIP!"
+        );
+        assert!(
+            !combined_json.contains("Documents/coalition-test"),
+            "Fragment 'Documents/coalition-test' found in exported diagnostics ZIP!"
+        );
+        assert!(
+            !combined_json.contains("jane"),
+            "Fragment 'jane' found in exported diagnostics ZIP!"
+        );
+        assert!(
+            !combined_json.contains("alice"),
+            "Fragment 'alice' found in exported diagnostics ZIP!"
+        );
+
+        // Prove ordinary relative paths remain visible
+        assert!(
+            combined_json.contains("src/file.js"),
+            "Relative path 'src/file.js' must remain visible in exported diagnostics!"
+        );
+        assert!(
+            combined_json.contains("design/architecture.md"),
+            "Relative path 'design/architecture.md' must remain visible in exported diagnostics!"
+        );
+    }
+
+    #[test]
+    fn test_live_stage3_final_acceptance_fixture_export_has_no_mikea() {
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        let db_path = PathBuf::from(appdata)
+            .join("com.upstatedatasystems.coalition")
+            .join("coalition.db");
+        if !db_path.exists() {
+            return;
+        }
+
+        let db = DbManager::open(&db_path).expect("open live db");
+        let project_id = "ead3e7ea-bbb1-4c6e-b06c-d94862e25372";
+
+        let zip_path = match export_project_diagnostics(&db, project_id, None) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        eprintln!("Exported live diagnostic ZIP to: {:?}", zip_path);
+
+        let file = File::open(&zip_path).expect("open zip");
+        let mut archive = zip::ZipArchive::new(file).expect("read zip");
+
+        let mut combined_json = String::new();
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).expect("entry");
+            let mut content = String::new();
+            entry.read_to_string(&mut content).expect("read entry");
+            combined_json.push_str(&content);
+            combined_json.push('\n');
+        }
+
+        assert!(
+            !combined_json.contains("Users/mikea"),
+            "Live fixture export must not contain 'Users/mikea'!"
+        );
+        assert!(
+            !combined_json.contains("Users/mikea/"),
+            "Live fixture export must not contain 'Users/mikea/'!"
+        );
     }
 }
