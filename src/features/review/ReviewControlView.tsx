@@ -221,13 +221,10 @@ export const ReviewControlView: React.FC<ReviewControlViewProps> = ({
     try {
       setIsStartingCorrections(true);
       setErrorMessage(null);
-      await invoke('start_builder_turn', {
+      await invoke('start_builder_correction_turn', {
         payload: {
           projectId,
-          instructionSource: {
-            type: 'REVIEW_CORRECTION',
-            review_cycle_id: latestCycle.cycle_id,
-          },
+          reviewCycleId: latestCycle.cycle_id,
         },
       });
       setSuccessMessage('Builder corrections turn started successfully!');

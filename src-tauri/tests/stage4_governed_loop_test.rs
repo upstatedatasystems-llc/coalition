@@ -2454,3 +2454,495 @@ async fn test_stage4_diagnostic_routing_invariants_and_abuse_prevention() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_governed_builder_ipc_and_defense_in_depth() {
+    let (repo_temp, _db_temp, project_id, db_path) = setup_frozen_test_project();
+    let _repo_path = repo_temp.path();
+    let db_manager = Arc::new(Mutex::new(DbManager::open(&db_path).unwrap()));
+    let builder_registry = Arc::new(Mutex::new(
+        coalition_lib::core::builder::ActiveBuilderRegistry::new(),
+    ));
+
+    let epoch_id = {
+        let db = db_manager.lock().await;
+        db.connection()
+            .query_row(
+                "SELECT epoch_id FROM builder_epochs WHERE project_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                rusqlite::params![project_id],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+
+    // 1. Set up a valid human-confirmed review cycle with corrections in DB
+    let valid_cycle_id = "cycle-test-valid-corr";
+    {
+        let db = db_manager.lock().await;
+        db.connection()
+            .execute(
+                "INSERT INTO review_cycles (
+                    cycle_id, project_id, cycle_number, architecture_version, epoch_id,
+                    status, verdict, reviewer_type, review_packet_hash, corrections_packet, started_at, completed_at, created_at
+                 ) VALUES (?1, ?2, 1, '1.0', ?3, 'CORRECTIONS_REQUIRED', 'CORRECTIONS_REQUIRED', 'CHATGPT_RELAY', 'dummy-hash', 'Please fix XYZ', ?4, ?4, ?4)",
+                rusqlite::params![
+                    valid_cycle_id,
+                    project_id,
+                    epoch_id,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+    }
+
+    // A. Generic start_builder_turn payload rejection logic:
+    // With ReviewCorrection:
+    let payload_rev = coalition_lib::commands::StartBuilderTurnPayload {
+        project_id: project_id.clone(),
+        model: None,
+        effort: None,
+        instruction_source: Some(
+            coalition_lib::core::builder::BuilderInstructionSource::ReviewCorrection {
+                review_cycle_id: valid_cycle_id.to_string(),
+            },
+        ),
+    };
+    assert!(matches!(
+        payload_rev.instruction_source,
+        Some(
+            coalition_lib::core::builder::BuilderInstructionSource::ReviewCorrection { .. }
+                | coalition_lib::core::builder::BuilderInstructionSource::ValidationDiagnostic { .. }
+        )
+    ));
+
+    // B. Verify verify_and_prepare_review_correction succeeds when in CORRECTIONS_REQUIRED
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartBuild,
+            "HUMAN",
+        )
+        .unwrap();
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartValidation,
+            "HUMAN",
+        )
+        .unwrap();
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::RequestCorrections,
+            "HUMAN",
+        )
+        .unwrap();
+    }
+
+    {
+        let mut db = db_manager.lock().await;
+        let res = coalition_lib::commands::verify_and_prepare_review_correction(
+            &mut db,
+            &project_id,
+            valid_cycle_id,
+        );
+        assert!(
+            res.is_ok(),
+            "verify_and_prepare_review_correction should succeed when valid: {:?}",
+            res
+        );
+    }
+
+    // Verify activity event was recorded
+    {
+        let db = db_manager.lock().await;
+        let events =
+            ActivityManager::get_project_activity(db.connection(), &project_id, Some(10)).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "REVIEW_CORRECTIONS_ROUTED_TO_BUILDER"),
+            "REVIEW_CORRECTIONS_ROUTED_TO_BUILDER event must be logged"
+        );
+    }
+
+    // C. verify_and_prepare_review_correction rejection checks:
+    // 1. Wrong workflow state (e.g. BUILDING)
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartBuild,
+            "HUMAN",
+        )
+        .unwrap();
+
+        let err = coalition_lib::commands::verify_and_prepare_review_correction(
+            &mut db,
+            &project_id,
+            valid_cycle_id,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "INVALID_WORKFLOW_STATE");
+    }
+
+    // Reset back to CORRECTIONS_REQUIRED
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartValidation,
+            "HUMAN",
+        )
+        .unwrap();
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::RequestCorrections,
+            "HUMAN",
+        )
+        .unwrap();
+    }
+
+    // 2. Non-existent cycle
+    {
+        let mut db = db_manager.lock().await;
+        let err = coalition_lib::commands::verify_and_prepare_review_correction(
+            &mut db,
+            &project_id,
+            "cycle-nonexistent",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "NOT_FOUND");
+    }
+
+    // 3. Cycle for other project
+    let other_cycle_id = "cycle-other-proj";
+    {
+        let db = db_manager.lock().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.connection()
+            .execute(
+                "INSERT INTO projects (project_id, name, repository_path, created_at, updated_at, last_opened_at)
+                 VALUES ('other-proj', 'Other', '/dummy/path', ?1, ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO review_cycles (
+                    cycle_id, project_id, cycle_number, architecture_version, epoch_id,
+                    status, verdict, reviewer_type, review_packet_hash, corrections_packet, started_at, completed_at, created_at
+                 ) VALUES (?1, 'other-proj', 1, '1.0', ?2, 'CORRECTIONS_REQUIRED', 'CORRECTIONS_REQUIRED', 'CHATGPT_RELAY', 'dummy-hash', 'Please fix XYZ', ?3, ?3, ?3)",
+                rusqlite::params![
+                    other_cycle_id,
+                    epoch_id,
+                    now
+                ],
+            )
+            .unwrap();
+        drop(db);
+        let mut db = db_manager.lock().await;
+        let err = coalition_lib::commands::verify_and_prepare_review_correction(
+            &mut db,
+            &project_id,
+            other_cycle_id,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "FORBIDDEN");
+    }
+
+    // 4. Cycle not in CORRECTIONS_REQUIRED
+    let accepted_cycle_id = "cycle-accepted";
+    {
+        let db = db_manager.lock().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.connection()
+            .execute(
+                "INSERT INTO review_cycles (
+                    cycle_id, project_id, cycle_number, architecture_version, epoch_id,
+                    status, verdict, reviewer_type, review_packet_hash, corrections_packet, started_at, completed_at, created_at
+                 ) VALUES (?1, ?2, 2, '1.0', ?3, 'ACCEPTED', 'ACCEPT', 'CHATGPT_RELAY', 'dummy-hash', 'LGTM', ?4, ?4, ?4)",
+                rusqlite::params![
+                    accepted_cycle_id,
+                    project_id,
+                    epoch_id,
+                    now
+                ],
+            )
+            .unwrap();
+        drop(db);
+        let mut db = db_manager.lock().await;
+        let err = coalition_lib::commands::verify_and_prepare_review_correction(
+            &mut db,
+            &project_id,
+            accepted_cycle_id,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "INVALID_STATE");
+    }
+
+    // 5. Cycle not human-confirmed
+    let unconfirmed_cycle_id = "cycle-unconfirmed";
+    {
+        let db = db_manager.lock().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.connection()
+            .execute(
+                "INSERT INTO review_cycles (
+                    cycle_id, project_id, cycle_number, architecture_version, epoch_id,
+                    status, verdict, reviewer_type, review_packet_hash, corrections_packet, started_at, completed_at, created_at
+                 ) VALUES (?1, ?2, 3, '1.0', ?3, 'CORRECTIONS_REQUIRED', 'CORRECTIONS_REQUIRED', 'CHATGPT_RELAY', 'dummy-hash', 'Please fix XYZ', ?4, NULL, ?4)",
+                rusqlite::params![
+                    unconfirmed_cycle_id,
+                    project_id,
+                    epoch_id,
+                    now
+                ],
+            )
+            .unwrap();
+        drop(db);
+        let mut db = db_manager.lock().await;
+        let err = coalition_lib::commands::verify_and_prepare_review_correction(
+            &mut db,
+            &project_id,
+            unconfirmed_cycle_id,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "INVALID_STATE");
+    }
+
+    // 6. Stale architecture version
+    let stale_arch_cycle_id = "cycle-stale-arch";
+    {
+        let db = db_manager.lock().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.connection()
+            .execute(
+                "INSERT INTO review_cycles (
+                    cycle_id, project_id, cycle_number, architecture_version, epoch_id,
+                    status, verdict, reviewer_type, review_packet_hash, corrections_packet, started_at, completed_at, created_at
+                 ) VALUES (?1, ?2, 4, '0.9', ?3, 'CORRECTIONS_REQUIRED', 'CORRECTIONS_REQUIRED', 'CHATGPT_RELAY', 'dummy-hash', 'Please fix XYZ', ?4, ?4, ?4)",
+                rusqlite::params![
+                    stale_arch_cycle_id,
+                    project_id,
+                    epoch_id,
+                    now
+                ],
+            )
+            .unwrap();
+        drop(db);
+        let mut db = db_manager.lock().await;
+        let err = coalition_lib::commands::verify_and_prepare_review_correction(
+            &mut db,
+            &project_id,
+            stale_arch_cycle_id,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "STALE_EVIDENCE");
+    }
+
+    // 7. Stale epoch
+    let stale_epoch_cycle_id = "cycle-stale-epoch";
+    {
+        let db = db_manager.lock().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.connection()
+            .execute(
+                "INSERT INTO review_cycles (
+                    cycle_id, project_id, cycle_number, architecture_version, epoch_id,
+                    status, verdict, reviewer_type, review_packet_hash, corrections_packet, started_at, completed_at, created_at
+                 ) VALUES (?1, ?2, 5, '1.0', 'old-epoch', 'CORRECTIONS_REQUIRED', 'CORRECTIONS_REQUIRED', 'CHATGPT_RELAY', 'dummy-hash', 'Please fix XYZ', ?3, ?3, ?3)",
+                rusqlite::params![
+                    stale_epoch_cycle_id,
+                    project_id,
+                    now
+                ],
+            )
+            .unwrap();
+        drop(db);
+        let mut db = db_manager.lock().await;
+        let err = coalition_lib::commands::verify_and_prepare_review_correction(
+            &mut db,
+            &project_id,
+            stale_epoch_cycle_id,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "STALE_EVIDENCE");
+    }
+
+    // 8. Empty corrections packet
+    let empty_corr_cycle_id = "cycle-empty-corr";
+    {
+        let db = db_manager.lock().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.connection()
+            .execute(
+                "INSERT INTO review_cycles (
+                    cycle_id, project_id, cycle_number, architecture_version, epoch_id,
+                    status, verdict, reviewer_type, review_packet_hash, corrections_packet, started_at, completed_at, created_at
+                 ) VALUES (?1, ?2, 6, '1.0', ?3, 'CORRECTIONS_REQUIRED', 'CORRECTIONS_REQUIRED', 'CHATGPT_RELAY', 'dummy-hash', '   ', ?4, ?4, ?4)",
+                rusqlite::params![
+                    empty_corr_cycle_id,
+                    project_id,
+                    epoch_id,
+                    now
+                ],
+            )
+            .unwrap();
+        drop(db);
+        let mut db = db_manager.lock().await;
+        let err = coalition_lib::commands::verify_and_prepare_review_correction(
+            &mut db,
+            &project_id,
+            empty_corr_cycle_id,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "INVALID_STATE");
+    }
+
+    // D. Defense-in-depth inside BuilderService::start_governed_turn_with_source
+    // 1. ReviewCorrection rejects if incoming workflow state is NOT CORRECTIONS_REQUIRED
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartBuild,
+            "HUMAN",
+        )
+        .unwrap();
+        drop(db);
+
+        let err = coalition_lib::core::builder::BuilderService::start_governed_turn_with_source(
+            db_manager.clone(),
+            builder_registry.clone(),
+            None,
+            &project_id,
+            None,
+            None,
+            None,
+            Some(
+                coalition_lib::core::builder::BuilderInstructionSource::ReviewCorrection {
+                    review_cycle_id: valid_cycle_id.to_string(),
+                },
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("CORRECTIONS_REQUIRED"),
+            "BuilderService must reject ReviewCorrection when state is BUILDING: {}",
+            err
+        );
+    }
+
+    // 2. ValidationDiagnostic defense in depth:
+    // Insert a PASS validation run and ensure BuilderService rejects it even if called directly
+    let pass_run_id = "val-pass-cannot-route";
+    {
+        let db = db_manager.lock().await;
+        let pass_run = coalition_lib::core::validation::ValidationRunRecord {
+            run_id: pass_run_id.to_string(),
+            project_id: project_id.clone(),
+            architecture_version: "1.0".to_string(),
+            epoch_id: Some(epoch_id.clone()),
+            trigger_source: ValidationTriggerSource::BuilderRequested,
+            status: coalition_lib::core::validation::ValidationRunStatus::Pass,
+            is_gate_passed: true,
+            has_override: false,
+            git_head: None,
+            git_dirty_fingerprint: None,
+            config_fingerprint: None,
+            log_path: None,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+            duration_ms: 50,
+            commands: Vec::new(),
+        };
+        coalition_lib::core::validation::insert_validation_run(db.connection(), &pass_run).unwrap();
+        drop(db);
+
+        let err = coalition_lib::core::builder::BuilderService::start_governed_turn_with_source(
+            db_manager.clone(),
+            builder_registry.clone(),
+            None,
+            &project_id,
+            None,
+            None,
+            None,
+            Some(
+                coalition_lib::core::builder::BuilderInstructionSource::ValidationDiagnostic {
+                    validation_run_id: pass_run_id.to_string(),
+                },
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("FAIL or TIMEOUT"),
+            "BuilderService must reject non-failing validation runs for diagnostic routing: {}",
+            err
+        );
+    }
+
+    // 3. ValidationDiagnostic defense in depth:
+    // POST_BUILD failed run supplied while in BUILDING state must fail closed
+    let pb_fail_run_id = "val-pb-fail-mismatch";
+    {
+        let db = db_manager.lock().await;
+        let pb_fail = coalition_lib::core::validation::ValidationRunRecord {
+            run_id: pb_fail_run_id.to_string(),
+            project_id: project_id.clone(),
+            architecture_version: "1.0".to_string(),
+            epoch_id: Some(epoch_id.clone()),
+            trigger_source: ValidationTriggerSource::PostBuild,
+            status: coalition_lib::core::validation::ValidationRunStatus::Fail,
+            is_gate_passed: false,
+            has_override: false,
+            git_head: None,
+            git_dirty_fingerprint: None,
+            config_fingerprint: None,
+            log_path: None,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+            duration_ms: 50,
+            commands: Vec::new(),
+        };
+        coalition_lib::core::validation::insert_validation_run(db.connection(), &pb_fail).unwrap();
+        drop(db);
+
+        // Project is in BUILDING state. POST_BUILD trigger is invalid!
+        let err = coalition_lib::core::builder::BuilderService::start_governed_turn_with_source(
+            db_manager.clone(),
+            builder_registry.clone(),
+            None,
+            &project_id,
+            None,
+            None,
+            None,
+            Some(
+                coalition_lib::core::builder::BuilderInstructionSource::ValidationDiagnostic {
+                    validation_run_id: pb_fail_run_id.to_string(),
+                },
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid combination"),
+            "BuilderService must reject POST_BUILD failure diagnostic while in BUILDING state: {}",
+            err
+        );
+    }
+}

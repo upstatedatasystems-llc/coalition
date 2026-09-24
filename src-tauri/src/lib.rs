@@ -100,6 +100,7 @@ pub fn run() {
             commands::get_builder_events,
             commands::start_builder_turn,
             commands::start_builder_diagnostic_turn,
+            commands::start_builder_correction_turn,
             commands::cancel_builder_turn,
             commands::run_diagnostic_fake_agy_turn,
             commands::get_usage_telemetry,

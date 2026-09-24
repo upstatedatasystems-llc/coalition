@@ -1465,19 +1465,8 @@ impl BuilderService {
             }
         }
 
-        // 4. Preflights have succeeded. If workflow state was FROZEN or CORRECTIONS_REQUIRED, transition to BUILDING.
-        if current_wf_state == "FROZEN" || current_wf_state == "CORRECTIONS_REQUIRED" {
-            let mut db = db_arc.lock().await;
-            crate::core::workflow::apply_workflow_action(
-                db.connection_mut(),
-                project_id,
-                crate::core::workflow::WorkflowAction::StartBuild,
-                "HUMAN",
-            )
-            .map_err(|e| BuilderError::ExecutionFailed(e.to_string()))?;
-        }
-
-        // 5. Invariant: Builder input comes authoritatively from frozen packet, review corrections, or validation diagnostics.
+        // 4. Invariant: Builder input comes authoritatively from frozen packet, review corrections, or validation diagnostics.
+        // Validate instruction source BEFORE mutating workflow state so any preflight failure fails closed without state drift.
         let turn_prompt = match &instruction_source {
             Some(BuilderInstructionSource::ValidationDiagnostic { validation_run_id }) => {
                 let db = db_arc.lock().await;
@@ -1485,16 +1474,20 @@ impl BuilderService {
                     project_id: String,
                     architecture_version: String,
                     epoch_id: String,
+                    status: String,
+                    trigger_source: String,
                 }
                 let run_info: Option<RunCheck> = db
                     .connection()
                     .query_row(
-                        "SELECT project_id, architecture_version, epoch_id FROM validation_runs WHERE run_id = ?1",
+                        "SELECT project_id, architecture_version, epoch_id, status, trigger_source FROM validation_runs WHERE run_id = ?1",
                         rusqlite::params![validation_run_id],
                         |r| Ok(RunCheck {
                             project_id: r.get(0)?,
                             architecture_version: r.get(1)?,
                             epoch_id: r.get(2)?,
+                            status: r.get(3)?,
+                            trigger_source: r.get(4)?,
                         }),
                     )
                     .optional()
@@ -1512,6 +1505,24 @@ impl BuilderService {
                         "Validation run {} does not belong to project {}",
                         validation_run_id, project_id
                     )));
+                }
+
+                if run.status != "FAIL" && run.status != "TIMEOUT" {
+                    return Err(BuilderError::ExecutionFailed(format!(
+                        "Validation run {} has status '{}', must be FAIL or TIMEOUT for diagnostic routing",
+                        validation_run_id, run.status
+                    )));
+                }
+
+                match (current_wf_state.as_str(), run.trigger_source.as_str()) {
+                    ("BUILDING", "BUILDER_REQUESTED") => {}
+                    ("CORRECTIONS_REQUIRED", "POST_BUILD") => {}
+                    (state, trig) => {
+                        return Err(BuilderError::ExecutionFailed(format!(
+                            "Invalid combination: workflow state '{}' does not permit validation diagnostic routing with trigger '{}' (BUILDING requires BUILDER_REQUESTED, CORRECTIONS_REQUIRED requires POST_BUILD)",
+                            state, trig
+                        )));
+                    }
                 }
 
                 if run.architecture_version != _arch_version {
@@ -1547,6 +1558,13 @@ impl BuilderService {
                 )
             }
             Some(BuilderInstructionSource::ReviewCorrection { review_cycle_id }) => {
+                if current_wf_state != "CORRECTIONS_REQUIRED" {
+                    return Err(BuilderError::ExecutionFailed(format!(
+                        "ReviewCorrection instruction source is only permitted when workflow state is CORRECTIONS_REQUIRED (current: {})",
+                        current_wf_state
+                    )));
+                }
+
                 let db = db_arc.lock().await;
                 struct CycleCheck {
                     project_id: String,
@@ -1644,6 +1662,18 @@ impl BuilderService {
             }
             _ => builder_packet.prompt.clone(),
         };
+
+        // 5. Preflights and source checks have succeeded. If workflow state was FROZEN or CORRECTIONS_REQUIRED, transition to BUILDING.
+        if current_wf_state == "FROZEN" || current_wf_state == "CORRECTIONS_REQUIRED" {
+            let mut db = db_arc.lock().await;
+            crate::core::workflow::apply_workflow_action(
+                db.connection_mut(),
+                project_id,
+                crate::core::workflow::WorkflowAction::StartBuild,
+                "HUMAN",
+            )
+            .map_err(|e| BuilderError::ExecutionFailed(e.to_string()))?;
+        }
 
         // 6. Check for existing conversation in this epoch only and Icarus state
         let (existing_conv_id, icarus_mode) = {

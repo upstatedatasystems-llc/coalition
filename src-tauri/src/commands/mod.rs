@@ -891,6 +891,30 @@ pub async fn start_builder_turn(
     state: State<'_, AppState>,
     payload: StartBuilderTurnPayload,
 ) -> Result<BuilderTurnResponse, CommandError> {
+    if let Some(
+        crate::core::builder::BuilderInstructionSource::ReviewCorrection { .. }
+        | crate::core::builder::BuilderInstructionSource::ValidationDiagnostic { .. },
+    ) = payload.instruction_source
+    {
+        return Err(CommandError::new(
+            "GOVERNED_BUILDER_SOURCE_REQUIRES_DEDICATED_COMMAND",
+            "Governed review corrections and validation diagnostics cannot be dispatched via generic start_builder_turn. Use start_builder_correction_turn or start_builder_diagnostic_turn.",
+        ));
+    }
+
+    {
+        let db = state.db.lock().await;
+        let wf_state =
+            crate::core::workflow::get_workflow_state(db.connection(), &payload.project_id)
+                .map_err(CommandError::from)?;
+        if wf_state.state == crate::core::workflow::WorkflowState::CorrectionsRequired {
+            return Err(CommandError::new(
+                "INVALID_WORKFLOW_STATE",
+                "Cannot start generic Builder turn while project is in CORRECTIONS_REQUIRED state. Governed review corrections or validation diagnostics must be dispatched via their dedicated commands.",
+            ));
+        }
+    }
+
     let adapter = {
         let lock = state.agy.lock().await;
         if let Some(ref a) = *lock {
@@ -1173,6 +1197,201 @@ pub async fn start_builder_diagnostic_turn(
         Some(
             crate::core::builder::BuilderInstructionSource::ValidationDiagnostic {
                 validation_run_id: payload.validation_run_id,
+            },
+        ),
+        Some(state.active_validation_registry.clone()),
+        Some(val_sink),
+    )
+    .await
+    .map_err(CommandError::from)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartBuilderCorrectionTurnPayload {
+    #[serde(alias = "project_id")]
+    pub project_id: String,
+    #[serde(alias = "review_cycle_id")]
+    pub review_cycle_id: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// Authoritative verification and workflow preparation for routing review corrections to Builder.
+/// Enforces:
+/// - Validation of builder preflight (repo, architecture version, builder epoch).
+/// - Current workflow state is CORRECTIONS_REQUIRED.
+/// - Review cycle belongs to active project.
+/// - Review cycle status or verdict is CORRECTIONS_REQUIRED.
+/// - Review cycle is human-confirmed (completed_at is Some).
+/// - Architecture version matches active frozen architecture.
+/// - Builder epoch matches current Builder epoch.
+/// - Corrections packet exists and is non-empty.
+/// - Logs REVIEW_CORRECTIONS_ROUTED_TO_BUILDER activity event.
+pub fn verify_and_prepare_review_correction(
+    db: &mut DbManager,
+    project_id: &str,
+    review_cycle_id: &str,
+) -> Result<(), CommandError> {
+    // 1. Authoritative verification: preflight repo, architecture version, builder epoch
+    let (_repo_path, current_arch_version, builder_packet) =
+        validate_builder_preflight(db, project_id)?;
+    let current_epoch = builder_packet.metadata.builder_epoch_id;
+
+    // 2. Workflow state must be exactly CORRECTIONS_REQUIRED
+    let wf_state = crate::core::workflow::get_workflow_state(db.connection(), project_id)
+        .map_err(CommandError::from)?;
+    if wf_state.state != crate::core::workflow::WorkflowState::CorrectionsRequired {
+        return Err(CommandError::new(
+            "INVALID_WORKFLOW_STATE",
+            format!(
+                "Cannot start builder correction turn while project is in {} state (must be CORRECTIONS_REQUIRED)",
+                wf_state.state
+            ),
+        ));
+    }
+
+    // 3. Authoritative verification of review cycle
+    let cycle = crate::core::review::get_review_cycle(db.connection(), review_cycle_id)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| {
+            CommandError::new(
+                "NOT_FOUND",
+                format!("Review cycle {} not found", review_cycle_id),
+            )
+        })?;
+
+    if cycle.project_id != project_id {
+        return Err(CommandError::new(
+            "FORBIDDEN",
+            format!(
+                "Review cycle {} does not belong to project {}",
+                review_cycle_id, project_id
+            ),
+        ));
+    }
+
+    if cycle.status != crate::core::review::ReviewCycleStatus::CorrectionsRequired
+        && cycle.verdict != Some(crate::core::review::ReviewVerdict::CorrectionsRequired)
+    {
+        return Err(CommandError::new(
+            "INVALID_STATE",
+            format!(
+                "Review cycle {} is not in CORRECTIONS_REQUIRED status (status={}, verdict={:?})",
+                review_cycle_id, cycle.status, cycle.verdict
+            ),
+        ));
+    }
+
+    if cycle.completed_at.is_none() {
+        return Err(CommandError::new(
+            "INVALID_STATE",
+            format!(
+                "Review cycle {} has not been human-confirmed",
+                review_cycle_id
+            ),
+        ));
+    }
+
+    if cycle.architecture_version != current_arch_version {
+        return Err(CommandError::new(
+            "STALE_EVIDENCE",
+            format!(
+                "Review cycle architecture version ({}) does not match current ({})",
+                cycle.architecture_version, current_arch_version
+            ),
+        ));
+    }
+
+    if cycle.epoch_id.as_deref() != Some(&current_epoch) {
+        return Err(CommandError::new(
+            "STALE_EVIDENCE",
+            format!(
+                "Review cycle epoch ({:?}) does not match current Builder epoch ({})",
+                cycle.epoch_id, current_epoch
+            ),
+        ));
+    }
+
+    let corrections = cycle.corrections_packet.as_deref().unwrap_or("");
+    if corrections.trim().is_empty() {
+        return Err(CommandError::new(
+            "INVALID_STATE",
+            format!(
+                "Review cycle {} corrections packet is empty",
+                review_cycle_id
+            ),
+        ));
+    }
+
+    // 4. Log activity event
+    let meta = serde_json::json!({
+        "review_cycle_id": review_cycle_id,
+        "reason": "Routed review corrections to Builder"
+    });
+    let _ = crate::core::activity::ActivityManager::record_event(
+        db.connection(),
+        project_id,
+        "REVIEW_CORRECTIONS_ROUTED_TO_BUILDER",
+        "HUMAN",
+        &format!(
+            "Routed review cycle {} corrections to Builder",
+            review_cycle_id
+        ),
+        Some(&meta),
+    );
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn start_builder_correction_turn(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    payload: StartBuilderCorrectionTurnPayload,
+) -> Result<BuilderTurnResponse, CommandError> {
+    {
+        let mut db = state.db.lock().await;
+        verify_and_prepare_review_correction(
+            &mut db,
+            &payload.project_id,
+            &payload.review_cycle_id,
+        )?;
+    }
+
+    let adapter = {
+        let lock = state.agy.lock().await;
+        if let Some(ref a) = *lock {
+            AntigravityCliAdapter::with_path(a.binary_path())
+        } else {
+            AntigravityCliAdapter::discover()
+                .map_err(|e| CommandError::new("AGY_DISCOVERY_ERROR", e.to_string()))?
+        }
+    };
+
+    let app_handle = app.clone();
+    let sink: crate::core::builder::BuilderEventSink = Arc::new(move |evt, val| {
+        use tauri::Emitter;
+        let _ = app_handle.emit(evt, val);
+    });
+
+    let app_handle_val = app.clone();
+    let val_sink: crate::core::validation::ValidationEventSink = Arc::new(move |evt, val| {
+        use tauri::Emitter;
+        let _ = app_handle_val.emit(evt, val);
+    });
+
+    crate::core::builder::BuilderService::start_governed_turn_with_source(
+        state.db.clone(),
+        state.active_builder_registry.clone(),
+        Some(sink),
+        &payload.project_id,
+        payload.model,
+        payload.effort,
+        Some(adapter),
+        Some(
+            crate::core::builder::BuilderInstructionSource::ReviewCorrection {
+                review_cycle_id: payload.review_cycle_id,
             },
         ),
         Some(state.active_validation_registry.clone()),

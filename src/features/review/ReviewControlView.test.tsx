@@ -314,7 +314,7 @@ describe('ReviewControlView', () => {
     mockInvoke.mockImplementation((cmd) => {
       if (cmd === 'get_latest_review_cycle') return Promise.resolve(mockCorrectionsCycle);
       if (cmd === 'list_review_cycles') return Promise.resolve([mockPendingCycle, mockCorrectionsCycle]);
-      if (cmd === 'start_builder_turn') return Promise.resolve({ status: 'RUNNING' });
+      if (cmd === 'start_builder_correction_turn') return Promise.resolve({ status: 'RUNNING' });
       return Promise.resolve(null);
     });
 
@@ -340,13 +340,10 @@ describe('ReviewControlView', () => {
     fireEvent.click(screen.getByTestId('start-builder-corrections-btn'));
 
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith('start_builder_turn', {
+      expect(mockInvoke).toHaveBeenCalledWith('start_builder_correction_turn', {
         payload: {
           projectId: 'proj-1',
-          instructionSource: {
-            type: 'REVIEW_CORRECTION',
-            review_cycle_id: 'cycle-2',
-          },
+          reviewCycleId: 'cycle-2',
         },
       });
       expect(navigateMock).toHaveBeenCalled();
