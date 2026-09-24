@@ -304,4 +304,99 @@ describe('ReviewControlView', () => {
       expect(navigateMock).toHaveBeenCalled();
     });
   });
+
+  it('fetches review packet from disk via get_review_packet_content if not in memory', async () => {
+    mockInvoke.mockImplementation((cmd, args: any) => {
+      if (cmd === 'get_latest_review_cycle') return Promise.resolve(mockPendingCycle);
+      if (cmd === 'list_review_cycles') return Promise.resolve([mockPendingCycle]);
+      if (cmd === 'get_review_packet_content') {
+        expect(args.projectId).toBe('proj-1');
+        expect(args.cycleId).toBe('cycle-1');
+        return Promise.resolve('=== COALITION REVIEW RELAY ENVELOPE ===\nDisk Content');
+      }
+      return Promise.resolve(null);
+    });
+
+    render(
+      <ReviewControlView
+        projectId="proj-1"
+        projectName="Test Project"
+        workflowState="WAITING_FOR_REVIEW"
+        onRefreshProject={vi.fn()}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('copy-packet-btn')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByTestId('copy-packet-btn'));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith('get_review_packet_content', {
+        projectId: 'proj-1',
+        cycleId: 'cycle-1',
+      });
+      expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
+        '=== COALITION REVIEW RELAY ENVELOPE ===\nDisk Content'
+      );
+    });
+  });
+
+  it('renders requirement linkage fields in findings', async () => {
+    const cycleWithLinkage: ReviewCycleRecord = {
+      ...mockCorrectionsCycle,
+      findings: [
+        {
+          finding_id: 'fnd-linkage-1',
+          project_id: 'proj-1',
+          first_cycle_id: 'cycle-1',
+          last_cycle_id: 'cycle-2',
+          fingerprint: 'fp-linkage',
+          severity: 'CRITICAL',
+          status: 'OPEN',
+          file_path: 'src/core/mod.rs',
+          line_range: '10-20',
+          title: 'Contract breach',
+          description: 'Architecture contract violated',
+          suggested_fix: 'Follow specification',
+          requirement_references: ['REQ-AUTH-001'],
+          problem_statement: 'Authentication token is not verified against public key',
+          required_change: 'Verify signature using Ed25519 validator',
+          required_test: 'Run cargo test test_token_verification',
+          resolution_cycle_id: null,
+          is_repeat: false,
+          created_at: '2026-09-23T12:00:00Z',
+          updated_at: '2026-09-23T13:05:00Z',
+        },
+      ],
+    };
+
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_latest_review_cycle') return Promise.resolve(cycleWithLinkage);
+      if (cmd === 'list_review_cycles') return Promise.resolve([cycleWithLinkage]);
+      return Promise.resolve(null);
+    });
+
+    render(
+      <ReviewControlView
+        projectId="proj-1"
+        projectName="Test Project"
+        workflowState="CORRECTIONS_REQUIRED"
+        onRefreshProject={vi.fn()}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('finding-req-refs')).toBeInTheDocument();
+      expect(screen.getByTestId('finding-problem')).toBeInTheDocument();
+      expect(screen.getByTestId('finding-required-change')).toBeInTheDocument();
+      expect(screen.getByTestId('finding-required-test')).toBeInTheDocument();
+    });
+
+    expect(screen.getByText('REQ-AUTH-001')).toBeInTheDocument();
+    expect(screen.getByText('Authentication token is not verified against public key')).toBeInTheDocument();
+    expect(screen.getByText('Verify signature using Ed25519 validator')).toBeInTheDocument();
+    expect(screen.getByText('Run cargo test test_token_verification')).toBeInTheDocument();
+  });
 });

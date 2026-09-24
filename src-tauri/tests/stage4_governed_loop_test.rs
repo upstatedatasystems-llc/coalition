@@ -1039,3 +1039,421 @@ policy:
         "Gate must not pass when required commands were omitted"
     );
 }
+
+#[tokio::test]
+async fn test_strict_envelope_rejections() {
+    let (repo_temp, _db_temp, project_id, db_path) = setup_frozen_test_project();
+    let repo_path = repo_temp.path();
+
+    let db_manager = Arc::new(Mutex::new(DbManager::open(&db_path).unwrap()));
+    let validation_reg = Arc::new(Mutex::new(ActiveValidationRegistry::new()));
+    let app_data_temp = tempdir().unwrap();
+    let app_data_dir = app_data_temp.path();
+
+    // Advance to WAITING_FOR_REVIEW
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartBuild,
+            "HUMAN",
+        )
+        .unwrap();
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartValidation,
+            "HUMAN",
+        )
+        .unwrap();
+    }
+
+    let target_dir = repo_path.join("target");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::write(target_dir.join("clean.txt"), "clean\n").unwrap();
+
+    ValidationService::execute_validation_run(
+        db_manager.clone(),
+        validation_reg.clone(),
+        &project_id,
+        repo_path,
+        ValidationTriggerSource::PostBuild,
+        None,
+        None,
+        app_data_dir,
+    )
+    .await
+    .unwrap();
+
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::SubmitForReview,
+            "HUMAN",
+        )
+        .unwrap();
+    }
+
+    let (cycle, _) = {
+        let db = db_manager.lock().await;
+        ReviewService::prepare_review_packet(
+            db.connection(),
+            repo_path,
+            &project_id,
+            ReviewerType::ChatgptRelay,
+        )
+        .unwrap()
+    };
+
+    // 1. Missing verdict field
+    let missing_verdict = format!(
+        "```verdict\nschema_version: 1\nresponse_type: REVIEW_VERDICT\nproject_id: \"{}\"\ncycle_id: \"{}\"\nreview_packet_hash: \"{}\"\nsummary: Test missing verdict\nfindings: []\n```",
+        project_id, cycle.cycle_id, cycle.review_packet_hash
+    );
+    {
+        let db = db_manager.lock().await;
+        let err = ReviewService::prepare_review_import(
+            db.connection(),
+            repo_path,
+            &project_id,
+            &cycle.cycle_id,
+            &missing_verdict,
+        );
+        assert!(
+            err.is_err(),
+            "Must reject verdict envelope missing verdict field"
+        );
+    }
+
+    // 2. Missing review_packet_hash field
+    let missing_hash = format!(
+        "```verdict\nschema_version: 1\nresponse_type: REVIEW_VERDICT\nproject_id: \"{}\"\ncycle_id: \"{}\"\nverdict: ACCEPT\nsummary: Test missing hash\nfindings: []\n```",
+        project_id, cycle.cycle_id
+    );
+    {
+        let db = db_manager.lock().await;
+        let err = ReviewService::prepare_review_import(
+            db.connection(),
+            repo_path,
+            &project_id,
+            &cycle.cycle_id,
+            &missing_hash,
+        );
+        assert!(
+            err.is_err(),
+            "Must reject verdict envelope missing review_packet_hash"
+        );
+    }
+
+    // 3. Unknown field injected (deny_unknown_fields)
+    let unknown_field = format!(
+        "```verdict\nschema_version: 1\nresponse_type: REVIEW_VERDICT\nproject_id: \"{}\"\ncycle_id: \"{}\"\nreview_packet_hash: \"{}\"\nverdict: ACCEPT\nsummary: Test unknown field\nfindings: []\nextra_unknown_prop: \"injected\"\n```",
+        project_id, cycle.cycle_id, cycle.review_packet_hash
+    );
+    {
+        let db = db_manager.lock().await;
+        let err = ReviewService::prepare_review_import(
+            db.connection(),
+            repo_path,
+            &project_id,
+            &cycle.cycle_id,
+            &unknown_field,
+        );
+        assert!(
+            err.is_err(),
+            "Must reject verdict envelope with unknown fields"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_override_validation_gate_fails_closed_on_mismatched_epoch() {
+    let (repo_temp, _db_temp, project_id, db_path) = setup_frozen_test_project();
+    let repo_path = repo_temp.path();
+
+    let mut db = DbManager::open(&db_path).unwrap();
+
+    let coalition_dir = repo_path.join(".coalition");
+    let py = coalition_lib::core::artifacts::ArtifactManager::read_project_yaml(
+        coalition_dir.join("project.yaml"),
+    )
+    .unwrap();
+    let arch_version = py
+        .current_architecture_version
+        .unwrap_or_else(|| "1.0.0".to_string());
+
+    // Insert an active epoch into builder_epochs (column is `status`)
+    db.connection_mut().execute(
+        "INSERT INTO builder_epochs (epoch_id, project_id, architecture_version, created_at, status) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params!["epoch-active-current", &project_id, &arch_version, "2026-09-24T00:00:00Z", "BUILDING"],
+    ).unwrap();
+
+    // Create a failed validation run with a different epoch
+    let run_rec = coalition_lib::core::validation::ValidationRunRecord {
+        run_id: "val-run-old-epoch".to_string(),
+        project_id: project_id.clone(),
+        architecture_version: arch_version.clone(),
+        epoch_id: Some("epoch-stale-old".to_string()),
+        trigger_source: ValidationTriggerSource::PostBuild,
+        status: coalition_lib::core::validation::ValidationRunStatus::Fail,
+        is_gate_passed: false,
+        has_override: false,
+        git_head: Some("abc1234".to_string()),
+        git_dirty_fingerprint: Some("none".to_string()),
+        config_fingerprint: Some(
+            ValidationService::read_validation_config(repo_path)
+                .unwrap()
+                .fingerprint(),
+        ),
+        log_path: None,
+        started_at: "2026-09-24T00:00:00Z".to_string(),
+        completed_at: Some("2026-09-24T00:00:05Z".to_string()),
+        duration_ms: 5000,
+        commands: vec![],
+    };
+    coalition_lib::core::validation::insert_validation_run(db.connection_mut(), &run_rec).unwrap();
+
+    // Attempt override - must fail closed because epoch doesn't match current epoch
+    let result = ValidationService::override_validation_gate(
+        db.connection_mut(),
+        repo_path,
+        &project_id,
+        "val-run-old-epoch",
+        "Override attempt with stale epoch",
+        "HUMAN",
+    );
+
+    assert!(
+        result.is_err(),
+        "Override must fail closed when run epoch does not match current builder epoch"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(err_msg.contains("does not match current Builder epoch"));
+}
+
+#[tokio::test]
+async fn test_crash_safe_journal_recovery() {
+    let (repo_temp, _db_temp, project_id, db_path) = setup_frozen_test_project();
+    let repo_path = repo_temp.path();
+    let reviews_dir = repo_path.join(".coalition").join("reviews");
+    fs::create_dir_all(&reviews_dir).unwrap();
+
+    let mut db = DbManager::open(&db_path).unwrap();
+
+    // Seam 1: STAGING phase - staging dir exists, target dir does not exist yet.
+    // Uncommitted SQLite transaction: Reconcile must remove the orphaned staging dir and clean up journal row.
+    let staging_1 = reviews_dir.join(".staging-cycle-99");
+    fs::create_dir_all(&staging_1).unwrap();
+    fs::write(staging_1.join("temp.txt"), "in progress").unwrap();
+
+    db.connection_mut().execute(
+        "INSERT INTO review_acceptance_journal (cycle_id, project_id, preview_id, phase, staging_dir, target_dir, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            "cycle-staging-test",
+            &project_id,
+            "prev-1",
+            "STAGING",
+            staging_1.to_str().unwrap(),
+            reviews_dir.join("cycle-99").to_str().unwrap(),
+            "2026-09-24T00:00:00Z",
+            "2026-09-24T00:00:00Z",
+        ],
+    ).unwrap();
+
+    let reconciled = ReviewService::reconcile_review_acceptance_journal(
+        db.connection_mut(),
+        repo_path,
+        &project_id,
+    )
+    .unwrap();
+    assert_eq!(reconciled, 1);
+    assert!(
+        !staging_1.exists(),
+        "Orphaned staging dir must be deleted on recovery"
+    );
+
+    let count: i64 = db
+        .connection_mut()
+        .query_row(
+            "SELECT COUNT(*) FROM review_acceptance_journal WHERE cycle_id = 'cycle-staging-test'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "Journal entry must be deleted after recovery");
+
+    // Seam 2: COMMITTED phase where staging dir exists and target dir does not exist yet.
+    // SQLite transaction committed: Reconcile must promote staging dir to target dir and remove journal row.
+    let staging_2 = reviews_dir.join(".staging-cycle-100");
+    let target_2 = reviews_dir.join("cycle-100");
+    fs::create_dir_all(&staging_2).unwrap();
+    fs::write(staging_2.join("verdict.yaml"), "schema_version: 1\n").unwrap();
+
+    db.connection_mut().execute(
+        "INSERT INTO review_acceptance_journal (cycle_id, project_id, preview_id, phase, staging_dir, target_dir, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            "cycle-committing-test",
+            &project_id,
+            "prev-2",
+            "COMMITTED",
+            staging_2.to_str().unwrap(),
+            target_2.to_str().unwrap(),
+            "2026-09-24T00:00:00Z",
+            "2026-09-24T00:00:00Z",
+        ],
+    ).unwrap();
+
+    let reconciled_2 = ReviewService::reconcile_review_acceptance_journal(
+        db.connection_mut(),
+        repo_path,
+        &project_id,
+    )
+    .unwrap();
+    assert_eq!(reconciled_2, 1);
+    assert!(!staging_2.exists(), "Staging dir should no longer exist");
+    assert!(
+        target_2.exists(),
+        "Target dir must be promoted from staging dir"
+    );
+
+    let count_2: i64 = db.connection_mut().query_row(
+        "SELECT COUNT(*) FROM review_acceptance_journal WHERE cycle_id = 'cycle-committing-test'",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(count_2, 0);
+
+    // Seam 3: COMMITTED phase where target dir already exists.
+    // Reconcile must remove journal entry cleanly.
+    db.connection_mut().execute(
+        "INSERT INTO review_acceptance_journal (cycle_id, project_id, preview_id, phase, staging_dir, target_dir, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            "cycle-committed-test",
+            &project_id,
+            "prev-3",
+            "COMMITTED",
+            staging_2.to_str().unwrap(),
+            target_2.to_str().unwrap(),
+            "2026-09-24T00:00:00Z",
+            "2026-09-24T00:00:00Z",
+        ],
+    ).unwrap();
+
+    let reconciled_3 = ReviewService::reconcile_review_acceptance_journal(
+        db.connection_mut(),
+        repo_path,
+        &project_id,
+    )
+    .unwrap();
+    assert_eq!(reconciled_3, 1);
+
+    let count_3: i64 = db.connection_mut().query_row(
+        "SELECT COUNT(*) FROM review_acceptance_journal WHERE cycle_id = 'cycle-committed-test'",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(count_3, 0);
+}
+
+#[tokio::test]
+async fn test_review_packet_hash_identity() {
+    use sha2::{Digest, Sha256};
+
+    let (repo_temp, _db_temp, project_id, db_path) = setup_frozen_test_project();
+    let repo_path = repo_temp.path();
+
+    let db_manager = Arc::new(Mutex::new(DbManager::open(&db_path).unwrap()));
+    let validation_reg = Arc::new(Mutex::new(ActiveValidationRegistry::new()));
+    let app_data_temp = tempdir().unwrap();
+    let app_data_dir = app_data_temp.path();
+
+    // Advance to WAITING_FOR_REVIEW
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartBuild,
+            "HUMAN",
+        )
+        .unwrap();
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartValidation,
+            "HUMAN",
+        )
+        .unwrap();
+    }
+
+    let target_dir = repo_path.join("target");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::write(target_dir.join("clean.txt"), "clean\n").unwrap();
+
+    ValidationService::execute_validation_run(
+        db_manager.clone(),
+        validation_reg.clone(),
+        &project_id,
+        repo_path,
+        ValidationTriggerSource::PostBuild,
+        None,
+        None,
+        app_data_dir,
+    )
+    .await
+    .unwrap();
+
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::SubmitForReview,
+            "HUMAN",
+        )
+        .unwrap();
+    }
+
+    let (cycle, packet_text) = {
+        let db = db_manager.lock().await;
+        ReviewService::prepare_review_packet(
+            db.connection(),
+            repo_path,
+            &project_id,
+            ReviewerType::ChatgptRelay,
+        )
+        .unwrap()
+    };
+
+    // Verify disk packet file exists
+    let packet_file = repo_path
+        .join(".coalition")
+        .join("reviews")
+        .join("cycle-1")
+        .join("packet.md");
+    assert!(packet_file.exists());
+    let disk_content = fs::read_to_string(&packet_file).unwrap();
+    assert_eq!(disk_content, packet_text);
+
+    // Verify hash calculation is over the body below delimiter
+    let body_marker = "=== COALITION REVIEW PACKET BODY ===\n\n";
+    let body_start = disk_content
+        .find(body_marker)
+        .expect("Body marker must be present");
+    let packet_body = &disk_content[body_start + body_marker.len()..];
+
+    let computed_hash = format!("{:x}", Sha256::digest(packet_body.as_bytes()));
+    assert_eq!(
+        cycle.review_packet_hash, computed_hash,
+        "Packet hash must strictly equal SHA-256 of the packet body below delimiter"
+    );
+
+    // Verify header references the non-self-referential hash
+    assert!(
+        disk_content.contains(&format!("Review-Packet-Hash: {}", computed_hash)),
+        "Header must cleanly state the review packet hash"
+    );
+}

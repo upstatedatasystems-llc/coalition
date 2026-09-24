@@ -565,6 +565,11 @@ export interface ReviewFindingRecord {
   title: string;
   description: string;
   suggested_fix?: string | null;
+  requirement_references?: string[];
+  problem_statement?: string | null;
+  required_change?: string | null;
+  required_test?: string | null;
+  reviewer_source_id?: string | null;
   resolution_cycle_id?: string | null;
   is_repeat: boolean;
   created_at: string;
@@ -600,6 +605,10 @@ export interface ParsedReviewFinding {
   lines?: string | null;
   description: string;
   suggested_fix?: string | null;
+  requirement_references?: string[];
+  problem_statement?: string | null;
+  required_change?: string | null;
+  required_test?: string | null;
 }
 
 export interface ReviewImportPreview {

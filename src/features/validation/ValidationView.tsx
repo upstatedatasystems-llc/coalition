@@ -83,12 +83,32 @@ export const ValidationView: React.FC<ValidationViewProps> = ({
                 status: payload.status,
                 commands: payload.commands ?? prev.commands,
               }
+            : payload.status === 'RUNNING' || payload.status === 'QUEUED'
+            ? {
+                run_id: payload.run_id,
+                project_id: payload.project_id,
+                architecture_version: payload.architecture_version ?? '',
+                epoch_id: payload.epoch_id ?? null,
+                trigger_source: payload.trigger_source ?? 'MANUAL',
+                status: payload.status,
+                is_gate_passed: false,
+                has_override: false,
+                git_head: payload.git_head ?? null,
+                git_dirty_fingerprint: null,
+                config_fingerprint: null,
+                log_path: null,
+                started_at: new Date().toISOString(),
+                completed_at: null,
+                duration_ms: 0,
+                commands: payload.commands ?? [],
+              }
             : null
         );
       });
 
       const u2 = await listen<any>('validation://command-start', (evt) => {
         const payload = evt.payload;
+        if (payload?.project_id !== projectId) return;
         setLiveLogs((prev) => [
           ...prev.slice(-1000),
           `\n>>> [${new Date().toLocaleTimeString()}] Running: ${payload.name || payload.command_id}...\n`,
@@ -97,6 +117,7 @@ export const ValidationView: React.FC<ValidationViewProps> = ({
 
       const u3 = await listen<any>('validation://output', (evt) => {
         const payload = evt.payload;
+        if (payload?.project_id !== projectId) return;
         if (payload?.line !== undefined) {
           setLiveLogs((prev) => [...prev.slice(-1500), payload.line]);
         }
@@ -104,6 +125,7 @@ export const ValidationView: React.FC<ValidationViewProps> = ({
 
       const u4 = await listen<any>('validation://command-finish', (evt) => {
         const payload = evt.payload;
+        if (payload?.project_id !== projectId) return;
         setLiveLogs((prev) => [
           ...prev.slice(-1000),
           `<<< [${new Date().toLocaleTimeString()}] Command ${payload.command_id} finished with status: ${payload.status} (exit: ${payload.exit_code ?? 'n/a'}) in ${payload.duration_ms}ms\n`,
@@ -113,6 +135,7 @@ export const ValidationView: React.FC<ValidationViewProps> = ({
       const u5 = await listen<any>('validation://finish', (evt) => {
         const payload = evt.payload;
         if (payload?.project_id !== projectId) return;
+        setActiveRun(null);
         setLiveLogs((prev) => [
           ...prev.slice(-1000),
           `\n=== [${new Date().toLocaleTimeString()}] Validation Run ${payload.run_id} finished: ${payload.status} (Gate: ${payload.is_gate_passed ? 'PASSED' : 'FAILED'}) in ${payload.duration_ms}ms ===\n`,

@@ -473,12 +473,32 @@ impl ProjectService {
             conn,
         )?;
 
-        // Rehydrate Stage 4 reviews from disk and reconcile interrupted validation runs
-        let _ = crate::core::review::ReviewService::rehydrate_reviews_from_disk(
+        // Reconcile review acceptance journal and rehydrate Stage 4 reviews from disk (Items 13, 15, 16)
+        let _ = crate::core::review::ReviewService::reconcile_review_acceptance_journal(
             conn,
             &repo_root,
             &project_record.project_id,
         );
+
+        if let Err(e) = crate::core::review::ReviewService::rehydrate_reviews_from_disk(
+            conn,
+            &repo_root,
+            &project_record.project_id,
+        ) {
+            let _ = ActivityManager::record_event(
+                conn,
+                &project_record.project_id,
+                "REVIEW_REHYDRATION_FAILED",
+                "system",
+                &format!("Failed to rehydrate reviews from disk: {}", e),
+                None,
+            );
+            return Err(ProjectError::CorruptedState(format!(
+                "Failed to rehydrate review governance history: {}",
+                e
+            )));
+        }
+
         let _ = crate::core::validation::ValidationService::reconcile_interrupted_runs(conn);
 
         // Re-query authoritative workflow state and durable project descriptor post-reconciliation

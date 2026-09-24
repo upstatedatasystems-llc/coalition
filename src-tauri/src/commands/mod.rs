@@ -907,6 +907,12 @@ pub async fn start_builder_turn(
         let _ = app_handle.emit(evt, val);
     });
 
+    let app_handle_val = app.clone();
+    let val_sink: crate::core::validation::ValidationEventSink = Arc::new(move |evt, val| {
+        use tauri::Emitter;
+        let _ = app_handle_val.emit(evt, val);
+    });
+
     crate::core::builder::BuilderService::start_governed_turn_with_source(
         state.db.clone(),
         state.active_builder_registry.clone(),
@@ -916,6 +922,8 @@ pub async fn start_builder_turn(
         payload.effort,
         Some(adapter),
         payload.instruction_source,
+        Some(state.active_validation_registry.clone()),
+        Some(val_sink),
     )
     .await
     .map_err(CommandError::from)
@@ -1887,6 +1895,46 @@ pub async fn confirm_review_import(
         &pid,
         &prev_id,
         "HUMAN",
+    )
+    .map_err(CommandError::from)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetReviewPacketContentPayload {
+    #[serde(alias = "project_id")]
+    pub project_id: String,
+    #[serde(alias = "cycle_id")]
+    pub cycle_id: String,
+}
+
+#[tauri::command]
+pub async fn get_review_packet_content(
+    state: State<'_, AppState>,
+    payload: Option<GetReviewPacketContentPayload>,
+    project_id: Option<String>,
+    cycle_id: Option<String>,
+) -> Result<String, CommandError> {
+    let (pid, cid) = if let Some(p) = payload {
+        (p.project_id, p.cycle_id)
+    } else {
+        (
+            project_id.ok_or_else(|| CommandError::new("MISSING_ARG", "project_id required"))?,
+            cycle_id.ok_or_else(|| CommandError::new("MISSING_ARG", "cycle_id required"))?,
+        )
+    };
+
+    let repo_path = {
+        let db = state.db.lock().await;
+        get_repo_path_for_project_sync(&db, &pid)?
+    };
+
+    let db = state.db.lock().await;
+    crate::core::review::ReviewService::get_review_packet_content(
+        db.connection(),
+        &repo_path,
+        &pid,
+        &cid,
     )
     .map_err(CommandError::from)
 }

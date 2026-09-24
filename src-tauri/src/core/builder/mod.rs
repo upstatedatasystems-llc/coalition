@@ -1394,6 +1394,8 @@ impl BuilderService {
             effort,
             custom_adapter,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -1408,7 +1410,17 @@ impl BuilderService {
         effort: Option<String>,
         custom_adapter: Option<AntigravityCliAdapter>,
         instruction_source: Option<BuilderInstructionSource>,
+        val_registry_arc: Option<
+            Arc<tokio::sync::Mutex<crate::core::validation::ActiveValidationRegistry>>,
+        >,
+        val_event_sink: Option<crate::core::validation::ValidationEventSink>,
     ) -> Result<BuilderTurnResponse, BuilderError> {
+        let effective_val_registry = val_registry_arc.unwrap_or_else(|| {
+            Arc::new(tokio::sync::Mutex::new(
+                crate::core::validation::ActiveValidationRegistry::new(),
+            ))
+        });
+
         // 1. Check current workflow state: must be FROZEN, BUILDING, or CORRECTIONS_REQUIRED
         let current_wf_state = {
             let db = db_arc.lock().await;
@@ -1469,30 +1481,51 @@ impl BuilderService {
         let turn_prompt = match &instruction_source {
             Some(BuilderInstructionSource::ValidationDiagnostic { validation_run_id }) => {
                 let db = db_arc.lock().await;
-                let run_project_id: Option<String> = db
+                struct RunCheck {
+                    project_id: String,
+                    architecture_version: String,
+                    epoch_id: String,
+                }
+                let run_info: Option<RunCheck> = db
                     .connection()
                     .query_row(
-                        "SELECT project_id FROM validation_runs WHERE run_id = ?1",
+                        "SELECT project_id, architecture_version, epoch_id FROM validation_runs WHERE run_id = ?1",
                         rusqlite::params![validation_run_id],
-                        |r| r.get(0),
+                        |r| Ok(RunCheck {
+                            project_id: r.get(0)?,
+                            architecture_version: r.get(1)?,
+                            epoch_id: r.get(2)?,
+                        }),
                     )
                     .optional()
                     .map_err(|e| BuilderError::Database(e.to_string()))?;
 
-                match run_project_id {
-                    Some(ref pid) if pid == project_id => {}
-                    Some(_) => {
-                        return Err(BuilderError::ExecutionFailed(format!(
-                            "Validation run {} does not belong to project {}",
-                            validation_run_id, project_id
-                        )));
-                    }
-                    None => {
-                        return Err(BuilderError::ExecutionFailed(format!(
-                            "Validation run {} not found",
-                            validation_run_id
-                        )));
-                    }
+                let run = run_info.ok_or_else(|| {
+                    BuilderError::ExecutionFailed(format!(
+                        "Validation run {} not found",
+                        validation_run_id
+                    ))
+                })?;
+
+                if run.project_id != project_id {
+                    return Err(BuilderError::ExecutionFailed(format!(
+                        "Validation run {} does not belong to project {}",
+                        validation_run_id, project_id
+                    )));
+                }
+
+                if run.architecture_version != _arch_version {
+                    return Err(BuilderError::ExecutionFailed(format!(
+                        "Validation run {} belongs to architecture version {}, but current is {}",
+                        validation_run_id, run.architecture_version, _arch_version
+                    )));
+                }
+
+                if run.epoch_id != epoch_id {
+                    return Err(BuilderError::ExecutionFailed(format!(
+                        "Validation run {} belongs to Builder epoch {}, but current is {}",
+                        validation_run_id, run.epoch_id, epoch_id
+                    )));
                 }
 
                 let diagnostic =
@@ -1515,42 +1548,99 @@ impl BuilderService {
             }
             Some(BuilderInstructionSource::ReviewCorrection { review_cycle_id }) => {
                 let db = db_arc.lock().await;
-                let cycle_info: Option<(String, Option<String>)> = db
+                struct CycleCheck {
+                    project_id: String,
+                    architecture_version: String,
+                    epoch_id: Option<String>,
+                    status: String,
+                    verdict: Option<String>,
+                    completed_at: Option<String>,
+                    corrections_packet: Option<String>,
+                }
+                let cycle_info: Option<CycleCheck> = db
                     .connection()
                     .query_row(
-                        "SELECT project_id, corrections_packet FROM review_cycles WHERE cycle_id = ?1",
+                        "SELECT project_id, architecture_version, epoch_id, status, verdict, completed_at, corrections_packet
+                         FROM review_cycles WHERE cycle_id = ?1",
                         rusqlite::params![review_cycle_id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        |r| {
+                            Ok(CycleCheck {
+                                project_id: r.get(0)?,
+                                architecture_version: r.get(1)?,
+                                epoch_id: r.get(2)?,
+                                status: r.get(3)?,
+                                verdict: r.get(4)?,
+                                completed_at: r.get(5)?,
+                                corrections_packet: r.get(6)?,
+                            })
+                        },
                     )
                     .optional()
                     .map_err(|e| BuilderError::Database(e.to_string()))?;
 
-                let (cycle_project_id, correction_text) = cycle_info.ok_or_else(|| {
+                let cycle = cycle_info.ok_or_else(|| {
                     BuilderError::ExecutionFailed(format!(
                         "Review cycle {} not found",
                         review_cycle_id
                     ))
                 })?;
 
-                if cycle_project_id != project_id {
+                if cycle.project_id != project_id {
                     return Err(BuilderError::ExecutionFailed(format!(
                         "Review cycle {} does not belong to project {}",
                         review_cycle_id, project_id
                     )));
                 }
 
-                if let Some(text) = correction_text {
-                    let sanitized = safe_sanitize_text(&text);
-                    format!(
-                        "{}\n\n=== REVIEW CORRECTION REQUEST ===\n{}",
-                        builder_packet.prompt, sanitized
-                    )
-                } else {
-                    format!(
-                        "{}\n\n=== REVIEW CORRECTION REQUEST (Cycle: {}) ===",
-                        builder_packet.prompt, review_cycle_id
-                    )
+                if cycle.status != "CORRECTIONS_REQUIRED"
+                    && cycle.verdict.as_deref() != Some("CORRECTIONS_REQUIRED")
+                {
+                    return Err(BuilderError::ExecutionFailed(format!(
+                        "Review cycle {} is not in CORRECTIONS_REQUIRED status (current: status={}, verdict={:?})",
+                        review_cycle_id, cycle.status, cycle.verdict
+                    )));
                 }
+
+                if cycle.completed_at.is_none() {
+                    return Err(BuilderError::ExecutionFailed(format!(
+                        "Review cycle {} has not been human-confirmed",
+                        review_cycle_id
+                    )));
+                }
+
+                if cycle.architecture_version != _arch_version {
+                    return Err(BuilderError::ExecutionFailed(format!(
+                        "Review cycle {} belongs to architecture version {}, but current project version is {}",
+                        review_cycle_id, cycle.architecture_version, _arch_version
+                    )));
+                }
+
+                if cycle.epoch_id.as_deref() != Some(epoch_id.as_str()) {
+                    return Err(BuilderError::ExecutionFailed(format!(
+                        "Review cycle {} belongs to Builder epoch {:?}, but current Builder epoch is {}",
+                        review_cycle_id, cycle.epoch_id, epoch_id
+                    )));
+                }
+
+                let text = cycle.corrections_packet.ok_or_else(|| {
+                    BuilderError::ExecutionFailed(format!(
+                        "Review cycle {} has no corrections packet. Failing closed.",
+                        review_cycle_id
+                    ))
+                })?;
+
+                if text.trim().is_empty() {
+                    return Err(BuilderError::ExecutionFailed(format!(
+                        "Review cycle {} corrections packet is empty. Failing closed.",
+                        review_cycle_id
+                    )));
+                }
+
+                let sanitized = safe_sanitize_text(&text);
+                format!(
+                    "{}\n\n=== REVIEW CORRECTION REQUEST ===\n{}",
+                    builder_packet.prompt, sanitized
+                )
             }
             _ => builder_packet.prompt.clone(),
         };
@@ -1899,6 +1989,27 @@ impl BuilderService {
                             "Builder requested validation execution via COALITION_REQUEST_VALIDATION",
                             None,
                         );
+
+                        // Item 1: Real Builder-Requested Validation
+                        // Authoritative trigger BUILDER_REQUESTED, ActiveValidationRegistry, human-configured validation
+                        // Builder NEVER supplies shell command text, replacement validation commands, working dirs, etc.
+                        drop(db);
+                        let app_dir = repo_path.join(".coalition");
+                        let val_res =
+                            crate::core::validation::ValidationService::execute_validation_run(
+                                db_arc.clone(),
+                                effective_val_registry.clone(),
+                                project_id,
+                                &repo_path,
+                                crate::core::validation::ValidationTriggerSource::BuilderRequested,
+                                None,
+                                val_event_sink.clone(),
+                                &app_dir,
+                            )
+                            .await;
+                        if let Err(e) = val_res {
+                            eprintln!("Builder-requested validation execution failed: {}", e);
+                        }
                     } else {
                         let meta = serde_json::json!({
                             "reason": "Builder-requested validation runs are disabled in project configuration"
@@ -1912,6 +2023,20 @@ impl BuilderService {
                             Some(&meta),
                         );
                     }
+                } else if resp.status == STATUS_SUCCESS && !resp.was_canceled {
+                    // Item 2: Wire workflow-triggered post-build validation into production
+                    // Successful builder completion drives BUILDING -> VALIDATING -> POST_BUILD validation -> WAITING_FOR_REVIEW
+                    drop(db);
+                    let app_dir = repo_path.join(".coalition");
+                    let _ = crate::core::validation::ValidationService::run_post_build_validation(
+                        db_arc.clone(),
+                        effective_val_registry.clone(),
+                        project_id,
+                        &repo_path,
+                        val_event_sink.clone(),
+                        &app_dir,
+                    )
+                    .await;
                 }
 
                 Ok(resp)

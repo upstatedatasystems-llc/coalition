@@ -41,6 +41,8 @@ export const ReviewControlView: React.FC<ReviewControlViewProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
+  const activeCycle = selectedCycle || latestCycle;
+
   const loadData = useCallback(async () => {
     try {
       setErrorMessage(null);
@@ -91,11 +93,24 @@ export const ReviewControlView: React.FC<ReviewControlViewProps> = ({
   };
 
   const handleCopyPacket = async () => {
-    const textToCopy =
-      preparedPacketText ||
-      latestCycle?.corrections_packet ||
-      latestCycle?.summary ||
-      (latestCycle ? `Review Packet for Cycle #${latestCycle.cycle_number}\nHash: ${latestCycle.review_packet_hash}` : '');
+    let textToCopy = preparedPacketText;
+    const cycleToCopy = activeCycle || latestCycle;
+    if (!textToCopy && cycleToCopy) {
+      try {
+        textToCopy = await invoke<string>('get_review_packet_content', {
+          projectId,
+          cycleId: cycleToCopy.cycle_id,
+        });
+      } catch (err) {
+        console.warn('Failed to fetch review packet from disk:', err);
+      }
+    }
+    if (!textToCopy) {
+      textToCopy =
+        latestCycle?.corrections_packet ||
+        latestCycle?.summary ||
+        (latestCycle ? `Review Packet for Cycle #${latestCycle.cycle_number}\nHash: ${latestCycle.review_packet_hash}` : '');
+    }
     if (!textToCopy) return;
     try {
       await navigator.clipboard.writeText(textToCopy);
@@ -203,8 +218,6 @@ export const ReviewControlView: React.FC<ReviewControlViewProps> = ({
       setIsStartingCorrections(false);
     }
   };
-
-  const activeCycle = selectedCycle || latestCycle;
 
   return (
     <div className="review-control-container" data-testid="review-control-view">
@@ -378,7 +391,32 @@ export const ReviewControlView: React.FC<ReviewControlViewProps> = ({
                             </code>
                           </div>
                         )}
+                        {f.requirement_references && (
+                          <div className="finding-req-refs" data-testid="finding-req-refs">
+                            <strong>Requirement:</strong>{' '}
+                            <code>
+                              {Array.isArray(f.requirement_references)
+                                ? f.requirement_references.join(', ')
+                                : f.requirement_references}
+                            </code>
+                          </div>
+                        )}
+                        {f.problem_statement && (
+                          <div className="finding-problem" data-testid="finding-problem">
+                            <strong>Problem:</strong> <p>{f.problem_statement}</p>
+                          </div>
+                        )}
                         <p className="finding-desc">{f.description}</p>
+                        {f.required_change && (
+                          <div className="finding-required-change" data-testid="finding-required-change">
+                            <strong>Required Change:</strong> <p>{f.required_change}</p>
+                          </div>
+                        )}
+                        {f.required_test && (
+                          <div className="finding-required-test" data-testid="finding-required-test">
+                            <strong>Required Test:</strong> <p>{f.required_test}</p>
+                          </div>
+                        )}
                         {f.suggested_fix && (
                           <div className="finding-suggestion">
                             <strong>Suggested Fix:</strong>
@@ -552,7 +590,32 @@ export const ReviewControlView: React.FC<ReviewControlViewProps> = ({
                             </code>
                           </div>
                         )}
+                        {finding.requirement_references && (
+                          <div className="finding-req-refs">
+                            <strong>Requirement:</strong>{' '}
+                            <code>
+                              {Array.isArray(finding.requirement_references)
+                                ? finding.requirement_references.join(', ')
+                                : finding.requirement_references}
+                            </code>
+                          </div>
+                        )}
+                        {finding.problem_statement && (
+                          <div className="finding-problem">
+                            <strong>Problem:</strong> <p>{finding.problem_statement}</p>
+                          </div>
+                        )}
                         <p>{finding.description}</p>
+                        {finding.required_change && (
+                          <div className="finding-required-change">
+                            <strong>Required Change:</strong> <p>{finding.required_change}</p>
+                          </div>
+                        )}
+                        {finding.required_test && (
+                          <div className="finding-required-test">
+                            <strong>Required Test:</strong> <p>{finding.required_test}</p>
+                          </div>
+                        )}
                         {finding.suggested_fix && (
                           <div className="suggested-fix">
                             <em>Suggested Fix:</em> {finding.suggested_fix}

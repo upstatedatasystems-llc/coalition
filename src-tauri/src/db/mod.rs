@@ -452,6 +452,27 @@ impl DbManager {
                 );
                 CREATE INDEX IF NOT EXISTS idx_review_previews_proj ON review_import_previews(project_id, cycle_id);",
             ),
+            (
+                13,
+                "013_stage4_review_journal_and_findings",
+                "ALTER TABLE review_findings ADD COLUMN reviewer_source_id TEXT;
+                ALTER TABLE review_findings ADD COLUMN requirement_references TEXT;
+                ALTER TABLE review_findings ADD COLUMN problem_statement TEXT;
+                ALTER TABLE review_findings ADD COLUMN required_change TEXT;
+                ALTER TABLE review_findings ADD COLUMN required_test TEXT;
+
+                CREATE TABLE IF NOT EXISTS review_acceptance_journal (
+                    cycle_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    preview_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    staging_dir TEXT NOT NULL,
+                    target_dir TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_review_acceptance_journal_proj ON review_acceptance_journal(project_id);",
+            ),
         ];
 
         let mut applied = Vec::new();
@@ -1230,7 +1251,7 @@ mod tests {
     fn test_sqlite_in_memory_migrations_and_proof() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let result = db.run_proof().expect("run proof");
-        assert_eq!(result.applied_migrations.len(), 12);
+        assert_eq!(result.applied_migrations.len(), 13);
         assert_eq!(result.applied_migrations[0].version, 1);
         assert_eq!(result.applied_migrations[1].version, 2);
         assert_eq!(result.applied_migrations[2].version, 3);
@@ -1243,6 +1264,7 @@ mod tests {
         assert_eq!(result.applied_migrations[9].version, 10);
         assert_eq!(result.applied_migrations[10].version, 11);
         assert_eq!(result.applied_migrations[11].version, 12);
+        assert_eq!(result.applied_migrations[12].version, 13);
         assert_eq!(result.test_record_id, 1);
         assert_eq!(result.total_records, 1);
 
@@ -1300,7 +1322,7 @@ mod tests {
 
         let mut db = DbManager { conn };
         let applied = db.run_migrations().expect("run forward migrations");
-        assert_eq!(applied.len(), 11);
+        assert_eq!(applied.len(), 12);
         assert_eq!(applied[0].version, 2);
         assert_eq!(applied[1].version, 3);
         assert_eq!(applied[2].version, 4);
@@ -1312,6 +1334,7 @@ mod tests {
         assert_eq!(applied[8].version, 10);
         assert_eq!(applied[9].version, 11);
         assert_eq!(applied[10].version, 12);
+        assert_eq!(applied[11].version, 13);
 
         // Verify Phase 0 data preserved
         let count: i64 = db
@@ -1347,7 +1370,7 @@ mod tests {
     fn test_migrations_already_migrated_is_idempotent() {
         let mut db = DbManager::new_in_memory().expect("in memory db");
         let applied1 = db.run_migrations().expect("first migration run");
-        assert_eq!(applied1.len(), 12);
+        assert_eq!(applied1.len(), 13);
 
         let applied2 = db.run_migrations().expect("second migration run");
         assert_eq!(applied2.len(), 0);

@@ -142,7 +142,10 @@ impl std::str::FromStr for ReviewFindingSeverity {
             "MAJOR" => Ok(Self::Major),
             "MINOR" => Ok(Self::Minor),
             "INFO" => Ok(Self::Info),
-            _ => Ok(Self::Major),
+            _ => Err(ReviewError::ParseError(format!(
+                "Invalid finding severity '{}'. Expected CRITICAL, MAJOR, MINOR, or INFO.",
+                s
+            ))),
         }
     }
 }
@@ -175,7 +178,10 @@ impl std::str::FromStr for ReviewFindingStatus {
             "RESOLVED" => Ok(Self::Resolved),
             "SUPERSEDED" => Ok(Self::Superseded),
             "BLOCKED" => Ok(Self::Blocked),
-            _ => Ok(Self::Open),
+            _ => Err(ReviewError::ParseError(format!(
+                "Invalid finding status '{}'. Expected OPEN, RESOLVED, SUPERSEDED, or BLOCKED.",
+                s
+            ))),
         }
     }
 }
@@ -221,6 +227,11 @@ pub struct ReviewFindingRecord {
     pub title: String,
     pub description: String,
     pub suggested_fix: Option<String>,
+    pub requirement_references: Vec<String>,
+    pub problem_statement: Option<String>,
+    pub required_change: Option<String>,
+    pub required_test: Option<String>,
+    pub reviewer_source_id: Option<String>,
     pub resolution_cycle_id: Option<String>,
     pub is_repeat: bool,
     pub created_at: String,
@@ -250,29 +261,41 @@ pub struct ReviewCycleRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ParsedReviewFinding {
+    #[serde(default)]
     pub id: Option<String>,
-    pub severity: Option<String>,
+    pub severity: ReviewFindingSeverity,
     pub title: String,
+    #[serde(default)]
     pub file: Option<String>,
+    #[serde(default)]
     pub lines: Option<String>,
     pub description: String,
+    #[serde(default)]
     pub suggested_fix: Option<String>,
+    #[serde(default)]
+    pub requirement_references: Vec<String>,
+    #[serde(default)]
+    pub problem_statement: Option<String>,
+    #[serde(default)]
+    pub required_change: Option<String>,
+    #[serde(default)]
+    pub required_test: Option<String>,
+    #[serde(default)]
+    pub reviewer_source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RawVerdictEnvelope {
+    pub schema_version: u32,
+    pub response_type: String,
+    pub project_id: String,
+    pub cycle_id: String,
+    pub review_packet_hash: String,
+    pub verdict: ReviewVerdict,
     #[serde(default)]
-    pub schema_version: Option<u32>,
-    #[serde(default)]
-    pub response_type: Option<String>,
-    #[serde(default)]
-    pub project_id: Option<String>,
-    #[serde(default)]
-    pub cycle_id: Option<String>,
-    #[serde(default)]
-    pub review_packet_hash: Option<String>,
-    pub verdict: String,
     pub summary: Option<String>,
     #[serde(default)]
     pub findings: Vec<ParsedReviewFinding>,
@@ -315,14 +338,56 @@ pub struct DurableReviewVerdictFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DurableReviewFinding {
     pub finding_id: String,
+    #[serde(default)]
+    pub reviewer_source_id: Option<String>,
     pub fingerprint: String,
     pub severity: String,
+    pub status: String,
     pub title: String,
     pub file_path: Option<String>,
     pub line_range: Option<String>,
     pub description: String,
     pub suggested_fix: Option<String>,
+    #[serde(default)]
+    pub requirement_references: Vec<String>,
+    #[serde(default)]
+    pub problem_statement: Option<String>,
+    #[serde(default)]
+    pub required_change: Option<String>,
+    #[serde(default)]
+    pub required_test: Option<String>,
+    pub first_cycle_id: String,
+    pub last_cycle_id: String,
+    pub resolution_cycle_id: Option<String>,
     pub is_repeat: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoalitionCorrectionRecord {
+    pub schema_version: u32,
+    pub project_id: String,
+    pub architecture_version: String,
+    pub epoch_id: Option<String>,
+    pub review_cycle_id: String,
+    pub review_cycle_number: i64,
+    pub reviewed_implementation_fingerprint: String,
+    pub qualifying_validation_run_id: Option<String>,
+    pub summary: String,
+    pub findings: Vec<CorrectionRecordItem>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorrectionRecordItem {
+    pub canonical_finding_id: String,
+    pub reviewer_source_id: Option<String>,
+    pub severity: ReviewFindingSeverity,
+    pub requirement_references: Vec<String>,
+    pub file_path: Option<String>,
+    pub line_range: Option<String>,
+    pub problem_statement: String,
+    pub required_change: String,
+    pub required_test: Option<String>,
 }
 
 pub struct ReviewService;
@@ -391,6 +456,35 @@ impl ReviewService {
         // 5. Directive 11: Collect and embed untracked source files bounded via GitAdapter
         let untracked_files_section = Self::collect_untracked_source_files(repo_path)?;
 
+        // Apply budget limits for diff and untracked files (Item 11)
+        let max_diff_bytes = 200 * 1024;
+        let bounded_tracked_diff = if tracked_diff.len() > max_diff_bytes {
+            let mut cut = max_diff_bytes;
+            while cut > 0 && !tracked_diff.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!(
+                "{}\n[... truncated for review packet budget ...]\n",
+                &tracked_diff[..cut]
+            )
+        } else {
+            tracked_diff
+        };
+
+        let max_untracked_bytes = 100 * 1024;
+        let bounded_untracked_files = if untracked_files_section.len() > max_untracked_bytes {
+            let mut cut = max_untracked_bytes;
+            while cut > 0 && !untracked_files_section.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!(
+                "{}\n[... truncated for review packet budget ...]\n",
+                &untracked_files_section[..cut]
+            )
+        } else {
+            untracked_files_section
+        };
+
         // 6. Calculate cycle number and globally unique cycle ID
         let cycle_count: i64 = conn
             .query_row(
@@ -416,37 +510,53 @@ impl ReviewService {
             "### Validation Evidence\nValidation is not required or unconfigured for this project.\n\n".to_string()
         };
 
-        // 8. Assemble review packet prompt with frozen architecture contracts and prior open findings
-        let mut packet = String::new();
-        packet.push_str(&format!(
+        // Milestone and Builder completion context (Item 11)
+        let milestone = project_details.project.name.clone();
+        let builder_completion_summary: Option<String> = conn
+            .query_row(
+                "SELECT description FROM activity_events WHERE project_id = ?1 AND event_type IN ('BUILDER_TURN_COMPLETED', 'BUILDER_COMPLETED') ORDER BY created_at DESC LIMIT 1",
+                params![project_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+
+        // 8. Assemble packet body (non-self-referential)
+        let mut body = String::new();
+        body.push_str(&format!(
             "# Coalition Review Packet: {} (Cycle {})\n\n",
             project_details.project.name, cycle_number
         ));
-        packet.push_str("## Project Context\n");
-        packet.push_str(&format!("- **Project ID**: `{}`\n", project_id));
-        packet.push_str(&format!("- **Review Cycle ID**: `{}`\n", cycle_id));
-        packet.push_str(&format!("- **Architecture Version**: `{}`\n", arch_version));
+        body.push_str("## Project Context\n");
+        body.push_str(&format!("- **Project ID**: `{}`\n", project_id));
+        body.push_str(&format!("- **Review Cycle ID**: `{}`\n", cycle_id));
+        body.push_str(&format!("- **Milestone / Name**: `{}`\n", milestone));
+        body.push_str(&format!("- **Architecture Version**: `{}`\n", arch_version));
         if let Some(ref ep) = epoch_id {
-            packet.push_str(&format!("- **Builder Epoch**: `{}`\n", ep));
+            body.push_str(&format!("- **Builder Epoch**: `{}`\n", ep));
         }
         if let Some(ref h) = git_head {
-            packet.push_str(&format!("- **Git HEAD**: `{}`\n", h));
+            body.push_str(&format!("- **Git HEAD**: `{}`\n", h));
         }
-        packet.push_str(&format!(
-            "- **Implementation Fingerprint**: `{}`\n\n",
+        body.push_str(&format!(
+            "- **Implementation Fingerprint**: `{}`\n",
             dirty_fingerprint
         ));
+        if let Some(ref bcs) = builder_completion_summary {
+            body.push_str(&format!("- **Builder Completion Context**: {}\n", bcs));
+        }
+        body.push('\n');
 
-        // Governed Architecture Contracts (Item 4)
+        // Governed Architecture Contracts & Acceptance Criteria (Item 11)
         if let Ok(builder_packet) =
             crate::core::freeze::FreezeService::get_builder_packet(repo_path, Some(&arch_version))
         {
-            packet.push_str(&format!(
-                "## Governed Architecture Contracts (Version {})\n\n",
+            body.push_str(&format!(
+                "## Governed Architecture Contracts & Acceptance Criteria (Version {})\n\n",
                 arch_version
             ));
             for art in &builder_packet.artifacts {
-                packet.push_str(&format!(
+                body.push_str(&format!(
                     "### Contract Artifact: `{}`\n```markdown\n{}\n```\n\n",
                     art.path, art.content
                 ));
@@ -457,9 +567,9 @@ impl ReviewService {
         let open_findings =
             list_findings_for_project(conn, project_id, Some(ReviewFindingStatus::Open))?;
         if !open_findings.is_empty() {
-            packet.push_str("## Prior Open Review Findings\n\n");
+            body.push_str("## Prior Open Review Findings\n\n");
             for f in &open_findings {
-                packet.push_str(&format!(
+                body.push_str(&format!(
                     "- **Finding `{}`** (Severity: {}): {}\n  - File: `{}` (Lines: `{}`)\n  - Defect: {}\n  - Suggested Fix: {}\n\n",
                     f.finding_id,
                     f.severity,
@@ -472,8 +582,8 @@ impl ReviewService {
             }
         }
 
-        packet.push_str("## Governance Instructions for Independent Reviewer\n");
-        packet.push_str(&format!(
+        body.push_str("## Governance Instructions for Independent Reviewer\n");
+        body.push_str(&format!(
             "You are an authoritative independent code reviewer governing this implementation.\n\
              Evaluate the code changes against the architecture contracts, acceptance criteria, and validation evidence.\n\
              You MUST respond with a structured verdict block in either ```verdict or ```yaml fence:\n\n\
@@ -482,7 +592,7 @@ impl ReviewService {
              response_type: REVIEW_VERDICT\n\
              project_id: {}\n\
              cycle_id: {}\n\
-             review_packet_hash: <REVIEW_PACKET_HASH>\n\
+             review_packet_hash: <PASTE REVIEW-PACKET-HASH FROM ENVELOPE HEADER>\n\
              verdict: ACCEPT | CORRECTIONS_REQUIRED | BLOCKED | ARCHITECTURE_CONCERN\n\
              summary: \"Comprehensive summary of your review evaluation\"\n\
              findings:\n\
@@ -493,6 +603,10 @@ impl ReviewService {
                  lines: \"10-25\"\n\
                  description: \"Detailed description of the defect or contract violation\"\n\
                  suggested_fix: \"Specific instructions on how to correct this defect\"\n\
+                 requirement_references: [\"REQ-1\"]\n\
+                 problem_statement: \"Defect details\"\n\
+                 required_change: \"Code modification required\"\n\
+                 required_test: \"Validation test required\"\n\
              ```\n\n\
              Rules:\n\
              - If all implementation contracts and acceptance criteria are satisfied and tests pass, verdict is ACCEPT.\n\
@@ -502,30 +616,42 @@ impl ReviewService {
             project_id, cycle_id
         ));
 
-        packet.push_str("## Validation State\n");
-        packet.push_str(&validation_section);
+        body.push_str("## Validation State\n");
+        body.push_str(&validation_section);
 
-        packet.push_str("## Code Modifications (Tracked Git Diff)\n");
-        packet.push_str("```diff\n");
-        packet.push_str(&tracked_diff);
-        if !tracked_diff.ends_with('\n') {
-            packet.push('\n');
+        body.push_str("## Code Modifications (Tracked Git Diff)\n");
+        body.push_str("```diff\n");
+        body.push_str(&bounded_tracked_diff);
+        if !bounded_tracked_diff.ends_with('\n') {
+            body.push('\n');
         }
-        packet.push_str("```\n\n");
+        body.push_str("```\n\n");
 
-        if !untracked_files_section.is_empty() {
-            packet.push_str("## Untracked Source Files\n");
-            packet.push_str(&untracked_files_section);
-            packet.push_str("\n\n");
+        if !bounded_untracked_files.is_empty() {
+            body.push_str("## Untracked Source Files\n");
+            body.push_str(&bounded_untracked_files);
+            body.push_str("\n\n");
         }
 
-        // Compute packet hash and embed in instruction placeholder
-        let placeholder = "<REVIEW_PACKET_HASH>";
+        let body_sanitized = safe_sanitize_text(&body);
+
+        // Compute packet hash non-self-referentially over exact packet body (Item 12)
         let mut hasher = Sha256::new();
-        hasher.update(packet.as_bytes());
+        hasher.update(body_sanitized.as_bytes());
         let review_packet_hash = format!("{:x}", hasher.finalize());
-        let final_packet = packet.replace(placeholder, &review_packet_hash);
-        let sanitized_packet = safe_sanitize_text(&final_packet);
+
+        let relay_header = format!(
+            "=== COALITION REVIEW RELAY ENVELOPE ===\n\
+             Schema-Version: 1\n\
+             Project-ID: {}\n\
+             Review-Cycle-ID: {}\n\
+             Review-Packet-Hash: {}\n\
+             Target-Reviewer: Governed Reviewer\n\
+             === COALITION REVIEW PACKET BODY ===\n\n",
+            project_id, cycle_id, review_packet_hash
+        );
+
+        let final_packet = format!("{}{}", relay_header, body_sanitized);
 
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -556,12 +682,12 @@ impl ReviewService {
             .join("reviews")
             .join(format!("cycle-{}", cycle_number));
         std::fs::create_dir_all(&cycle_dir)?;
-        std::fs::write(cycle_dir.join("packet.md"), &sanitized_packet)?;
+        std::fs::write(cycle_dir.join("packet.md"), &final_packet)?;
 
         // Insert cycle record into SQLite
         insert_review_cycle(conn, &cycle_rec)?;
 
-        Ok((cycle_rec, sanitized_packet))
+        Ok((cycle_rec, final_packet))
     }
 
     /// Scans untracked source files bounded to avoid memory exhaustion or huge binaries.
@@ -576,12 +702,11 @@ impl ReviewService {
         text: &str,
     ) -> Result<(ReviewVerdict, String, Vec<ParsedReviewFinding>), ReviewError> {
         let parsed = Self::parse_reviewer_envelope(text)?;
-        let verdict: ReviewVerdict = parsed.verdict.parse()?;
         let summary = parsed
             .summary
-            .unwrap_or_else(|| format!("Review completed with verdict {}", verdict));
+            .unwrap_or_else(|| format!("Review completed with verdict {}", parsed.verdict));
 
-        Ok((verdict, summary, parsed.findings))
+        Ok((parsed.verdict, summary, parsed.findings))
     }
 
     /// Strict parser for structured reviewer envelope with schema and binding metadata.
@@ -602,8 +727,19 @@ impl ReviewService {
                 ))
             })?;
 
-        // Strict verdict validation
-        let _verdict: ReviewVerdict = parsed.verdict.parse()?;
+        if parsed.schema_version != 1 {
+            return Err(ReviewError::ParseError(format!(
+                "Unsupported schema_version: {}. Expected 1.",
+                parsed.schema_version
+            )));
+        }
+
+        if parsed.response_type.trim().to_uppercase() != "REVIEW_VERDICT" {
+            return Err(ReviewError::ParseError(format!(
+                "Invalid response_type: '{}'. Expected 'REVIEW_VERDICT'.",
+                parsed.response_type
+            )));
+        }
 
         Ok(parsed)
     }
@@ -636,53 +772,31 @@ impl ReviewService {
 
         // Parse reviewer envelope
         let envelope = Self::parse_reviewer_envelope(raw_response)?;
-        let verdict: ReviewVerdict = envelope.verdict.parse()?;
+        let verdict = envelope.verdict;
         let summary = envelope
             .summary
             .clone()
             .unwrap_or_else(|| format!("Review completed with verdict {}", verdict));
         let findings = envelope.findings;
 
-        // Strict Reviewer Envelope Validation (Item 2)
-        if let Some(sv) = envelope.schema_version {
-            if sv != 1 {
-                return Err(ReviewError::ParseError(format!(
-                    "Unsupported schema_version: {}. Expected 1.",
-                    sv
-                )));
-            }
+        // Strict Reviewer Envelope Validation (Item 9)
+        if envelope.project_id != project_id {
+            return Err(ReviewError::ParseError(format!(
+                "Reviewer response project_id '{}' does not match active project '{}'",
+                envelope.project_id, project_id
+            )));
         }
-        if let Some(ref rt) = envelope.response_type {
-            if rt.trim().to_uppercase() != "REVIEW_VERDICT" {
-                return Err(ReviewError::ParseError(format!(
-                    "Invalid response_type: '{}'. Expected 'REVIEW_VERDICT'.",
-                    rt
-                )));
-            }
+        if envelope.cycle_id != cycle_id {
+            return Err(ReviewError::ParseError(format!(
+                "Reviewer response cycle_id '{}' does not match active cycle '{}'",
+                envelope.cycle_id, cycle_id
+            )));
         }
-        if let Some(ref pid) = envelope.project_id {
-            if pid != project_id {
-                return Err(ReviewError::ParseError(format!(
-                    "Reviewer response project_id '{}' does not match active project '{}'",
-                    pid, project_id
-                )));
-            }
-        }
-        if let Some(ref cid) = envelope.cycle_id {
-            if cid != cycle_id {
-                return Err(ReviewError::ParseError(format!(
-                    "Reviewer response cycle_id '{}' does not match active cycle '{}'",
-                    cid, cycle_id
-                )));
-            }
-        }
-        if let Some(ref rph) = envelope.review_packet_hash {
-            if rph != &cycle.review_packet_hash {
-                return Err(ReviewError::ParseError(format!(
-                    "Reviewer response review_packet_hash '{}' does not match active cycle packet hash '{}'",
-                    rph, cycle.review_packet_hash
-                )));
-            }
+        if envelope.review_packet_hash != cycle.review_packet_hash {
+            return Err(ReviewError::ParseError(format!(
+                "Reviewer response review_packet_hash '{}' does not match active cycle packet hash '{}'",
+                envelope.review_packet_hash, cycle.review_packet_hash
+            )));
         }
 
         // Verify git state has not drifted since packet was prepared
@@ -873,17 +987,45 @@ impl ReviewService {
         .map_err(|e| ReviewError::ValidationGateBlocked(e.to_string()))?;
 
         let now = chrono::Utc::now().to_rfc3339();
-        let cycle_dir = repo_path
+
+        // 0. Reconcile any existing incomplete journal entries (Item 13)
+        Self::reconcile_review_acceptance_journal(conn, repo_path, project_id)?;
+
+        // 4. Staging setup and crash-safe journal initialization (Item 13)
+        let target_dir = repo_path
             .join(".coalition")
             .join("reviews")
             .join(format!("cycle-{}", cycle.cycle_number));
-        std::fs::create_dir_all(&cycle_dir)?;
+        let staging_dir = repo_path
+            .join(".coalition")
+            .join("reviews")
+            .join(format!(".staging-cycle-{}", cycle.cycle_number));
 
-        // 4. Persist response.md
+        if staging_dir.exists() {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+        }
+        std::fs::create_dir_all(&staging_dir)?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO review_acceptance_journal (
+                cycle_id, project_id, preview_id, phase, staging_dir, target_dir, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, 'STAGING', ?4, ?5, ?6, ?6)",
+            params![
+                cycle.cycle_id,
+                project_id,
+                preview_id,
+                staging_dir.to_string_lossy(),
+                target_dir.to_string_lossy(),
+                now
+            ],
+        )
+        .map_err(|e| ReviewError::Database(e.to_string()))?;
+
+        // 5. Persist response.md into staging directory
         let sanitized_resp = safe_sanitize_text(&stored.raw_response);
-        std::fs::write(cycle_dir.join("response.md"), &sanitized_resp)?;
+        std::fs::write(staging_dir.join("response.md"), &sanitized_resp)?;
 
-        // 5. Process findings & compute fingerprints (excluding severity per Item 14)
+        // 6. Process findings & compute fingerprints (excluding severity per Item 14)
         let mut finding_records = Vec::new();
         let mut durable_findings = Vec::new();
 
@@ -910,12 +1052,7 @@ impl ReviewService {
         }
 
         for pf in &stored.findings {
-            let severity: ReviewFindingSeverity = pf
-                .severity
-                .as_deref()
-                .unwrap_or("MAJOR")
-                .parse()
-                .unwrap_or(ReviewFindingSeverity::Major);
+            let severity = pf.severity;
 
             // Compute stable finding fingerprint EXCLUDING severity (Item 14)
             let norm_file = pf
@@ -942,7 +1079,7 @@ impl ReviewService {
             let f_rec = ReviewFindingRecord {
                 finding_id: finding_id.clone(),
                 project_id: project_id.to_string(),
-                first_cycle_id,
+                first_cycle_id: first_cycle_id.clone(),
                 last_cycle_id: cycle.cycle_id.clone(),
                 fingerprint: fp.clone(),
                 severity,
@@ -952,6 +1089,11 @@ impl ReviewService {
                 title: pf.title.clone(),
                 description: pf.description.clone(),
                 suggested_fix: pf.suggested_fix.clone(),
+                requirement_references: pf.requirement_references.clone(),
+                problem_statement: pf.problem_statement.clone(),
+                required_change: pf.required_change.clone(),
+                required_test: pf.required_test.clone(),
+                reviewer_source_id: pf.reviewer_source_id.clone().or_else(|| pf.id.clone()),
                 resolution_cycle_id: None,
                 is_repeat,
                 created_at: now.clone(),
@@ -960,20 +1102,29 @@ impl ReviewService {
 
             durable_findings.push(DurableReviewFinding {
                 finding_id: finding_id.clone(),
+                reviewer_source_id: pf.reviewer_source_id.clone().or_else(|| pf.id.clone()),
                 fingerprint: fp,
                 severity: severity.to_string(),
+                status: "OPEN".to_string(),
                 title: pf.title.clone(),
                 file_path: pf.file.clone(),
                 line_range: pf.lines.clone(),
                 description: pf.description.clone(),
                 suggested_fix: pf.suggested_fix.clone(),
+                requirement_references: pf.requirement_references.clone(),
+                problem_statement: pf.problem_statement.clone(),
+                required_change: pf.required_change.clone(),
+                required_test: pf.required_test.clone(),
+                first_cycle_id,
+                last_cycle_id: cycle.cycle_id.clone(),
+                resolution_cycle_id: None,
                 is_repeat,
             });
 
             finding_records.push(f_rec);
         }
 
-        // 6. Generate corrections packet if corrections required
+        // 7. Generate corrections packet if corrections required
         let corrections_text = if stored.verdict == ReviewVerdict::CorrectionsRequired {
             let cp = Self::generate_corrections_packet(
                 cycle.cycle_number,
@@ -981,13 +1132,13 @@ impl ReviewService {
                 &stored.summary,
                 &stored.findings,
             );
-            std::fs::write(cycle_dir.join("corrections.md"), &cp)?;
+            std::fs::write(staging_dir.join("corrections.md"), &cp)?;
             Some(cp)
         } else {
             None
         };
 
-        // 7. Write verdict.yaml atomically
+        // 8. Write verdict.yaml into staging directory
         let verdict_file = DurableReviewVerdictFile {
             schema_version: 1,
             cycle_id: cycle.cycle_id.clone(),
@@ -1007,12 +1158,16 @@ impl ReviewService {
         };
 
         let verdict_yaml = serde_yaml::to_string(&verdict_file)?;
-        let final_path = cycle_dir.join("verdict.yaml");
-        let temp_path = cycle_dir.join(format!(".verdict-{}.tmp", Uuid::new_v4()));
-        std::fs::write(&temp_path, &verdict_yaml)?;
-        std::fs::rename(&temp_path, &final_path)?;
+        std::fs::write(staging_dir.join("verdict.yaml"), &verdict_yaml)?;
 
-        // 8. Atomic SQLite persistence transaction (Item 15)
+        // Update journal phase to COMMITTING
+        conn.execute(
+            "UPDATE review_acceptance_journal SET phase = 'COMMITTING', updated_at = ?1 WHERE cycle_id = ?2",
+            params![now, cycle.cycle_id],
+        )
+        .map_err(|e| ReviewError::Database(e.to_string()))?;
+
+        // 9. Atomic SQLite persistence transaction
         let new_cycle_status = match stored.verdict {
             ReviewVerdict::Accept => ReviewCycleStatus::Accepted,
             ReviewVerdict::CorrectionsRequired => ReviewCycleStatus::CorrectionsRequired,
@@ -1040,14 +1195,28 @@ impl ReviewService {
         .map_err(|e| ReviewError::Database(e.to_string()))?;
 
         for f in &finding_records {
+            let req_refs_json = serde_json::to_string(&f.requirement_references)
+                .unwrap_or_else(|_| "[]".to_string());
             tx.execute(
                 "INSERT INTO review_findings (
                     finding_id, project_id, first_cycle_id, last_cycle_id, fingerprint,
                     severity, status, file_path, line_range, title, description,
-                    suggested_fix, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                    suggested_fix, requirement_references, problem_statement, required_change,
+                    required_test, reviewer_source_id, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                 ON CONFLICT(finding_id) DO UPDATE SET
                     last_cycle_id = excluded.last_cycle_id,
+                    severity = excluded.severity,
+                    file_path = excluded.file_path,
+                    line_range = excluded.line_range,
+                    title = excluded.title,
+                    description = excluded.description,
+                    suggested_fix = excluded.suggested_fix,
+                    requirement_references = excluded.requirement_references,
+                    problem_statement = excluded.problem_statement,
+                    required_change = excluded.required_change,
+                    required_test = excluded.required_test,
+                    reviewer_source_id = excluded.reviewer_source_id,
                     updated_at = excluded.updated_at",
                 params![
                     f.finding_id,
@@ -1062,6 +1231,11 @@ impl ReviewService {
                     f.title,
                     f.description,
                     f.suggested_fix,
+                    req_refs_json,
+                    f.problem_statement,
+                    f.required_change,
+                    f.required_test,
+                    f.reviewer_source_id,
                     f.created_at,
                     f.updated_at
                 ],
@@ -1098,7 +1272,7 @@ impl ReviewService {
         )
         .map_err(|e| ReviewError::Database(e.to_string()))?;
 
-        // 9. Authoritative workflow state transition
+        // 10. Authoritative workflow state transition
         let action = match stored.verdict {
             ReviewVerdict::Accept => WorkflowAction::AcceptReview,
             ReviewVerdict::CorrectionsRequired => WorkflowAction::RequestCorrections,
@@ -1109,7 +1283,7 @@ impl ReviewService {
         workflow::apply_workflow_action_conn(&tx, project_id, action, actor)
             .map_err(|e| ReviewError::Database(e.to_string()))?;
 
-        // 10. Record audit activity event
+        // 11. Record audit activity event
         let meta = serde_json::json!({
             "cycle_id": cycle.cycle_id,
             "verdict": stored.verdict.to_string(),
@@ -1128,8 +1302,34 @@ impl ReviewService {
             Some(&meta),
         );
 
+        // Update journal phase to COMMITTED inside transaction
+        tx.execute(
+            "UPDATE review_acceptance_journal SET phase = 'COMMITTED', updated_at = ?1 WHERE cycle_id = ?2",
+            params![now, cycle.cycle_id],
+        )
+        .map_err(|e| ReviewError::Database(e.to_string()))?;
+
         tx.commit()
             .map_err(|e| ReviewError::Database(e.to_string()))?;
+
+        // 12. Promote staging directory to target directory
+        if target_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&staging_dir) {
+                for e in entries.flatten() {
+                    let _ = std::fs::copy(e.path(), target_dir.join(e.file_name()));
+                }
+            }
+            let _ = std::fs::remove_dir_all(&staging_dir);
+        } else {
+            let _ = std::fs::rename(&staging_dir, &target_dir);
+        }
+
+        // Delete journal row
+        conn.execute(
+            "DELETE FROM review_acceptance_journal WHERE cycle_id = ?1",
+            params![cycle.cycle_id],
+        )
+        .map_err(|e| ReviewError::Database(e.to_string()))?;
 
         let mut completed_cycle = cycle;
         completed_cycle.status = new_cycle_status;
@@ -1165,12 +1365,11 @@ impl ReviewService {
             out.push_str("No specific findings reported. Review summary indicates general corrections required.\n");
         } else {
             for (idx, f) in findings.iter().enumerate() {
-                let sev = f.severity.as_deref().unwrap_or("MAJOR");
                 out.push_str(&format!(
                     "### [{}-{:02}] ({}) {}\n",
                     cycle_number,
                     idx + 1,
-                    sev,
+                    f.severity,
                     f.title
                 ));
                 if let Some(ref path) = f.file {
@@ -1184,6 +1383,21 @@ impl ReviewService {
                 if let Some(ref fix) = f.suggested_fix {
                     out.push_str(&format!("- **Required Correction**: {}\n", fix));
                 }
+                if !f.requirement_references.is_empty() {
+                    out.push_str(&format!(
+                        "- **Requirement References**: {}\n",
+                        f.requirement_references.join(", ")
+                    ));
+                }
+                if let Some(ref ps) = f.problem_statement {
+                    out.push_str(&format!("- **Problem Statement**: {}\n", ps));
+                }
+                if let Some(ref rc) = f.required_change {
+                    out.push_str(&format!("- **Required Change**: {}\n", rc));
+                }
+                if let Some(ref rt) = f.required_test {
+                    out.push_str(&format!("- **Required Test**: {}\n", rt));
+                }
                 out.push('\n');
             }
         }
@@ -1191,7 +1405,89 @@ impl ReviewService {
         safe_sanitize_text(&out)
     }
 
+    /// Reconciles interrupted review acceptance journals across crash seams (Item 13).
+    pub fn reconcile_review_acceptance_journal(
+        conn: &mut Connection,
+        _repo_path: &Path,
+        project_id: &str,
+    ) -> Result<usize, ReviewError> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT cycle_id, preview_id, phase, staging_dir, target_dir
+                 FROM review_acceptance_journal
+                 WHERE project_id = ?1",
+            )
+            .map_err(|e| ReviewError::Database(e.to_string()))?;
+
+        let rows: Vec<(String, String, String, String, String)> = stmt
+            .query_map(params![project_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .map_err(|e| ReviewError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut reconciled = 0;
+        for (cycle_id, _preview_id, phase, staging_dir_str, target_dir_str) in rows {
+            let staging_path = Path::new(&staging_dir_str);
+            let target_path = Path::new(&target_dir_str);
+
+            match phase.as_str() {
+                "STAGING" | "COMMITTING" => {
+                    // SQLite transaction never committed. Clean up staging directory and journal.
+                    if staging_path.exists() {
+                        let _ = std::fs::remove_dir_all(staging_path);
+                    }
+                    conn.execute(
+                        "DELETE FROM review_acceptance_journal WHERE cycle_id = ?1",
+                        params![cycle_id],
+                    )
+                    .map_err(|e| ReviewError::Database(e.to_string()))?;
+                    reconciled += 1;
+                }
+                "COMMITTED" => {
+                    // SQLite transaction committed; promotion was interrupted. Promote staging dir.
+                    if staging_path.exists() {
+                        if target_path.exists() {
+                            if let Ok(entries) = std::fs::read_dir(staging_path) {
+                                for e in entries.flatten() {
+                                    let _ =
+                                        std::fs::copy(e.path(), target_path.join(e.file_name()));
+                                }
+                            }
+                            let _ = std::fs::remove_dir_all(staging_path);
+                        } else {
+                            let _ = std::fs::rename(staging_path, target_path);
+                        }
+                    }
+                    conn.execute(
+                        "DELETE FROM review_acceptance_journal WHERE cycle_id = ?1",
+                        params![cycle_id],
+                    )
+                    .map_err(|e| ReviewError::Database(e.to_string()))?;
+                    reconciled += 1;
+                }
+                _ => {
+                    conn.execute(
+                        "DELETE FROM review_acceptance_journal WHERE cycle_id = ?1",
+                        params![cycle_id],
+                    )
+                    .map_err(|e| ReviewError::Database(e.to_string()))?;
+                }
+            }
+        }
+
+        Ok(reconciled)
+    }
+
     /// Rehydrates review cycles from durable disk artifacts if SQLite state was deleted.
+    /// Sorts files by cycle_number ASC, enforces strict validation, and reconciles workflow state (Items 14, 15, 16).
     pub fn rehydrate_reviews_from_disk(
         conn: &mut Connection,
         repo_path: &Path,
@@ -1202,7 +1498,7 @@ impl ReviewService {
             return Ok(0);
         }
 
-        let mut count = 0;
+        let mut verdict_files: Vec<(i64, std::path::PathBuf)> = Vec::new();
         let entries = std::fs::read_dir(&reviews_dir)?;
         for entry in entries.flatten() {
             let path = entry.path();
@@ -1213,108 +1509,202 @@ impl ReviewService {
             if !verdict_path.exists() {
                 continue;
             }
+            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let cycle_num: i64 = if let Some(stripped) = dir_name.strip_prefix("cycle-") {
+                stripped.parse().unwrap_or(0)
+            } else {
+                0
+            };
+            verdict_files.push((cycle_num, verdict_path));
+        }
 
-            if let Ok(content) = std::fs::read_to_string(&verdict_path) {
-                if let Ok(vf) = serde_yaml::from_str::<DurableReviewVerdictFile>(&content) {
-                    if vf.project_id != project_id {
-                        continue;
-                    }
+        // Deterministic cycle ordering: sort by cycle_number ASC (Item 14)
+        verdict_files.sort_by_key(|(num, _)| *num);
 
-                    // Check if cycle already exists
-                    let exists: bool = conn
-                        .query_row(
-                            "SELECT 1 FROM review_cycles WHERE cycle_id = ?1",
-                            params![vf.cycle_id],
-                            |_| Ok(true),
-                        )
-                        .unwrap_or(false);
+        let mut count = 0;
+        let mut latest_cycle: Option<(i64, ReviewVerdict)> = None;
 
-                    if !exists {
-                        let verdict: Option<ReviewVerdict> = vf.verdict.parse().ok();
-                        let status = match verdict {
-                            Some(ReviewVerdict::Accept) => ReviewCycleStatus::Accepted,
-                            Some(ReviewVerdict::CorrectionsRequired) => {
-                                ReviewCycleStatus::CorrectionsRequired
-                            }
-                            Some(ReviewVerdict::Blocked) => ReviewCycleStatus::Blocked,
-                            Some(ReviewVerdict::ArchitectureConcern) => {
-                                ReviewCycleStatus::ArchitectureConcern
-                            }
-                            None => ReviewCycleStatus::Pending,
-                        };
+        for (_num, verdict_path) in verdict_files {
+            let content = std::fs::read_to_string(&verdict_path)?;
+            // Strict parsing: fail closed on corrupt verdict YAML (Item 15)
+            let vf: DurableReviewVerdictFile = serde_yaml::from_str(&content).map_err(|e| {
+                ReviewError::ParseError(format!(
+                    "Corrupt verdict.yaml at {:?}: {}",
+                    verdict_path, e
+                ))
+            })?;
 
-                        let corrections_content =
-                            std::fs::read_to_string(path.join("corrections.md")).ok();
+            if vf.project_id != project_id {
+                continue;
+            }
 
-                        conn.execute(
-                            "INSERT INTO review_cycles (
-                                cycle_id, project_id, cycle_number, architecture_version, epoch_id,
-                                validation_run_id, status, verdict, reviewer_type, git_head,
-                                git_dirty_fingerprint, review_packet_hash, corrections_packet, summary,
-                                started_at, completed_at, created_at
-                            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'CHATGPT_RELAY', ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?14)",
-                            params![
-                                vf.cycle_id,
-                                project_id,
-                                vf.cycle_number,
-                                vf.architecture_version,
-                                vf.epoch_id,
-                                vf.validation_run_id,
-                                status.to_string(),
-                                vf.verdict,
-                                vf.git_head,
-                                vf.git_dirty_fingerprint,
-                                vf.review_packet_hash,
-                                corrections_content,
-                                vf.summary,
-                                vf.completed_at
-                            ],
-                        ).map_err(|e| ReviewError::Database(e.to_string()))?;
+            let cycle_dir = verdict_path.parent().unwrap();
+            let corrections_content =
+                std::fs::read_to_string(cycle_dir.join("corrections.md")).ok();
 
-                        for f in &vf.findings {
-                            conn.execute(
-                                "INSERT OR IGNORE INTO review_findings (
-                                    finding_id, project_id, first_cycle_id, last_cycle_id, fingerprint,
-                                    severity, status, file_path, line_range, title, description,
-                                    suggested_fix, created_at, updated_at
-                                ) VALUES (?1, ?2, ?3, ?3, ?4, ?5, 'OPEN', ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
-                                params![
-                                    f.finding_id,
-                                    project_id,
-                                    vf.cycle_id,
-                                    f.fingerprint,
-                                    f.severity,
-                                    f.file_path,
-                                    f.line_range,
-                                    f.title,
-                                    f.description,
-                                    f.suggested_fix,
-                                    vf.completed_at
-                                ],
-                            ).map_err(|e| ReviewError::Database(e.to_string()))?;
+            let verdict: ReviewVerdict = vf.verdict.parse()?;
+            let status = match verdict {
+                ReviewVerdict::Accept => ReviewCycleStatus::Accepted,
+                ReviewVerdict::CorrectionsRequired => ReviewCycleStatus::CorrectionsRequired,
+                ReviewVerdict::Blocked => ReviewCycleStatus::Blocked,
+                ReviewVerdict::ArchitectureConcern => ReviewCycleStatus::ArchitectureConcern,
+            };
 
-                            conn.execute(
-                                "INSERT OR REPLACE INTO review_cycle_findings (cycle_id, finding_id, is_repeat)
-                                 VALUES (?1, ?2, ?3)",
-                                params![vf.cycle_id, f.finding_id, if f.is_repeat { 1 } else { 0 }],
-                            ).map_err(|e| ReviewError::Database(e.to_string()))?;
-                        }
+            if latest_cycle
+                .as_ref()
+                .is_none_or(|(n, _)| vf.cycle_number >= *n)
+            {
+                latest_cycle = Some((vf.cycle_number, verdict));
+            }
 
-                        // If verdict was Accept, mark findings resolved
-                        if verdict == Some(ReviewVerdict::Accept) {
-                            let _ = conn.execute(
-                                "UPDATE review_findings SET status = 'RESOLVED', resolution_cycle_id = ?1, updated_at = ?2 WHERE project_id = ?3 AND status = 'OPEN'",
-                                params![vf.cycle_id, vf.completed_at, project_id],
-                            );
-                        }
+            // Check if cycle already exists
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM review_cycles WHERE cycle_id = ?1",
+                    params![vf.cycle_id],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
 
-                        count += 1;
-                    }
+            if !exists {
+                conn.execute(
+                    "INSERT INTO review_cycles (
+                        cycle_id, project_id, cycle_number, architecture_version, epoch_id,
+                        validation_run_id, status, verdict, reviewer_type, git_head,
+                        git_dirty_fingerprint, review_packet_hash, corrections_packet, summary,
+                        started_at, completed_at, created_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'CHATGPT_RELAY', ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?14)",
+                    params![
+                        vf.cycle_id,
+                        project_id,
+                        vf.cycle_number,
+                        vf.architecture_version,
+                        vf.epoch_id,
+                        vf.validation_run_id,
+                        status.to_string(),
+                        vf.verdict,
+                        vf.git_head,
+                        vf.git_dirty_fingerprint,
+                        vf.review_packet_hash,
+                        corrections_content,
+                        vf.summary,
+                        vf.completed_at
+                    ],
+                ).map_err(|e| ReviewError::Database(e.to_string()))?;
+
+                for f in &vf.findings {
+                    let req_refs_json = serde_json::to_string(&f.requirement_references)
+                        .unwrap_or_else(|_| "[]".to_string());
+                    conn.execute(
+                        "INSERT OR IGNORE INTO review_findings (
+                            finding_id, project_id, first_cycle_id, last_cycle_id, fingerprint,
+                            severity, status, file_path, line_range, title, description,
+                            suggested_fix, requirement_references, problem_statement,
+                            required_change, required_test, reviewer_source_id,
+                            resolution_cycle_id, created_at, updated_at
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?19)",
+                        params![
+                            f.finding_id,
+                            project_id,
+                            f.first_cycle_id,
+                            f.last_cycle_id,
+                            f.fingerprint,
+                            f.severity,
+                            f.status,
+                            f.file_path,
+                            f.line_range,
+                            f.title,
+                            f.description,
+                            f.suggested_fix,
+                            req_refs_json,
+                            f.problem_statement,
+                            f.required_change,
+                            f.required_test,
+                            f.reviewer_source_id,
+                            f.resolution_cycle_id,
+                            vf.completed_at
+                        ],
+                    ).map_err(|e| ReviewError::Database(e.to_string()))?;
+
+                    conn.execute(
+                        "INSERT OR REPLACE INTO review_cycle_findings (cycle_id, finding_id, is_repeat)
+                         VALUES (?1, ?2, ?3)",
+                        params![vf.cycle_id, f.finding_id, if f.is_repeat { 1 } else { 0 }],
+                    ).map_err(|e| ReviewError::Database(e.to_string()))?;
                 }
+
+                // If verdict was Accept, mark findings resolved
+                if verdict == ReviewVerdict::Accept {
+                    let _ = conn.execute(
+                        "UPDATE review_findings SET status = 'RESOLVED', resolution_cycle_id = ?1, updated_at = ?2 WHERE project_id = ?3 AND status = 'OPEN'",
+                        params![vf.cycle_id, vf.completed_at, project_id],
+                    );
+                }
+
+                count += 1;
+            }
+        }
+
+        // Authoritatively restore workflow state from latest durable review cycle (Item 16)
+        if let Some((_cycle_num, verdict)) = latest_cycle {
+            let target_state = match verdict {
+                ReviewVerdict::Accept => WorkflowState::ReviewAccepted,
+                ReviewVerdict::CorrectionsRequired => WorkflowState::CorrectionsRequired,
+                ReviewVerdict::Blocked => WorkflowState::Blocked,
+                ReviewVerdict::ArchitectureConcern => WorkflowState::ArchitectureConcern,
+            };
+
+            let current_state = workflow::get_workflow_state(conn, project_id)
+                .map(|ws| ws.state)
+                .unwrap_or(WorkflowState::Draft);
+
+            if current_state != target_state {
+                let _ = conn.execute(
+                    "UPDATE workflow_state SET state = ?1, updated_at = ?2 WHERE project_id = ?3",
+                    params![
+                        target_state.to_string(),
+                        chrono::Utc::now().to_rfc3339(),
+                        project_id
+                    ],
+                );
             }
         }
 
         Ok(count)
+    }
+
+    /// Reads review packet file from disk under .coalition/reviews/cycle-<n>/packet.md (Item 17).
+    pub fn get_review_packet_content(
+        conn: &Connection,
+        repo_path: &Path,
+        project_id: &str,
+        cycle_id: &str,
+    ) -> Result<String, ReviewError> {
+        let cycle = get_review_cycle(conn, cycle_id)?
+            .ok_or_else(|| ReviewError::NotFound(cycle_id.to_string()))?;
+
+        if cycle.project_id != project_id {
+            return Err(ReviewError::NotFound(format!(
+                "Cycle {} does not belong to project {}",
+                cycle_id, project_id
+            )));
+        }
+
+        let packet_path = repo_path
+            .join(".coalition")
+            .join("reviews")
+            .join(format!("cycle-{}", cycle.cycle_number))
+            .join("packet.md");
+
+        if !packet_path.exists() {
+            return Err(ReviewError::NotFound(format!(
+                "Review packet file not found at {:?}",
+                packet_path
+            )));
+        }
+
+        let content = std::fs::read_to_string(&packet_path)?;
+        Ok(content)
     }
 }
 
@@ -1489,7 +1879,9 @@ pub fn list_findings_for_cycle(
         .prepare(
             "SELECT f.finding_id, f.project_id, f.first_cycle_id, f.last_cycle_id, f.fingerprint,
                     f.severity, f.status, f.file_path, f.line_range, f.title, f.description,
-                    f.suggested_fix, f.resolution_cycle_id, cf.is_repeat, f.created_at, f.updated_at
+                    f.suggested_fix, f.requirement_references, f.problem_statement, f.required_change,
+                    f.required_test, f.reviewer_source_id, f.resolution_cycle_id, cf.is_repeat,
+                    f.created_at, f.updated_at
              FROM review_findings f
              JOIN review_cycle_findings cf ON f.finding_id = cf.finding_id
              WHERE cf.cycle_id = ?1
@@ -1501,7 +1893,12 @@ pub fn list_findings_for_cycle(
         .query_map(params![cycle_id], |row| {
             let sev_str: String = row.get(5)?;
             let st_str: String = row.get(6)?;
-            let repeat_int: i64 = row.get(13)?;
+            let req_refs_raw: Option<String> = row.get(12)?;
+            let req_refs: Vec<String> = req_refs_raw
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            let repeat_int: i64 = row.get(18)?;
 
             Ok(ReviewFindingRecord {
                 finding_id: row.get(0)?,
@@ -1516,10 +1913,15 @@ pub fn list_findings_for_cycle(
                 title: row.get(9)?,
                 description: row.get(10)?,
                 suggested_fix: row.get(11)?,
-                resolution_cycle_id: row.get(12)?,
+                requirement_references: req_refs,
+                problem_statement: row.get(13)?,
+                required_change: row.get(14)?,
+                required_test: row.get(15)?,
+                reviewer_source_id: row.get(16)?,
+                resolution_cycle_id: row.get(17)?,
                 is_repeat: repeat_int != 0,
-                created_at: row.get(14)?,
-                updated_at: row.get(15)?,
+                created_at: row.get(19)?,
+                updated_at: row.get(20)?,
             })
         })
         .map_err(|e| ReviewError::Database(e.to_string()))?;
@@ -1540,7 +1942,9 @@ pub fn list_findings_for_project(
         Some(st) => format!(
             "SELECT finding_id, project_id, first_cycle_id, last_cycle_id, fingerprint,
                     severity, status, file_path, line_range, title, description,
-                    suggested_fix, resolution_cycle_id, 0, created_at, updated_at
+                    suggested_fix, requirement_references, problem_statement, required_change,
+                    required_test, reviewer_source_id, resolution_cycle_id, 0,
+                    created_at, updated_at
              FROM review_findings
              WHERE project_id = ?1 AND status = '{}'
              ORDER BY finding_id ASC",
@@ -1548,7 +1952,9 @@ pub fn list_findings_for_project(
         ),
         None => "SELECT finding_id, project_id, first_cycle_id, last_cycle_id, fingerprint,
                         severity, status, file_path, line_range, title, description,
-                        suggested_fix, resolution_cycle_id, 0, created_at, updated_at
+                        suggested_fix, requirement_references, problem_statement, required_change,
+                        required_test, reviewer_source_id, resolution_cycle_id, 0,
+                        created_at, updated_at
                  FROM review_findings
                  WHERE project_id = ?1
                  ORDER BY finding_id ASC"
@@ -1563,7 +1969,12 @@ pub fn list_findings_for_project(
         .query_map(params![project_id], |row| {
             let sev_str: String = row.get(5)?;
             let st_str: String = row.get(6)?;
-            let repeat_int: i64 = row.get(13)?;
+            let req_refs_raw: Option<String> = row.get(12)?;
+            let req_refs: Vec<String> = req_refs_raw
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            let repeat_int: i64 = row.get(18)?;
 
             Ok(ReviewFindingRecord {
                 finding_id: row.get(0)?,
@@ -1578,10 +1989,15 @@ pub fn list_findings_for_project(
                 title: row.get(9)?,
                 description: row.get(10)?,
                 suggested_fix: row.get(11)?,
-                resolution_cycle_id: row.get(12)?,
+                requirement_references: req_refs,
+                problem_statement: row.get(13)?,
+                required_change: row.get(14)?,
+                required_test: row.get(15)?,
+                reviewer_source_id: row.get(16)?,
+                resolution_cycle_id: row.get(17)?,
                 is_repeat: repeat_int != 0,
-                created_at: row.get(14)?,
-                updated_at: row.get(15)?,
+                created_at: row.get(19)?,
+                updated_at: row.get(20)?,
             })
         })
         .map_err(|e| ReviewError::Database(e.to_string()))?;
@@ -1621,6 +2037,11 @@ mod tests {
 Here is my review of the changes.
 
 ```verdict
+schema_version: 1
+response_type: REVIEW_VERDICT
+project_id: "test-proj"
+cycle_id: "rcy-test-1"
+review_packet_hash: "hash-abc"
 verdict: ACCEPT
 summary: "All implementation details adhere strictly to the frozen contract. Tests pass."
 findings: []
@@ -1636,6 +2057,11 @@ findings: []
     fn test_parse_reviewer_response_corrections_required() {
         let resp = r#"
 ```verdict
+schema_version: 1
+response_type: REVIEW_VERDICT
+project_id: "test-proj"
+cycle_id: "rcy-test-1"
+review_packet_hash: "hash-abc"
 verdict: CORRECTIONS_REQUIRED
 summary: "Found 2 issues that violate error handling requirements."
 findings:
@@ -1656,21 +2082,25 @@ findings:
         let (verdict, _summary, findings) = ReviewService::parse_reviewer_response(resp).unwrap();
         assert_eq!(verdict, ReviewVerdict::CorrectionsRequired);
         assert_eq!(findings.len(), 2);
-        assert_eq!(findings[0].title, "Missing input bounds check");
-        assert_eq!(findings[0].severity.as_deref(), Some("CRITICAL"));
-        assert_eq!(findings[1].severity.as_deref(), Some("MINOR"));
+        assert_eq!(findings[0].severity, ReviewFindingSeverity::Critical);
+        assert_eq!(findings[1].severity, ReviewFindingSeverity::Minor);
     }
 
     #[test]
     fn test_generate_corrections_packet() {
         let findings = vec![ParsedReviewFinding {
             id: Some("FND-1".to_string()),
-            severity: Some("CRITICAL".to_string()),
+            severity: ReviewFindingSeverity::Critical,
             title: "Memory leak in cache".to_string(),
             file: Some("src/cache.rs".to_string()),
             lines: Some("12-15".to_string()),
             description: "Entries are not pruned on TTL expiry.".to_string(),
             suggested_fix: Some("Add cleanup_expired() call.".to_string()),
+            requirement_references: vec!["REQ-1".to_string()],
+            problem_statement: Some("Unbounded cache memory growth.".to_string()),
+            required_change: Some("Implement eviction policy.".to_string()),
+            required_test: Some("Verify memory bounds under load.".to_string()),
+            reviewer_source_id: Some("REV-FND-1".to_string()),
         }];
         let packet = ReviewService::generate_corrections_packet(
             1,

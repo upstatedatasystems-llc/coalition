@@ -37,7 +37,7 @@ pub enum ValidationError {
     Validation(String),
     #[error("Validation run not found: {0}")]
     NotFound(String),
-    #[error("Stale evidence: working tree or Git HEAD has changed since validation was run")]
+    #[error("Stale evidence: {0}")]
     StaleEvidence(String),
 }
 
@@ -815,6 +815,10 @@ impl ValidationService {
                     "project_id": project_id,
                     "run_id": run_id,
                     "status": "RUNNING",
+                    "architecture_version": arch_version,
+                    "epoch_id": epoch_id,
+                    "trigger_source": trigger.to_string(),
+                    "git_head": git_head,
                     "commands": initial_command_records
                 }),
             );
@@ -853,6 +857,7 @@ impl ValidationService {
                 sink(
                     "validation://command-start",
                     serde_json::json!({
+                        "project_id": project_id,
                         "run_id": run_id,
                         "command_id": cmd.id,
                         "name": cmd.name
@@ -881,6 +886,7 @@ impl ValidationService {
             let sink_clone = event_sink.clone();
             let cmd_id_clone = cmd.id.clone();
             let run_id_clone = run_id.clone();
+            let project_id_clone = project_id.to_string();
 
             tokio::spawn(async move {
                 while let Some(line) = rx.recv().await {
@@ -888,6 +894,7 @@ impl ValidationService {
                         sink(
                             "validation://output",
                             serde_json::json!({
+                                "project_id": project_id_clone,
                                 "run_id": run_id_clone,
                                 "command_id": cmd_id_clone,
                                 "kind": match line.kind {
@@ -951,6 +958,7 @@ impl ValidationService {
                 sink(
                     "validation://command-finish",
                     serde_json::json!({
+                        "project_id": project_id,
                         "run_id": run_id,
                         "command_id": cmd.id,
                         "status": status.to_string(),
@@ -1151,6 +1159,53 @@ impl ValidationService {
             )));
         }
 
+        let current_arch_version = crate::core::artifacts::ArtifactManager::resolve_coalition_dir(repo_path)
+            .ok()
+            .and_then(|dir| {
+                crate::core::artifacts::ArtifactManager::read_project_yaml(dir.join("project.yaml"))
+                    .ok()
+            })
+            .and_then(|py| py.current_architecture_version)
+            .unwrap_or_else(|| {
+                conn.query_row(
+                    "SELECT architecture_version FROM builder_epochs WHERE project_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                    params![project_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|_| "1.0".to_string())
+            });
+
+        if run.architecture_version != current_arch_version {
+            return Err(ValidationError::StaleEvidence(format!(
+                "Cannot override validation gate: run architecture version ({}) does not match current project architecture version ({})",
+                run.architecture_version, current_arch_version
+            )));
+        }
+
+        let current_epoch_id: Option<String> = crate::core::freeze::FreezeService::get_builder_packet(
+            repo_path,
+            Some(&current_arch_version),
+        )
+        .map(|bp| Some(bp.metadata.builder_epoch_id))
+        .unwrap_or_else(|_| {
+            conn.query_row(
+                "SELECT epoch_id FROM builder_epochs WHERE project_id = ?1 AND architecture_version = ?2 ORDER BY created_at DESC LIMIT 1",
+                params![project_id, &current_arch_version],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or(None)
+        });
+
+        if let Some(ref ep) = current_epoch_id {
+            if run.epoch_id.as_deref() != Some(ep) {
+                return Err(ValidationError::StaleEvidence(format!(
+                    "Cannot override validation gate: run Builder epoch ({:?}) does not match current Builder epoch ({})",
+                    run.epoch_id, ep
+                )));
+            }
+        }
+
         let config = Self::read_validation_config(repo_path)?;
         if run.config_fingerprint.as_deref() != Some(&config.fingerprint()) {
             return Err(ValidationError::StaleEvidence(format!(
@@ -1223,6 +1278,19 @@ impl ValidationService {
             ),
             Some(&meta),
         );
+
+        // Authoritatively verify review gate passes before transitioning workflow
+        let epoch_to_check = current_epoch_id
+            .as_deref()
+            .or(run.epoch_id.as_deref())
+            .unwrap_or("");
+        Self::check_review_gate(
+            conn,
+            repo_path,
+            project_id,
+            &current_arch_version,
+            epoch_to_check,
+        )?;
 
         // If workflow state is Validating, advance it to WaitingForReview via SubmitForReview
         if let Ok(current_wf) = crate::core::workflow::get_workflow_state(conn, project_id) {
@@ -1406,7 +1474,12 @@ impl ValidationService {
         repo_path: &Path,
         event_sink: Option<ValidationEventSink>,
         app_data_dir: &Path,
-    ) -> Result<ValidationRunRecord, ValidationError> {
+    ) -> Result<Option<ValidationRunRecord>, ValidationError> {
+        let config = Self::read_validation_config(repo_path)?;
+        if !config.enabled {
+            return Ok(None);
+        }
+
         // 1. Transition workflow from Building to Validating if currently Building
         {
             let mut db = db_conn.lock().await;
@@ -1452,7 +1525,7 @@ impl ValidationService {
             }
         }
 
-        Ok(record)
+        Ok(Some(record))
     }
 }
 

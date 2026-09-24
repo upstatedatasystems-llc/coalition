@@ -17,6 +17,9 @@ pub fn run() {
                 let mut d = DbManager::open(custom_path).expect("Failed to open custom database");
                 d.run_migrations().expect("Failed to run migrations");
                 let _ = d.reconcile_orphaned_sessions();
+                let _ = crate::core::validation::ValidationService::reconcile_interrupted_runs(
+                    d.connection_mut(),
+                );
                 d
             } else {
                 let app_dir = app
@@ -144,6 +147,7 @@ pub fn run() {
             commands::list_review_cycles,
             commands::prepare_review_import,
             commands::confirm_review_import,
+            commands::get_review_packet_content,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

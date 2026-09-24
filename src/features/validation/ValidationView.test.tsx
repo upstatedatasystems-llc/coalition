@@ -279,4 +279,96 @@ describe('ValidationView', () => {
       expect(screen.getByText(/Submission Blocked by Validation Gate/)).toBeInTheDocument();
     });
   });
+
+  it('ignores validation events from different projects (multi-project isolation)', async () => {
+    let statusCallback: ((event: { payload: any }) => void) | null = null;
+    mockListen.mockImplementation((eventName: string, cb: any) => {
+      if (eventName === 'validation://status') {
+        statusCallback = cb;
+      }
+      return Promise.resolve(() => {});
+    });
+
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'get_validation_config') return Promise.resolve(mockConfig);
+      if (cmd === 'get_active_validation_run') return Promise.resolve(null);
+      if (cmd === 'get_validation_history') return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    render(
+      <ValidationView
+        projectId="proj-1"
+        projectName="Test Project"
+        workflowState="BUILDING"
+        onRefreshProject={onRefreshProject}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('start-validation-btn')).toBeInTheDocument();
+    });
+
+    // Fire status event for a DIFFERENT project
+    if (statusCallback) {
+      (statusCallback as any)({
+        payload: {
+          project_id: 'other-project-id',
+          run_id: 'other-run',
+          status: 'RUNNING',
+        },
+      });
+    }
+
+    // Active run banner should NOT appear for proj-1
+    expect(screen.queryByTestId('active-validation-run')).not.toBeInTheDocument();
+  });
+
+  it('renders Stop Current and Stop All enabled while validation is running', async () => {
+    const runningRun: ValidationRunRecord = {
+      ...mockHistoryRun,
+      run_id: 'val-running-now',
+      status: 'RUNNING',
+    };
+
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      if (cmd === 'get_validation_config') return Promise.resolve(mockConfig);
+      if (cmd === 'get_active_validation_run') return Promise.resolve(runningRun);
+      if (cmd === 'get_validation_history') return Promise.resolve([]);
+      if (cmd === 'cancel_validation_run') return Promise.resolve(args);
+      return Promise.resolve(null);
+    });
+
+    render(
+      <ValidationView
+        projectId="proj-1"
+        projectName="Test Project"
+        workflowState="VALIDATING"
+        onRefreshProject={onRefreshProject}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('active-validation-run')).toBeInTheDocument();
+      expect(screen.getByTestId('stop-current-btn')).toBeInTheDocument();
+      expect(screen.getByTestId('stop-all-btn')).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId('stop-current-btn')).not.toBeDisabled();
+    expect(screen.getByTestId('stop-all-btn')).not.toBeDisabled();
+
+    fireEvent.click(screen.getByTestId('stop-current-btn'));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith('stop_validation_command', {
+        runId: 'val-running-now',
+      });
+    });
+
+    fireEvent.click(screen.getByTestId('stop-all-btn'));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith('stop_validation_run', {
+        runId: 'val-running-now',
+      });
+    });
+  });
 });
