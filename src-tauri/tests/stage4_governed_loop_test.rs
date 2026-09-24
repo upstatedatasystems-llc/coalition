@@ -1935,3 +1935,522 @@ async fn test_stage4_validation_diagnostic_routing_to_builder() {
         );
     }
 }
+
+fn setup_frozen_test_project_with_builder_request(
+) -> (tempfile::TempDir, tempfile::TempDir, String, PathBuf) {
+    let repo_temp = tempdir().unwrap();
+    let repo_path = repo_temp.path();
+
+    Command::new("git")
+        .args(["init"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "Stage 4 Tester"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "stage4@test.local"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+
+    let fixture_file = repo_path.join("README.md");
+    fs::write(&fixture_file, "# Stage 4 Governed Loop Project\n").unwrap();
+    Command::new("git")
+        .args(["add", "README.md"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "initial commit"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+
+    let db_temp = tempdir().unwrap();
+    let db_path = db_temp.path().join("stage4_test.db");
+
+    let git = GitAdapter::new().unwrap();
+    let mut db = DbManager::open(&db_path).unwrap();
+    db.run_migrations().unwrap();
+
+    let details = ProjectService::register_or_open_project(
+        db.connection_mut(),
+        &git,
+        repo_path.to_str().unwrap(),
+    )
+    .unwrap();
+    let project_id = details.project.project_id;
+
+    apply_workflow_action(
+        db.connection_mut(),
+        &project_id,
+        WorkflowAction::StartArchitecting,
+        "HUMAN",
+    )
+    .unwrap();
+
+    let coalition_dir = repo_path.join(".coalition");
+    for &art_path in CANONICAL_ARCHITECTURE_ARTIFACTS {
+        let full_path = coalition_dir.join(art_path);
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        if art_path.ends_with(".yaml") || art_path.ends_with(".yml") {
+            fs::write(
+                &full_path,
+                "version: 1\nreadiness: ready\nsummary: Test architecture\n",
+            )
+            .unwrap();
+        } else if art_path == "design/product-vision.md" {
+            fs::write(
+                &full_path,
+                "# Architecture Spec\nSubstantive architecture content for Stage 4 governed loop.\ntrigger_builder_request_validation\n",
+            )
+            .unwrap();
+        } else {
+            fs::write(
+                &full_path,
+                "# Architecture Spec\nSubstantive architecture content for Stage 4 governed loop.\n",
+            )
+            .unwrap();
+        }
+    }
+
+    let validation_path = coalition_dir.join("implementation").join("validation.yaml");
+    fs::create_dir_all(validation_path.parent().unwrap()).unwrap();
+
+    #[cfg(windows)]
+    let val_yaml = r#"schema_version: 1
+enabled: true
+commands:
+  - id: check-sentinel
+    name: "Check Clean Sentinel"
+    command: "if exist target\\clean.txt (exit 0) else (exit 1)"
+    timeout_seconds: 30
+    required: true
+policy:
+  gate_review_on_required_failure: true
+  grace_period_seconds: 5
+"#;
+
+    #[cfg(not(windows))]
+    let val_yaml = r#"schema_version: 1
+enabled: true
+commands:
+  - id: check-sentinel
+    name: "Check Clean Sentinel"
+    command: "test -f target/clean.txt"
+    timeout_seconds: 30
+    required: true
+policy:
+  gate_review_on_required_failure: true
+  grace_period_seconds: 5
+"#;
+
+    fs::write(&validation_path, val_yaml).unwrap();
+
+    apply_workflow_action(
+        db.connection_mut(),
+        &project_id,
+        WorkflowAction::MarkReadyToFreeze,
+        "HUMAN",
+    )
+    .unwrap();
+
+    let preview =
+        FreezeService::prepare_freeze_preview(repo_path, &project_id, &git, db.connection())
+            .unwrap();
+    FreezeService::confirm_freeze(
+        repo_path,
+        &project_id,
+        &preview.preview_id,
+        &git,
+        db.connection_mut(),
+    )
+    .unwrap();
+
+    (repo_temp, db_temp, project_id, db_path)
+}
+
+#[tokio::test]
+async fn test_stage4_builder_requested_validation_diagnostic_and_fix_loop() {
+    let (repo_temp, _db_temp, project_id, db_path) =
+        setup_frozen_test_project_with_builder_request();
+    let _repo_path = repo_temp.path();
+
+    let db_manager = Arc::new(Mutex::new(DbManager::open(&db_path).unwrap()));
+    let val_registry = Arc::new(Mutex::new(ActiveValidationRegistry::new()));
+    let builder_registry = Arc::new(Mutex::new(
+        coalition_lib::core::builder::ActiveBuilderRegistry::new(),
+    ));
+    let fake_agy_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("tests")
+        .join("fake-commands")
+        .join(if cfg!(windows) {
+            "fake-agy.cmd"
+        } else {
+            "fake-agy"
+        });
+    let adapter =
+        coalition_lib::core::builder::AntigravityCliAdapter::with_path(fake_agy_path.clone());
+
+    // 1. Project is BUILDING
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartBuild,
+            "HUMAN",
+        )
+        .unwrap();
+
+        let wf = coalition_lib::core::workflow::get_workflow_state(db.connection(), &project_id)
+            .unwrap();
+        assert_eq!(
+            wf.state,
+            WorkflowState::Building,
+            "Step 1: Project must be in BUILDING state"
+        );
+    }
+
+    // 2. Start initial Builder turn: fake-agy outputs COALITION_REQUEST_VALIDATION,
+    // which triggers Builder-requested validation with trigger BUILDER_REQUESTED.
+    // 3. Validation fails (target/clean.txt does not exist).
+    let turn1_resp = coalition_lib::core::builder::BuilderService::start_governed_turn_with_source(
+        db_manager.clone(),
+        builder_registry.clone(),
+        None,
+        &project_id,
+        Some("gemini-3.8-flash-high".to_string()),
+        Some("low".to_string()),
+        Some(adapter.clone()),
+        None,
+        Some(val_registry.clone()),
+        None,
+    )
+    .await
+    .expect("Builder turn 1 should execute and complete");
+
+    assert_eq!(turn1_resp.status, "SUCCESS");
+
+    // 4. Workflow remains in BUILDING after failed builder-requested validation!
+    let failed_run_id = {
+        let db = db_manager.lock().await;
+        let wf = coalition_lib::core::workflow::get_workflow_state(db.connection(), &project_id)
+            .unwrap();
+        assert_eq!(wf.state, WorkflowState::Building, "Step 4: Workflow must remain in BUILDING state after builder-requested validation failure");
+
+        let latest_run = coalition_lib::core::validation::get_latest_validation_run(
+            db.connection(),
+            &project_id,
+        )
+        .unwrap()
+        .expect("Builder-requested validation run must exist");
+        assert_eq!(
+            latest_run.trigger_source,
+            ValidationTriggerSource::BuilderRequested,
+            "Step 2: Trigger must be BUILDER_REQUESTED"
+        );
+        assert_eq!(
+            latest_run.status,
+            coalition_lib::core::validation::ValidationRunStatus::Fail,
+            "Step 3: Validation must fail"
+        );
+        assert!(!latest_run.is_gate_passed);
+
+        latest_run.run_id
+    };
+
+    // 5. The failed run is eligible for ValidationDiagnostic routing in BUILDING state.
+    // verify_and_prepare_diagnostic_routing succeeds and leaves workflow in BUILDING.
+    {
+        let mut db = db_manager.lock().await;
+        coalition_lib::commands::verify_and_prepare_diagnostic_routing(
+            &mut db,
+            &project_id,
+            &failed_run_id,
+        )
+        .expect("Step 5: Failed BUILDER_REQUESTED run must be eligible for diagnostic routing in BUILDING state");
+
+        let wf = coalition_lib::core::workflow::get_workflow_state(db.connection(), &project_id)
+            .unwrap();
+        assert_eq!(
+            wf.state,
+            WorkflowState::Building,
+            "Step 5: Workflow must remain in BUILDING state (not CORRECTIONS_REQUIRED)"
+        );
+
+        // Verify activity event was recorded
+        let events =
+            ActivityManager::get_project_activity(db.connection(), &project_id, Some(10)).unwrap();
+        let routed_event = events
+            .iter()
+            .find(|e| e.event_type == "VALIDATION_DIAGNOSTICS_ROUTED_TO_BUILDER")
+            .expect("VALIDATION_DIAGNOSTICS_ROUTED_TO_BUILDER event must be recorded");
+        assert_eq!(routed_event.actor, "HUMAN");
+    }
+
+    // 6. Same-epoch Builder diagnostic turn starts successfully.
+    // 7. Builder prompt contains the bounded sanitized validation diagnostic.
+    // 8. Project remains/returns to BUILDING appropriately.
+    // 9. After Builder fixes the issue and finishes normally, ordinary POST_BUILD validation orchestration runs.
+    // 10. Passing POST_BUILD validation reaches WAITING_FOR_REVIEW.
+    let turn2_resp = coalition_lib::core::builder::BuilderService::start_governed_turn_with_source(
+        db_manager.clone(),
+        builder_registry.clone(),
+        None,
+        &project_id,
+        Some("gemini-3.8-flash-high".to_string()),
+        Some("low".to_string()),
+        Some(adapter),
+        Some(
+            coalition_lib::core::builder::BuilderInstructionSource::ValidationDiagnostic {
+                validation_run_id: failed_run_id.clone(),
+            },
+        ),
+        Some(val_registry.clone()),
+        None,
+    )
+    .await
+    .expect("Step 6: Diagnostic turn must execute and complete successfully");
+
+    assert_eq!(turn2_resp.status, "SUCCESS");
+
+    {
+        let db = db_manager.lock().await;
+
+        // Step 7: Verify builder prompt recorded in session contains validation diagnostic report
+        let latest_session = db.get_latest_builder_session(&project_id).unwrap().unwrap();
+        assert!(
+            latest_session
+                .prompt
+                .contains("=== VALIDATION DIAGNOSTIC REPORT ==="),
+            "Step 7: Builder prompt must contain sanitized validation diagnostic report"
+        );
+        assert!(
+            latest_session.prompt.contains(&failed_run_id),
+            "Step 7: Builder prompt must reference the failed validation run ID"
+        );
+
+        // Step 9 & 10: After Builder fixes the issue, post-build validation ran and passed, reaching WAITING_FOR_REVIEW
+        let wf = coalition_lib::core::workflow::get_workflow_state(db.connection(), &project_id)
+            .unwrap();
+        assert_eq!(
+            wf.state,
+            WorkflowState::WaitingForReview,
+            "Step 10: Passing post-build validation must reach WAITING_FOR_REVIEW"
+        );
+
+        let latest_run = coalition_lib::core::validation::get_latest_validation_run(
+            db.connection(),
+            &project_id,
+        )
+        .unwrap()
+        .expect("Post-build validation run must exist");
+        assert_eq!(
+            latest_run.trigger_source,
+            ValidationTriggerSource::PostBuild
+        );
+        assert_eq!(
+            latest_run.status,
+            coalition_lib::core::validation::ValidationRunStatus::Pass
+        );
+        assert!(latest_run.is_gate_passed);
+    }
+}
+
+#[tokio::test]
+async fn test_stage4_diagnostic_routing_invariants_and_abuse_prevention() {
+    let (repo_temp, _db_temp, project_id, db_path) = setup_frozen_test_project();
+    let _repo_path = repo_temp.path();
+    let db_manager = Arc::new(Mutex::new(DbManager::open(&db_path).unwrap()));
+
+    let epoch_id = {
+        let db = db_manager.lock().await;
+        db.connection()
+            .query_row(
+                "SELECT epoch_id FROM builder_epochs WHERE project_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                rusqlite::params![project_id],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+
+    // Put project in BUILDING
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartBuild,
+            "HUMAN",
+        )
+        .unwrap();
+    }
+
+    // 1. Wrong project run rejected
+    {
+        let mut db = db_manager.lock().await;
+        let err = coalition_lib::commands::verify_and_prepare_diagnostic_routing(
+            &mut db,
+            &project_id,
+            "val-nonexistent-run-999",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "NOT_FOUND");
+    }
+
+    // 2. A MANUAL failed validation run cannot abuse the BUILDING-state diagnostic route
+    let manual_run_id = "val-manual-fail-abuse";
+    {
+        let mut db = db_manager.lock().await;
+        let manual_run = coalition_lib::core::validation::ValidationRunRecord {
+            run_id: manual_run_id.to_string(),
+            project_id: project_id.clone(),
+            architecture_version: "1.0".to_string(),
+            epoch_id: Some(epoch_id.clone()),
+            trigger_source: ValidationTriggerSource::Manual,
+            status: coalition_lib::core::validation::ValidationRunStatus::Fail,
+            is_gate_passed: false,
+            has_override: false,
+            git_head: None,
+            git_dirty_fingerprint: None,
+            config_fingerprint: None,
+            log_path: None,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+            duration_ms: 50,
+            commands: Vec::new(),
+        };
+        coalition_lib::core::validation::insert_validation_run(db.connection(), &manual_run)
+            .unwrap();
+
+        let err = coalition_lib::commands::verify_and_prepare_diagnostic_routing(
+            &mut db,
+            &project_id,
+            manual_run_id,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code, "INVALID_TRIGGER_FOR_WORKFLOW_STATE",
+            "MANUAL failed run cannot abuse BUILDING diagnostic route"
+        );
+    }
+
+    // 3. A POST_BUILD failed run cannot abuse the BUILDING-state route
+    let post_build_run_id = "val-post-build-fail-abuse";
+    {
+        let mut db = db_manager.lock().await;
+        let pb_run = coalition_lib::core::validation::ValidationRunRecord {
+            run_id: post_build_run_id.to_string(),
+            project_id: project_id.clone(),
+            architecture_version: "1.0".to_string(),
+            epoch_id: Some(epoch_id.clone()),
+            trigger_source: ValidationTriggerSource::PostBuild,
+            status: coalition_lib::core::validation::ValidationRunStatus::Fail,
+            is_gate_passed: false,
+            has_override: false,
+            git_head: None,
+            git_dirty_fingerprint: None,
+            config_fingerprint: None,
+            log_path: None,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+            duration_ms: 50,
+            commands: Vec::new(),
+        };
+        coalition_lib::core::validation::insert_validation_run(db.connection(), &pb_run).unwrap();
+
+        let err = coalition_lib::commands::verify_and_prepare_diagnostic_routing(
+            &mut db,
+            &project_id,
+            post_build_run_id,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code, "INVALID_TRIGGER_FOR_WORKFLOW_STATE",
+            "POST_BUILD failed run cannot abuse BUILDING diagnostic route"
+        );
+    }
+
+    // 4. Stale architecture version is rejected
+    let stale_arch_run_id = "val-stale-arch-fail";
+    {
+        let mut db = db_manager.lock().await;
+        let stale_arch_run = coalition_lib::core::validation::ValidationRunRecord {
+            run_id: stale_arch_run_id.to_string(),
+            project_id: project_id.clone(),
+            architecture_version: "0.1".to_string(),
+            epoch_id: Some(epoch_id.clone()),
+            trigger_source: ValidationTriggerSource::BuilderRequested,
+            status: coalition_lib::core::validation::ValidationRunStatus::Fail,
+            is_gate_passed: false,
+            has_override: false,
+            git_head: None,
+            git_dirty_fingerprint: None,
+            config_fingerprint: None,
+            log_path: None,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+            duration_ms: 50,
+            commands: Vec::new(),
+        };
+        coalition_lib::core::validation::insert_validation_run(db.connection(), &stale_arch_run)
+            .unwrap();
+
+        let err = coalition_lib::commands::verify_and_prepare_diagnostic_routing(
+            &mut db,
+            &project_id,
+            stale_arch_run_id,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code, "STALE_EVIDENCE",
+            "Stale architecture version must be rejected"
+        );
+    }
+
+    // 5. Stale Builder epoch is rejected
+    let stale_epoch_run_id = "val-stale-epoch-fail";
+    {
+        let mut db = db_manager.lock().await;
+        let stale_epoch_run = coalition_lib::core::validation::ValidationRunRecord {
+            run_id: stale_epoch_run_id.to_string(),
+            project_id: project_id.clone(),
+            architecture_version: "1.0".to_string(),
+            epoch_id: Some("old-epoch-obsolete".to_string()),
+            trigger_source: ValidationTriggerSource::BuilderRequested,
+            status: coalition_lib::core::validation::ValidationRunStatus::Fail,
+            is_gate_passed: false,
+            has_override: false,
+            git_head: None,
+            git_dirty_fingerprint: None,
+            config_fingerprint: None,
+            log_path: None,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+            duration_ms: 50,
+            commands: Vec::new(),
+        };
+        coalition_lib::core::validation::insert_validation_run(db.connection(), &stale_epoch_run)
+            .unwrap();
+
+        let err = coalition_lib::commands::verify_and_prepare_diagnostic_routing(
+            &mut db,
+            &project_id,
+            stale_epoch_run_id,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code, "STALE_EVIDENCE",
+            "Stale Builder epoch must be rejected"
+        );
+    }
+}

@@ -21,11 +21,28 @@ When a Builder turn completes successfully:
 
 ## Routable Validation Diagnostics to Builder
 
-When a validation run produces failures or timeouts while in the `VALIDATING` state:
-- The operator can dispatch diagnostics to the Builder via `start_builder_diagnostic_turn`.
-- **Preflights**: The run is verified to belong to the project, match the active frozen architecture version, and match the current builder epoch.
-- **Workflow State**: The workflow transitions `VALIDATING -> CORRECTIONS_REQUIRED` via `RequestCorrections`, logs `VALIDATION_DIAGNOSTICS_ROUTED_TO_BUILDER`, and initiates a Builder turn with `BuilderInstructionSource::ValidationDiagnostic`.
-- **Sanitized Packet**: Antigravity receives a bounded, secret-sanitized diagnostic tail report appended to the canonical frozen prompt, legally transitioning `CORRECTIONS_REQUIRED -> BUILDING`.
+When a validation run produces failures or timeouts, Coalition supports two governed diagnostic-routing paths depending on the workflow state and trigger:
+
+1. **Post-Build Validation Failures (`VALIDATING` / `CORRECTIONS_REQUIRED`)**:
+   - For failed or timed-out `POST_BUILD` validation runs while the workflow is in `VALIDATING`.
+   - The workflow legally transitions `VALIDATING -> CORRECTIONS_REQUIRED` via `RequestCorrections`, logs `VALIDATION_DIAGNOSTICS_ROUTED_TO_BUILDER`, and initiates a Builder turn with `BuilderInstructionSource::ValidationDiagnostic`.
+   - The Builder turn transitions `CORRECTIONS_REQUIRED -> BUILDING`.
+
+2. **Builder-Requested Validation Failures (`BUILDING`)**:
+   - When a Builder turn outputs `COALITION_REQUEST_VALIDATION`, an intermediate validation run executes with trigger `BUILDER_REQUESTED` while the project remains in `BUILDING`.
+   - If that validation run fails or times out, the operator can dispatch diagnostics directly back to the Builder via `start_builder_diagnostic_turn` without routing through `CORRECTIONS_REQUIRED`.
+   - This provides intermediate inner-loop development feedback rather than a Reviewer correction cycle; the project remains in `BUILDING`.
+   - Once the Builder resolves the defect and completes normally, ordinary `POST_BUILD` validation orchestration executes automatically and advances the project to `WAITING_FOR_REVIEW`.
+
+3. **Authoritative Invariants & Eligibility Rules**:
+   - The validation run must belong to the active project.
+   - The validation run status must be `FAIL` or `TIMEOUT`.
+   - The run architecture version must match the active frozen architecture version.
+   - The run epoch must match the active Builder epoch.
+   - In `BUILDING` state: only `BUILDER_REQUESTED` runs qualify (preventing `MANUAL` or `POST_BUILD` runs from bypassing state checks).
+   - In `VALIDATING` or `CORRECTIONS_REQUIRED` states: only `POST_BUILD` runs qualify.
+   - Frontend cannot supply arbitrary prompt text or executable commands; diagnostic contents are generated authoritatively by Coalition from stored execution records and remain bounded and secret-sanitized.
+   - The UI only presents and enables "Send Diagnostics to Builder" when the selected run matches the required trigger and state eligibility criteria.
 
 ## Review Import Governance & Rejection
 

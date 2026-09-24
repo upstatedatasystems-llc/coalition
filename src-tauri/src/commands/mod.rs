@@ -940,114 +940,203 @@ pub struct StartBuilderDiagnosticTurnPayload {
     pub effort: Option<String>,
 }
 
-#[tauri::command]
-pub async fn start_builder_diagnostic_turn(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    payload: StartBuilderDiagnosticTurnPayload,
-) -> Result<BuilderTurnResponse, CommandError> {
+/// Authoritative verification and workflow preparation for diagnostic routing to Builder.
+/// Enforces:
+/// - Validation run belongs to the active project.
+/// - Validation run status is FAIL or TIMEOUT.
+/// - Architecture version matches active frozen architecture.
+/// - Builder epoch matches current Builder epoch.
+/// - In BUILDING state: run trigger must be BUILDER_REQUESTED (workflow remains BUILDING).
+/// - In VALIDATING state: run trigger must be POST_BUILD (workflow transitions VALIDATING -> CORRECTIONS_REQUIRED).
+/// - In CORRECTIONS_REQUIRED state: run trigger must be POST_BUILD (workflow remains CORRECTIONS_REQUIRED).
+pub fn verify_and_prepare_diagnostic_routing(
+    db: &mut DbManager,
+    project_id: &str,
+    validation_run_id: &str,
+) -> Result<(), CommandError> {
     // 1. Authoritative verification: preflight repo, architecture version, builder epoch
-    let (_repo_path, current_arch_version, builder_packet) = {
-        let mut db = state.db.lock().await;
-        validate_builder_preflight(&mut db, &payload.project_id)?
-    };
+    let (_repo_path, current_arch_version, builder_packet) =
+        validate_builder_preflight(db, project_id)?;
     let current_epoch = builder_packet.metadata.builder_epoch_id;
 
     // 2. Authoritative verification of validation run
-    {
-        let db = state.db.lock().await;
-        let run = crate::core::validation::get_validation_run(
-            db.connection(),
-            &payload.validation_run_id,
-        )
+    let run = crate::core::validation::get_validation_run(db.connection(), validation_run_id)
         .map_err(CommandError::from)?
         .ok_or_else(|| {
             CommandError::new(
                 "NOT_FOUND",
-                format!("Validation run {} not found", payload.validation_run_id),
+                format!("Validation run {} not found", validation_run_id),
             )
         })?;
 
-        if run.project_id != payload.project_id {
-            return Err(CommandError::new(
-                "FORBIDDEN",
-                format!(
-                    "Validation run {} does not belong to project {}",
-                    payload.validation_run_id, payload.project_id
-                ),
-            ));
-        }
-
-        if run.status != crate::core::validation::ValidationRunStatus::Fail
-            && run.status != crate::core::validation::ValidationRunStatus::Timeout
-        {
-            return Err(CommandError::new(
-                "INVALID_STATE",
-                format!(
-                    "Validation run {} has status {} (must be FAIL or TIMEOUT)",
-                    payload.validation_run_id, run.status
-                ),
-            ));
-        }
-
-        if run.architecture_version != current_arch_version {
-            return Err(CommandError::new(
-                "STALE_EVIDENCE",
-                format!(
-                    "Validation run architecture version ({}) does not match current ({})",
-                    run.architecture_version, current_arch_version
-                ),
-            ));
-        }
-
-        if run.epoch_id.as_deref() != Some(&current_epoch) {
-            return Err(CommandError::new(
-                "STALE_EVIDENCE",
-                format!(
-                    "Validation run epoch ({:?}) does not match current Builder epoch ({})",
-                    run.epoch_id, current_epoch
-                ),
-            ));
-        }
+    if run.project_id != project_id {
+        return Err(CommandError::new(
+            "FORBIDDEN",
+            format!(
+                "Validation run {} does not belong to project {}",
+                validation_run_id, project_id
+            ),
+        ));
     }
 
-    // 3. Workflow transition: VALIDATING -> CORRECTIONS_REQUIRED
+    if run.status != crate::core::validation::ValidationRunStatus::Fail
+        && run.status != crate::core::validation::ValidationRunStatus::Timeout
     {
-        let mut db = state.db.lock().await;
-        let wf_state =
-            crate::core::workflow::get_workflow_state(db.connection(), &payload.project_id)
-                .map_err(CommandError::from)?;
+        return Err(CommandError::new(
+            "INVALID_STATE",
+            format!(
+                "Validation run {} has status {} (must be FAIL or TIMEOUT)",
+                validation_run_id, run.status
+            ),
+        ));
+    }
 
-        if wf_state.state == crate::core::workflow::WorkflowState::Validating {
+    if run.architecture_version != current_arch_version {
+        return Err(CommandError::new(
+            "STALE_EVIDENCE",
+            format!(
+                "Validation run architecture version ({}) does not match current ({})",
+                run.architecture_version, current_arch_version
+            ),
+        ));
+    }
+
+    if run.epoch_id.as_deref() != Some(&current_epoch) {
+        return Err(CommandError::new(
+            "STALE_EVIDENCE",
+            format!(
+                "Validation run epoch ({:?}) does not match current Builder epoch ({})",
+                run.epoch_id, current_epoch
+            ),
+        ));
+    }
+
+    // 3. Workflow transition & trigger compatibility:
+    let wf_state = crate::core::workflow::get_workflow_state(db.connection(), project_id)
+        .map_err(CommandError::from)?;
+
+    match wf_state.state {
+        crate::core::workflow::WorkflowState::Building => {
+            if run.trigger_source
+                != crate::core::validation::ValidationTriggerSource::BuilderRequested
+            {
+                return Err(CommandError::new(
+                    "INVALID_TRIGGER_FOR_WORKFLOW_STATE",
+                    format!(
+                        "Validation run trigger {:?} is not eligible for diagnostic routing while project is in BUILDING state (must be BUILDER_REQUESTED)",
+                        run.trigger_source
+                    ),
+                ));
+            }
+
+            let meta = serde_json::json!({
+                "validation_run_id": validation_run_id,
+                "trigger": "BUILDER_REQUESTED",
+                "reason": "Routed builder-requested validation failure diagnostics to Builder"
+            });
+            let _ = crate::core::activity::ActivityManager::record_event(
+                db.connection(),
+                project_id,
+                "VALIDATION_DIAGNOSTICS_ROUTED_TO_BUILDER",
+                "HUMAN",
+                &format!(
+                    "Routed builder-requested validation run {} diagnostics to Builder",
+                    validation_run_id
+                ),
+                Some(&meta),
+            );
+        }
+        crate::core::workflow::WorkflowState::Validating => {
+            if run.trigger_source != crate::core::validation::ValidationTriggerSource::PostBuild {
+                return Err(CommandError::new(
+                    "INVALID_TRIGGER_FOR_WORKFLOW_STATE",
+                    format!(
+                        "Validation run trigger {:?} is not eligible for diagnostic routing while project is in VALIDATING state (must be POST_BUILD)",
+                        run.trigger_source
+                    ),
+                ));
+            }
+
             crate::core::workflow::apply_workflow_action(
                 db.connection_mut(),
-                &payload.project_id,
+                project_id,
                 crate::core::workflow::WorkflowAction::RequestCorrections,
                 "HUMAN",
             )
             .map_err(CommandError::from)?;
 
             let meta = serde_json::json!({
-                "validation_run_id": payload.validation_run_id,
+                "validation_run_id": validation_run_id,
+                "trigger": "POST_BUILD",
                 "reason": "Routed validation failure diagnostics to Builder"
             });
             let _ = crate::core::activity::ActivityManager::record_event(
                 db.connection(),
-                &payload.project_id,
+                project_id,
                 "VALIDATION_DIAGNOSTICS_ROUTED_TO_BUILDER",
                 "HUMAN",
                 &format!(
                     "Routed validation run {} diagnostics to Builder",
-                    payload.validation_run_id
+                    validation_run_id
                 ),
                 Some(&meta),
             );
-        } else if wf_state.state != crate::core::workflow::WorkflowState::CorrectionsRequired {
+        }
+        crate::core::workflow::WorkflowState::CorrectionsRequired => {
+            if run.trigger_source != crate::core::validation::ValidationTriggerSource::PostBuild {
+                return Err(CommandError::new(
+                    "INVALID_TRIGGER_FOR_WORKFLOW_STATE",
+                    format!(
+                        "Validation run trigger {:?} is not eligible for diagnostic routing while project is in CORRECTIONS_REQUIRED state (must be POST_BUILD)",
+                        run.trigger_source
+                    ),
+                ));
+            }
+
+            let meta = serde_json::json!({
+                "validation_run_id": validation_run_id,
+                "trigger": "POST_BUILD",
+                "reason": "Routed validation failure diagnostics to Builder in CORRECTIONS_REQUIRED state"
+            });
+            let _ = crate::core::activity::ActivityManager::record_event(
+                db.connection(),
+                project_id,
+                "VALIDATION_DIAGNOSTICS_ROUTED_TO_BUILDER",
+                "HUMAN",
+                &format!(
+                    "Routed validation run {} diagnostics to Builder",
+                    validation_run_id
+                ),
+                Some(&meta),
+            );
+        }
+        other => {
             return Err(CommandError::new(
                 "INVALID_WORKFLOW_STATE",
-                format!("Cannot start builder diagnostic turn while project is in {} state (must be VALIDATING or CORRECTIONS_REQUIRED)", wf_state.state),
+                format!(
+                    "Cannot start builder diagnostic turn while project is in {} state (must be BUILDING, VALIDATING, or CORRECTIONS_REQUIRED)",
+                    other
+                ),
             ));
         }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn start_builder_diagnostic_turn(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    payload: StartBuilderDiagnosticTurnPayload,
+) -> Result<BuilderTurnResponse, CommandError> {
+    {
+        let mut db = state.db.lock().await;
+        verify_and_prepare_diagnostic_routing(
+            &mut db,
+            &payload.project_id,
+            &payload.validation_run_id,
+        )?;
     }
 
     // 4. Launch builder turn with ValidationDiagnostic instruction source

@@ -372,12 +372,16 @@ describe('ValidationView', () => {
     });
   });
 
-  it('renders Send Diagnostics to Builder button for failed runs and invokes start_builder_diagnostic_turn', async () => {
+  it('renders Send Diagnostics to Builder button for POST_BUILD failed runs in VALIDATING and invokes start_builder_diagnostic_turn', async () => {
     const onNavigateToBuilder = vi.fn();
+    const postBuildRun: ValidationRunRecord = {
+      ...mockHistoryRun,
+      trigger_source: 'POST_BUILD',
+    };
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === 'get_validation_config') return Promise.resolve(mockConfig);
       if (cmd === 'get_active_validation_run') return Promise.resolve(null);
-      if (cmd === 'get_validation_history') return Promise.resolve([mockHistoryRun]);
+      if (cmd === 'get_validation_history') return Promise.resolve([postBuildRun]);
       if (cmd === 'start_builder_diagnostic_turn') return Promise.resolve({ status: 'RUNNING' });
       return Promise.resolve(null);
     });
@@ -406,6 +410,129 @@ describe('ValidationView', () => {
         },
       });
       expect(onNavigateToBuilder).toHaveBeenCalled();
+    });
+  });
+
+  it('renders Send Diagnostics to Builder button for BUILDER_REQUESTED failed run in BUILDING state', async () => {
+    const onNavigateToBuilder = vi.fn();
+    const builderReqRun: ValidationRunRecord = {
+      ...mockHistoryRun,
+      trigger_source: 'BUILDER_REQUESTED',
+    };
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'get_validation_config') return Promise.resolve(mockConfig);
+      if (cmd === 'get_active_validation_run') return Promise.resolve(null);
+      if (cmd === 'get_validation_history') return Promise.resolve([builderReqRun]);
+      if (cmd === 'start_builder_diagnostic_turn') return Promise.resolve({ status: 'RUNNING' });
+      return Promise.resolve(null);
+    });
+
+    render(
+      <ValidationView
+        projectId="proj-1"
+        projectName="Test Project"
+        workflowState="BUILDING"
+        onRefreshProject={onRefreshProject}
+        onNavigateToBuilder={onNavigateToBuilder}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('send-diagnostics-builder-btn')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByTestId('send-diagnostics-builder-btn'));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith('start_builder_diagnostic_turn', {
+        payload: {
+          projectId: 'proj-1',
+          validationRunId: 'val-run-123',
+        },
+      });
+      expect(onNavigateToBuilder).toHaveBeenCalled();
+    });
+  });
+
+  it('does NOT render Send Diagnostics to Builder button for MANUAL failed run in BUILDING state', async () => {
+    const manualRun: ValidationRunRecord = {
+      ...mockHistoryRun,
+      trigger_source: 'MANUAL',
+    };
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'get_validation_config') return Promise.resolve(mockConfig);
+      if (cmd === 'get_active_validation_run') return Promise.resolve(null);
+      if (cmd === 'get_validation_history') return Promise.resolve([manualRun]);
+      return Promise.resolve(null);
+    });
+
+    render(
+      <ValidationView
+        projectId="proj-1"
+        projectName="Test Project"
+        workflowState="BUILDING"
+        onRefreshProject={onRefreshProject}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('run-item-val-run-123')).toBeInTheDocument();
+    });
+
+    expect(screen.queryByTestId('send-diagnostics-builder-btn')).not.toBeInTheDocument();
+  });
+
+  it('does NOT render Send Diagnostics to Builder button for POST_BUILD failed run in BUILDING state', async () => {
+    const postBuildRun: ValidationRunRecord = {
+      ...mockHistoryRun,
+      trigger_source: 'POST_BUILD',
+    };
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'get_validation_config') return Promise.resolve(mockConfig);
+      if (cmd === 'get_active_validation_run') return Promise.resolve(null);
+      if (cmd === 'get_validation_history') return Promise.resolve([postBuildRun]);
+      return Promise.resolve(null);
+    });
+
+    render(
+      <ValidationView
+        projectId="proj-1"
+        projectName="Test Project"
+        workflowState="BUILDING"
+        onRefreshProject={onRefreshProject}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('run-item-val-run-123')).toBeInTheDocument();
+    });
+
+    expect(screen.queryByTestId('send-diagnostics-builder-btn')).not.toBeInTheDocument();
+  });
+
+  it('renders Send Diagnostics to Builder button for POST_BUILD failed run in CORRECTIONS_REQUIRED state', async () => {
+    const postBuildRun: ValidationRunRecord = {
+      ...mockHistoryRun,
+      trigger_source: 'POST_BUILD',
+    };
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'get_validation_config') return Promise.resolve(mockConfig);
+      if (cmd === 'get_active_validation_run') return Promise.resolve(null);
+      if (cmd === 'get_validation_history') return Promise.resolve([postBuildRun]);
+      return Promise.resolve(null);
+    });
+
+    render(
+      <ValidationView
+        projectId="proj-1"
+        projectName="Test Project"
+        workflowState="CORRECTIONS_REQUIRED"
+        onRefreshProject={onRefreshProject}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('send-diagnostics-builder-btn')).toBeInTheDocument();
     });
   });
 });

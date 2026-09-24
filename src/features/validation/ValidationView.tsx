@@ -14,6 +14,22 @@ interface ValidationViewProps {
   onNavigateToBuilder?: () => void;
 }
 
+export const isEligibleForDiagnosticRouting = (
+  run: ValidationRunRecord | null,
+  wfState: string
+): boolean => {
+  if (!run) return false;
+  if (run.status !== 'FAIL' && run.status !== 'TIMEOUT') return false;
+
+  if (wfState === 'BUILDING') {
+    return run.trigger_source === 'BUILDER_REQUESTED';
+  }
+  if (wfState === 'VALIDATING' || wfState === 'CORRECTIONS_REQUIRED') {
+    return run.trigger_source === 'POST_BUILD';
+  }
+  return false;
+};
+
 export const ValidationView: React.FC<ValidationViewProps> = ({
   projectId,
   workflowState,
@@ -518,7 +534,7 @@ export const ValidationView: React.FC<ValidationViewProps> = ({
                     </p>
                   </div>
                   <div className="detail-header-actions">
-                    {(selectedRun.status === 'FAIL' || selectedRun.status === 'TIMEOUT') && (
+                    {isEligibleForDiagnosticRouting(selectedRun, workflowState) && (
                       <button
                         className="primary-btn diagnostic-turn-btn"
                         onClick={() => handleStartDiagnosticTurn(selectedRun.run_id)}

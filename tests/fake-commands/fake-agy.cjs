@@ -140,6 +140,98 @@ function main() {
         return;
       }
 
+      if (promptContent.includes('=== VALIDATION DIAGNOSTIC REPORT ===')) {
+        const targetDir = path.join(process.cwd(), 'target');
+        if (!fs.existsSync(targetDir)) {
+          fs.mkdirSync(targetDir, { recursive: true });
+        }
+        fs.writeFileSync(path.join(targetDir, 'clean.txt'), 'clean sentinel created by fake-agy\n');
+
+        const step0 = {
+          event: 'step_update',
+          step_update: {
+            conversation_id: conversationId,
+            step_index: turnCount * 2 - 2,
+            state: 'DONE',
+            step_type: 'user_input'
+          }
+        };
+        console.log(JSON.stringify(step0));
+        const step1 = {
+          event: 'step_update',
+          step_update: {
+            conversation_id: conversationId,
+            step_index: turnCount * 2 - 1,
+            state: 'DONE',
+            step_type: 'agent_response',
+            text_delta: 'Fixed the defect based on diagnostic report: created target/clean.txt.\n',
+            duration_seconds: 0.2,
+            usage: { input_tokens: 400, output_tokens: 50, thinking_tokens: 10, cache_read_tokens: 0, total_tokens: 460 }
+          }
+        };
+        console.log(JSON.stringify(step1));
+        const resultEvent = {
+          event: 'result',
+          result: {
+            conversation_id: conversationId,
+            status: 'SUCCESS',
+            response: 'Fixed the defect based on diagnostic report: created target/clean.txt.\n',
+            duration_seconds: 0.3,
+            num_turns: turnCount,
+            usage: { input_tokens: 400, output_tokens: 50, thinking_tokens: 10, cache_read_tokens: 0, total_tokens: 460 }
+          }
+        };
+        console.log(JSON.stringify(resultEvent));
+        process.exit(0);
+      }
+
+      if (promptContent.includes('trigger_create_sentinel')) {
+        const targetDir = path.join(process.cwd(), 'target');
+        if (!fs.existsSync(targetDir)) {
+          fs.mkdirSync(targetDir, { recursive: true });
+        }
+        fs.writeFileSync(path.join(targetDir, 'clean.txt'), 'clean sentinel created by fake-agy\n');
+      }
+
+      if (promptContent.includes('trigger_builder_request_validation')) {
+        const step0 = {
+          event: 'step_update',
+          step_update: {
+            conversation_id: conversationId,
+            step_index: turnCount * 2 - 2,
+            state: 'DONE',
+            step_type: 'user_input'
+          }
+        };
+        console.log(JSON.stringify(step0));
+        const step1 = {
+          event: 'step_update',
+          step_update: {
+            conversation_id: conversationId,
+            step_index: turnCount * 2 - 1,
+            state: 'DONE',
+            step_type: 'agent_response',
+            text_delta: 'COALITION_REQUEST_VALIDATION\nRequesting intermediate validation run.\n',
+            duration_seconds: 0.2,
+            usage: { input_tokens: 300, output_tokens: 60, thinking_tokens: 20, cache_read_tokens: 0, total_tokens: 380 }
+          }
+        };
+        console.log(JSON.stringify(step1));
+        const resultEvent = {
+          event: 'result',
+          result: {
+            conversation_id: conversationId,
+            status: 'SUCCESS',
+            response: 'COALITION_REQUEST_VALIDATION\nRequesting intermediate validation run.\n',
+            duration_seconds: 0.3,
+            num_turns: turnCount,
+            usage: { input_tokens: 300, output_tokens: 60, thinking_tokens: 20, cache_read_tokens: 0, total_tokens: 380 }
+          }
+        };
+        console.log(JSON.stringify(resultEvent));
+        process.exit(0);
+      }
+
       if (promptContent.includes('trigger_raw_error')) {
         const errResult = {
           event: 'result',
