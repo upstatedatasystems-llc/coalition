@@ -73,9 +73,9 @@ pub async fn terminate_process_tree(pid: u32) {
 
 #[cfg(target_os = "windows")]
 pub async fn request_process_graceful_stop(pid: u32) {
-    // Windows taskkill without /F requests graceful termination
+    // Windows taskkill without /F requests graceful termination of process and its tree
     let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string()])
+        .args(["/T", "/PID", &pid.to_string()])
         .output()
         .await;
 }

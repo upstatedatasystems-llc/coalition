@@ -483,6 +483,103 @@ impl GitAdapter {
             )))
         }
     }
+
+    /// Collects untracked source files bounded to size caps with symlink breakout protection.
+    pub fn collect_untracked_source_files_bounded<P: AsRef<Path>>(
+        &self,
+        repo_root: P,
+        max_total_bytes: usize,
+        max_per_file_bytes: usize,
+    ) -> Result<String, GitError> {
+        let root = repo_root.as_ref();
+        let canonical_root = root.canonicalize().map_err(|e| {
+            GitError::ExecutionFailed(format!("Failed to canonicalize repo root: {}", e))
+        })?;
+
+        let args = [
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            ":(exclude).coalition/**",
+            ":(exclude)target/**",
+            ":(exclude)node_modules/**",
+            ":(exclude)dist/**",
+        ];
+
+        let output = self.run_git_cmd(&args, Some(root))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(GitError::ExecutionFailed(format!(
+                "Failed to list untracked files: {}",
+                stderr.trim()
+            )));
+        }
+
+        let list_str = String::from_utf8_lossy(&output.stdout);
+        let mut out = String::new();
+        let mut total_bytes = 0;
+
+        for line in list_str.lines() {
+            let rel_path = line.trim();
+            if rel_path.is_empty() {
+                continue;
+            }
+
+            let full_path = root.join(rel_path);
+            if !full_path.exists() || full_path.is_dir() {
+                continue;
+            }
+
+            // Symlink and reparse point breakout protection:
+            // Ensure canonical path stays strictly inside canonical repository root
+            let canonical_target = match full_path.canonicalize() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            if !canonical_target.starts_with(&canonical_root) {
+                out.push_str(&format!(
+                    "### Untracked File: `{}` (Omitted: symlink / reparse point escapes repository root)\n\n",
+                    rel_path
+                ));
+                continue;
+            }
+
+            // Also check symlink metadata and file size
+            if let Ok(meta) = std::fs::symlink_metadata(&full_path) {
+                if meta.is_symlink() && !canonical_target.starts_with(&canonical_root) {
+                    continue;
+                }
+                if meta.len() > max_per_file_bytes as u64 {
+                    out.push_str(&format!(
+                        "### Untracked File: `{}` (Omitted: exceeds {}KB cap)\n\n",
+                        rel_path,
+                        max_per_file_bytes / 1024
+                    ));
+                    continue;
+                }
+            }
+
+            if let Ok(content) = std::fs::read_to_string(&full_path) {
+                if total_bytes + content.len() > max_total_bytes {
+                    out.push_str(&format!(
+                        "\n*(Untracked source files truncated: reached {}KB cap)*\n",
+                        max_total_bytes / 1024
+                    ));
+                    break;
+                }
+                total_bytes += content.len();
+                out.push_str(&format!("### Untracked File: `{}`\n```text\n", rel_path));
+                out.push_str(&content);
+                if !content.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("```\n\n");
+            }
+        }
+
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

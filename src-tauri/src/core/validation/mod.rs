@@ -33,6 +33,8 @@ pub enum ValidationError {
     Git(String),
     #[error("Validation execution error: {0}")]
     Execution(String),
+    #[error("Validation error: {0}")]
+    Validation(String),
     #[error("Validation run not found: {0}")]
     NotFound(String),
     #[error("Stale evidence: working tree or Git HEAD has changed since validation was run")]
@@ -72,6 +74,23 @@ impl Default for ValidationPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValidationTriggersConfig {
+    #[serde(default = "default_true")]
+    pub allow_manual_runs: bool,
+    #[serde(default = "default_true")]
+    pub allow_builder_requested_runs: bool,
+}
+
+impl Default for ValidationTriggersConfig {
+    fn default() -> Self {
+        Self {
+            allow_manual_runs: true,
+            allow_builder_requested_runs: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ValidationCommandConfig {
     pub id: String,
     pub name: String,
@@ -91,6 +110,8 @@ pub struct ValidationConfig {
     #[serde(default)]
     pub policy: ValidationPolicy,
     #[serde(default)]
+    pub triggers: ValidationTriggersConfig,
+    #[serde(default)]
     pub commands: Vec<ValidationCommandConfig>,
 }
 
@@ -100,8 +121,19 @@ impl Default for ValidationConfig {
             schema_version: 1,
             enabled: false,
             policy: ValidationPolicy::default(),
+            triggers: ValidationTriggersConfig::default(),
             commands: Vec::new(),
         }
+    }
+}
+
+impl ValidationConfig {
+    pub fn is_manual_run_allowed(&self) -> bool {
+        self.policy.allow_manual_runs && self.triggers.allow_manual_runs
+    }
+
+    pub fn is_builder_requested_run_allowed(&self) -> bool {
+        self.policy.allow_builder_requested_runs && self.triggers.allow_builder_requested_runs
     }
 }
 
@@ -602,6 +634,24 @@ impl ValidationService {
         let started_at = chrono::Utc::now().to_rfc3339();
         let config_fp = config.fingerprint();
 
+        // Enforce trigger permissions (Item 7)
+        match trigger {
+            ValidationTriggerSource::Manual if !config.is_manual_run_allowed() => {
+                return Err(ValidationError::Execution(
+                    "Manual validation runs are disabled in project configuration".to_string(),
+                ));
+            }
+            ValidationTriggerSource::BuilderRequested
+                if !config.is_builder_requested_run_allowed() =>
+            {
+                return Err(ValidationError::Execution(
+                    "Builder-requested validation runs are disabled in project configuration"
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
+
         // If validation is disabled, record a zero-command pass run immediately
         if !config.enabled {
             let record = ValidationRunRecord {
@@ -930,18 +980,27 @@ impl ValidationService {
             ValidationRunStatus::Fail
         };
 
-        // Gate evaluation
+        // Gate evaluation - requires ALL configured required commands to have executed and passed (Item 6)
+        let required_ids: std::collections::HashSet<&str> = config
+            .commands
+            .iter()
+            .filter(|c| c.required)
+            .map(|c| c.id.as_str())
+            .collect();
+        let passed_required_ids: std::collections::HashSet<&str> = executed_commands
+            .iter()
+            .filter(|c| c.required && c.status == ValidationCommandStatus::Pass)
+            .map(|c| c.command_id.as_str())
+            .collect();
+        let all_required_executed_and_passed = required_ids.is_subset(&passed_required_ids);
+
         let is_gate_passed = if !config.policy.gate_review_on_required_failure {
             // Diagnostic-only mode allows progression regardless of failure (Directive 7)
             true
         } else if overall_status == ValidationRunStatus::Canceled {
             false
         } else {
-            // In required gate mode, pass if all REQUIRED commands passed
-            executed_commands
-                .iter()
-                .filter(|c| c.required)
-                .all(|c| c.status == ValidationCommandStatus::Pass)
+            all_required_executed_and_passed
         };
 
         let completed_at = chrono::Utc::now().to_rfc3339();
@@ -1078,7 +1137,39 @@ impl ValidationService {
         let run = get_validation_run(conn, run_id)?
             .ok_or_else(|| ValidationError::NotFound(run_id.to_string()))?;
 
+        if run.project_id != project_id {
+            return Err(ValidationError::Validation(format!(
+                "Validation run {} does not belong to project {}",
+                run_id, project_id
+            )));
+        }
+
+        if run.status != ValidationRunStatus::Fail {
+            return Err(ValidationError::Validation(format!(
+                "Cannot override validation run {} because it is not in Fail status (current status: {})",
+                run_id, run.status
+            )));
+        }
+
+        let config = Self::read_validation_config(repo_path)?;
+        if run.config_fingerprint.as_deref() != Some(&config.fingerprint()) {
+            return Err(ValidationError::StaleEvidence(format!(
+                "Cannot override validation gate: configuration fingerprint has changed from {:?} to {}",
+                run.config_fingerprint, config.fingerprint()
+            )));
+        }
+
         let git = GitAdapter::new().map_err(|e| ValidationError::Git(e.to_string()))?;
+        let current_info = git
+            .inspect_repo(repo_path)
+            .map_err(|e| ValidationError::Git(e.to_string()))?;
+        if run.git_head != current_info.head_commit {
+            return Err(ValidationError::StaleEvidence(format!(
+                "Cannot override validation gate: Git HEAD has changed from {:?} to {:?}",
+                run.git_head, current_info.head_commit
+            )));
+        }
+
         let current_dirty = git
             .compute_implementation_fingerprint(repo_path)
             .map_err(|e| ValidationError::Git(e.to_string()))?;
@@ -1133,6 +1224,18 @@ impl ValidationService {
             Some(&meta),
         );
 
+        // If workflow state is Validating, advance it to WaitingForReview via SubmitForReview
+        if let Ok(current_wf) = crate::core::workflow::get_workflow_state(conn, project_id) {
+            if current_wf.state == crate::core::workflow::WorkflowState::Validating {
+                let _ = crate::core::workflow::apply_workflow_action(
+                    conn,
+                    project_id,
+                    crate::core::workflow::WorkflowAction::SubmitForReview,
+                    authorized_by,
+                );
+            }
+        }
+
         Ok(rec)
     }
 
@@ -1181,6 +1284,13 @@ impl ValidationService {
             return Err(ValidationError::StaleEvidence(format!(
                 "Latest validation run epoch ID ({:?}) does not match current ({})",
                 run.epoch_id, epoch_id
+            )));
+        }
+
+        if run.config_fingerprint.as_deref() != Some(&config.fingerprint()) {
+            return Err(ValidationError::StaleEvidence(format!(
+                "Latest validation run configuration fingerprint ({:?}) does not match current ({})",
+                run.config_fingerprint, config.fingerprint()
             )));
         }
 
@@ -1286,6 +1396,63 @@ impl ValidationService {
         let run = get_validation_run(conn, run_id)?
             .ok_or_else(|| ValidationError::NotFound(run_id.to_string()))?;
         Ok(Self::generate_diagnostic_packet(&run, max_tail_bytes))
+    }
+
+    /// Orchestrates post-build validation workflow transition (Building -> Validating -> WaitingForReview).
+    pub async fn run_post_build_validation(
+        db_conn: Arc<tokio::sync::Mutex<crate::db::DbManager>>,
+        registry: Arc<tokio::sync::Mutex<ActiveValidationRegistry>>,
+        project_id: &str,
+        repo_path: &Path,
+        event_sink: Option<ValidationEventSink>,
+        app_data_dir: &Path,
+    ) -> Result<ValidationRunRecord, ValidationError> {
+        // 1. Transition workflow from Building to Validating if currently Building
+        {
+            let mut db = db_conn.lock().await;
+            if let Ok(st) = crate::core::workflow::get_workflow_state(db.connection(), project_id) {
+                if st.state == crate::core::workflow::WorkflowState::Building {
+                    crate::core::workflow::apply_workflow_action(
+                        db.connection_mut(),
+                        project_id,
+                        crate::core::workflow::WorkflowAction::StartValidation,
+                        "system",
+                    )
+                    .map_err(|e| ValidationError::Execution(e.to_string()))?;
+                }
+            }
+        }
+
+        // 2. Start validation run with ValidationTriggerSource::PostBuild
+        let record = Self::execute_validation_run(
+            db_conn.clone(),
+            registry,
+            project_id,
+            repo_path,
+            ValidationTriggerSource::PostBuild,
+            None,
+            event_sink,
+            app_data_dir,
+        )
+        .await?;
+
+        // 3. If gate passed, transition workflow from Validating to WaitingForReview
+        if record.is_gate_passed {
+            let mut db = db_conn.lock().await;
+            if let Ok(st) = crate::core::workflow::get_workflow_state(db.connection(), project_id) {
+                if st.state == crate::core::workflow::WorkflowState::Validating {
+                    crate::core::workflow::apply_workflow_action(
+                        db.connection_mut(),
+                        project_id,
+                        crate::core::workflow::WorkflowAction::SubmitForReview,
+                        "system",
+                    )
+                    .map_err(|e| ValidationError::Execution(e.to_string()))?;
+                }
+            }
+        }
+
+        Ok(record)
     }
 }
 
@@ -1886,6 +2053,8 @@ commands:
         let git = GitAdapter::new().unwrap();
         let head = git.inspect_repo(repo_path).unwrap().head_commit.unwrap();
         let dirty = git.compute_implementation_fingerprint(repo_path).unwrap();
+        let cfg = ValidationService::read_validation_config(repo_path).unwrap();
+        let cfg_fp = cfg.fingerprint();
 
         let mut db = crate::db::DbManager::new_in_memory().unwrap();
         db.run_migrations().unwrap();
@@ -1929,7 +2098,7 @@ commands:
             has_override: false,
             git_head: Some(head.clone()),
             git_dirty_fingerprint: Some(dirty.clone()),
-            config_fingerprint: Some("cfg-1".to_string()),
+            config_fingerprint: Some(cfg_fp),
             log_path: None,
             started_at: chrono::Utc::now().to_rfc3339(),
             completed_at: Some(chrono::Utc::now().to_rfc3339()),

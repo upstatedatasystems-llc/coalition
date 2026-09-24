@@ -70,42 +70,82 @@ export const ValidationView: React.FC<ValidationViewProps> = ({
 
   // Listen to live validation events & terminal output
   useEffect(() => {
-    let unlistenEvents: (() => void) | undefined;
-    let unlistenLines: (() => void) | undefined;
+    let unlisteners: (() => void)[] = [];
 
     const setupListeners = async () => {
-      unlistenEvents = await listen<any>('coalition:validation-event', (evt) => {
+      const u1 = await listen<any>('validation://status', (evt) => {
         const payload = evt.payload;
         if (payload?.project_id !== projectId) return;
+        setActiveRun((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: payload.status,
+                commands: payload.commands ?? prev.commands,
+              }
+            : null
+        );
+      });
 
-        if (payload.event_type === 'COMMAND_STARTED') {
-          setLiveLogs((prev) => [
-            ...prev.slice(-1000),
-            `\n>>> [${new Date().toLocaleTimeString()}] Running: ${payload.name} (${payload.command})...\n`,
-          ]);
-        } else if (payload.event_type === 'COMMAND_FINISHED') {
-          setLiveLogs((prev) => [
-            ...prev.slice(-1000),
-            `<<< [${new Date().toLocaleTimeString()}] ${payload.name} finished with status: ${payload.status} (exit: ${payload.exit_code ?? 'n/a'}) in ${payload.duration_ms}ms\n`,
-          ]);
-        } else if (payload.event_type === 'RUN_COMPLETED') {
+      const u2 = await listen<any>('validation://command-start', (evt) => {
+        const payload = evt.payload;
+        setLiveLogs((prev) => [
+          ...prev.slice(-1000),
+          `\n>>> [${new Date().toLocaleTimeString()}] Running: ${payload.name || payload.command_id}...\n`,
+        ]);
+      });
+
+      const u3 = await listen<any>('validation://output', (evt) => {
+        const payload = evt.payload;
+        if (payload?.line !== undefined) {
+          setLiveLogs((prev) => [...prev.slice(-1500), payload.line]);
+        }
+      });
+
+      const u4 = await listen<any>('validation://command-finish', (evt) => {
+        const payload = evt.payload;
+        setLiveLogs((prev) => [
+          ...prev.slice(-1000),
+          `<<< [${new Date().toLocaleTimeString()}] Command ${payload.command_id} finished with status: ${payload.status} (exit: ${payload.exit_code ?? 'n/a'}) in ${payload.duration_ms}ms\n`,
+        ]);
+      });
+
+      const u5 = await listen<any>('validation://finish', (evt) => {
+        const payload = evt.payload;
+        if (payload?.project_id !== projectId) return;
+        setLiveLogs((prev) => [
+          ...prev.slice(-1000),
+          `\n=== [${new Date().toLocaleTimeString()}] Validation Run ${payload.run_id} finished: ${payload.status} (Gate: ${payload.is_gate_passed ? 'PASSED' : 'FAILED'}) in ${payload.duration_ms}ms ===\n`,
+        ]);
+        loadData();
+        onRefreshProject();
+      });
+
+      // Backward-compatible listeners
+      const u6 = await listen<any>('coalition:validation-event', (evt) => {
+        const payload = evt.payload;
+        if (payload?.project_id !== projectId) return;
+        if (payload.event_type === 'RUN_COMPLETED') {
           loadData();
           onRefreshProject();
         }
       });
 
-      unlistenLines = await listen<any>('coalition:validation-line', (evt) => {
+      const u7 = await listen<any>('coalition:validation-line', (evt) => {
         const payload = evt.payload;
         if (payload?.project_id !== projectId) return;
-        setLiveLogs((prev) => [...prev.slice(-1500), payload.line]);
+        if (payload?.line) {
+          setLiveLogs((prev) => [...prev.slice(-1500), payload.line]);
+        }
       });
+
+      unlisteners = [u1, u2, u3, u4, u5, u6, u7];
     };
 
     setupListeners();
 
     return () => {
-      if (unlistenEvents) unlistenEvents();
-      if (unlistenLines) unlistenLines();
+      unlisteners.forEach((u) => u());
     };
   }, [projectId, loadData, onRefreshProject]);
 

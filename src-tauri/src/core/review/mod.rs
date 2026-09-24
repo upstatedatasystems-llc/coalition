@@ -41,7 +41,8 @@ pub enum ReviewError {
 pub enum ReviewVerdict {
     Accept,
     CorrectionsRequired,
-    Block,
+    Blocked,
+    ArchitectureConcern,
 }
 
 impl fmt::Display for ReviewVerdict {
@@ -49,7 +50,8 @@ impl fmt::Display for ReviewVerdict {
         match self {
             Self::Accept => write!(f, "ACCEPT"),
             Self::CorrectionsRequired => write!(f, "CORRECTIONS_REQUIRED"),
-            Self::Block => write!(f, "BLOCK"),
+            Self::Blocked => write!(f, "BLOCKED"),
+            Self::ArchitectureConcern => write!(f, "ARCHITECTURE_CONCERN"),
         }
     }
 }
@@ -57,14 +59,13 @@ impl fmt::Display for ReviewVerdict {
 impl std::str::FromStr for ReviewVerdict {
     type Err = ReviewError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_uppercase().as_str() {
-            "ACCEPT" | "ACCEPTED" | "PASS" => Ok(Self::Accept),
-            "CORRECTIONS_REQUIRED" | "CORRECTION_REQUIRED" | "REQUEST_CORRECTIONS" | "REVISE" => {
-                Ok(Self::CorrectionsRequired)
-            }
-            "BLOCK" | "BLOCKED" | "REJECT" | "REJECTED" => Ok(Self::Block),
+        match s.trim() {
+            "ACCEPT" => Ok(Self::Accept),
+            "CORRECTIONS_REQUIRED" => Ok(Self::CorrectionsRequired),
+            "BLOCKED" => Ok(Self::Blocked),
+            "ARCHITECTURE_CONCERN" => Ok(Self::ArchitectureConcern),
             _ => Err(ReviewError::ParseError(format!(
-                "Invalid verdict string: '{}'. Expected ACCEPT, CORRECTIONS_REQUIRED, or BLOCK.",
+                "Invalid verdict string: '{}'. Expected ACCEPT, CORRECTIONS_REQUIRED, BLOCKED, or ARCHITECTURE_CONCERN.",
                 s
             ))),
         }
@@ -78,6 +79,7 @@ pub enum ReviewCycleStatus {
     Accepted,
     CorrectionsRequired,
     Blocked,
+    ArchitectureConcern,
     Superseded,
 }
 
@@ -88,6 +90,7 @@ impl fmt::Display for ReviewCycleStatus {
             Self::Accepted => write!(f, "ACCEPTED"),
             Self::CorrectionsRequired => write!(f, "CORRECTIONS_REQUIRED"),
             Self::Blocked => write!(f, "BLOCKED"),
+            Self::ArchitectureConcern => write!(f, "ARCHITECTURE_CONCERN"),
             Self::Superseded => write!(f, "SUPERSEDED"),
         }
     }
@@ -96,11 +99,12 @@ impl fmt::Display for ReviewCycleStatus {
 impl std::str::FromStr for ReviewCycleStatus {
     type Err = ReviewError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_uppercase().as_str() {
+        match s.trim() {
             "PENDING" => Ok(Self::Pending),
             "ACCEPTED" => Ok(Self::Accepted),
             "CORRECTIONS_REQUIRED" => Ok(Self::CorrectionsRequired),
             "BLOCKED" => Ok(Self::Blocked),
+            "ARCHITECTURE_CONCERN" => Ok(Self::ArchitectureConcern),
             "SUPERSEDED" => Ok(Self::Superseded),
             _ => Err(ReviewError::ParseError(format!(
                 "Unknown cycle status: {}",
@@ -257,6 +261,24 @@ pub struct ParsedReviewFinding {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawVerdictEnvelope {
+    #[serde(default)]
+    pub schema_version: Option<u32>,
+    #[serde(default)]
+    pub response_type: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub cycle_id: Option<String>,
+    #[serde(default)]
+    pub review_packet_hash: Option<String>,
+    pub verdict: String,
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub findings: Vec<ParsedReviewFinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewImportPreview {
     pub preview_id: String,
     pub project_id: String,
@@ -366,10 +388,10 @@ impl ReviewService {
             .get_implementation_diff(repo_path)
             .unwrap_or_else(|_| "No tracked changes.".to_string());
 
-        // 5. Directive 11: Collect and embed untracked source files bounded
+        // 5. Directive 11: Collect and embed untracked source files bounded via GitAdapter
         let untracked_files_section = Self::collect_untracked_source_files(repo_path)?;
 
-        // 6. Calculate cycle number
+        // 6. Calculate cycle number and globally unique cycle ID
         let cycle_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM review_cycles WHERE project_id = ?1",
@@ -378,7 +400,7 @@ impl ReviewService {
             )
             .unwrap_or(0);
         let cycle_number = cycle_count + 1;
-        let cycle_id = format!("cycle-{}", cycle_number);
+        let cycle_id = format!("rcy-{}-{}", project_id, cycle_number);
 
         // 7. Format validation section
         let validation_section = if let Some(ref run) = validation_run {
@@ -394,7 +416,7 @@ impl ReviewService {
             "### Validation Evidence\nValidation is not required or unconfigured for this project.\n\n".to_string()
         };
 
-        // 8. Assemble review packet prompt
+        // 8. Assemble review packet prompt with frozen architecture contracts and prior open findings
         let mut packet = String::new();
         packet.push_str(&format!(
             "# Coalition Review Packet: {} (Cycle {})\n\n",
@@ -402,6 +424,7 @@ impl ReviewService {
         ));
         packet.push_str("## Project Context\n");
         packet.push_str(&format!("- **Project ID**: `{}`\n", project_id));
+        packet.push_str(&format!("- **Review Cycle ID**: `{}`\n", cycle_id));
         packet.push_str(&format!("- **Architecture Version**: `{}`\n", arch_version));
         if let Some(ref ep) = epoch_id {
             packet.push_str(&format!("- **Builder Epoch**: `{}`\n", ep));
@@ -414,13 +437,53 @@ impl ReviewService {
             dirty_fingerprint
         ));
 
+        // Governed Architecture Contracts (Item 4)
+        if let Ok(builder_packet) =
+            crate::core::freeze::FreezeService::get_builder_packet(repo_path, Some(&arch_version))
+        {
+            packet.push_str(&format!(
+                "## Governed Architecture Contracts (Version {})\n\n",
+                arch_version
+            ));
+            for art in &builder_packet.artifacts {
+                packet.push_str(&format!(
+                    "### Contract Artifact: `{}`\n```markdown\n{}\n```\n\n",
+                    art.path, art.content
+                ));
+            }
+        }
+
+        // Prior Open Review Findings
+        let open_findings =
+            list_findings_for_project(conn, project_id, Some(ReviewFindingStatus::Open))?;
+        if !open_findings.is_empty() {
+            packet.push_str("## Prior Open Review Findings\n\n");
+            for f in &open_findings {
+                packet.push_str(&format!(
+                    "- **Finding `{}`** (Severity: {}): {}\n  - File: `{}` (Lines: `{}`)\n  - Defect: {}\n  - Suggested Fix: {}\n\n",
+                    f.finding_id,
+                    f.severity,
+                    f.title,
+                    f.file_path.as_deref().unwrap_or("n/a"),
+                    f.line_range.as_deref().unwrap_or("n/a"),
+                    f.description,
+                    f.suggested_fix.as_deref().unwrap_or("n/a"),
+                ));
+            }
+        }
+
         packet.push_str("## Governance Instructions for Independent Reviewer\n");
-        packet.push_str(
+        packet.push_str(&format!(
             "You are an authoritative independent code reviewer governing this implementation.\n\
-             Evaluate the code changes against the architecture contracts and validation evidence.\n\
+             Evaluate the code changes against the architecture contracts, acceptance criteria, and validation evidence.\n\
              You MUST respond with a structured verdict block in either ```verdict or ```yaml fence:\n\n\
              ```verdict\n\
-             verdict: ACCEPT | CORRECTIONS_REQUIRED | BLOCK\n\
+             schema_version: 1\n\
+             response_type: REVIEW_VERDICT\n\
+             project_id: {}\n\
+             cycle_id: {}\n\
+             review_packet_hash: <REVIEW_PACKET_HASH>\n\
+             verdict: ACCEPT | CORRECTIONS_REQUIRED | BLOCKED | ARCHITECTURE_CONCERN\n\
              summary: \"Comprehensive summary of your review evaluation\"\n\
              findings:\n\
                - id: FND-1\n\
@@ -432,10 +495,12 @@ impl ReviewService {
                  suggested_fix: \"Specific instructions on how to correct this defect\"\n\
              ```\n\n\
              Rules:\n\
-             - If there are zero defects or only minor advisory notes that do not block release, verdict is ACCEPT.\n\
-             - If there are defects that the Builder must fix, verdict is CORRECTIONS_REQUIRED.\n\
-             - If the implementation is fundamentally flawed or irrecoverable without human re-architecture, verdict is BLOCK.\n\n",
-        );
+             - If all implementation contracts and acceptance criteria are satisfied and tests pass, verdict is ACCEPT.\n\
+             - If there are actionable defects that the Builder must fix in code, verdict is CORRECTIONS_REQUIRED.\n\
+             - If the implementation is fundamentally flawed or irrecoverable without human intervention, verdict is BLOCKED.\n\
+             - If the code cannot satisfy requirements due to a contradictory, missing, or impossible architecture contract, verdict is ARCHITECTURE_CONCERN.\n\n",
+            project_id, cycle_id
+        ));
 
         packet.push_str("## Validation State\n");
         packet.push_str(&validation_section);
@@ -454,13 +519,13 @@ impl ReviewService {
             packet.push_str("\n\n");
         }
 
-        // Sanitize packet
-        let sanitized_packet = safe_sanitize_text(&packet);
-
-        // Compute packet hash
+        // Compute packet hash and embed in instruction placeholder
+        let placeholder = "<REVIEW_PACKET_HASH>";
         let mut hasher = Sha256::new();
-        hasher.update(sanitized_packet.as_bytes());
+        hasher.update(packet.as_bytes());
         let review_packet_hash = format!("{:x}", hasher.finalize());
+        let final_packet = packet.replace(placeholder, &review_packet_hash);
+        let sanitized_packet = safe_sanitize_text(&final_packet);
 
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -502,95 +567,31 @@ impl ReviewService {
     /// Scans untracked source files bounded to avoid memory exhaustion or huge binaries.
     fn collect_untracked_source_files(repo_path: &Path) -> Result<String, ReviewError> {
         let git = GitAdapter::new().map_err(|e| ReviewError::Git(e.to_string()))?;
-        let status = git
-            .inspect_repo(repo_path)
-            .map_err(|e| ReviewError::Git(e.to_string()))?;
-
-        // If repo is clean of untracked files, return empty
-        if status.status.untracked == 0 {
-            return Ok(String::new());
-        }
-
-        let output = std::process::Command::new("git")
-            .args([
-                "ls-files",
-                "--others",
-                "--exclude-standard",
-                ":(exclude).coalition/**",
-                ":(exclude)target/**",
-                ":(exclude)node_modules/**",
-                ":(exclude)dist/**",
-            ])
-            .current_dir(repo_path)
-            .output()
-            .map_err(|e| ReviewError::Git(e.to_string()))?;
-
-        let list_str = String::from_utf8_lossy(&output.stdout);
-        let mut out = String::new();
-        let mut total_bytes = 0;
-        const MAX_TOTAL_BYTES: usize = 500 * 1024; // 500 KB total limit
-        const MAX_PER_FILE_BYTES: usize = 100 * 1024; // 100 KB per file limit
-
-        for line in list_str.lines() {
-            let rel_path = line.trim();
-            if rel_path.is_empty() {
-                continue;
-            }
-
-            let full_path = repo_path.join(rel_path);
-            if !full_path.exists() || full_path.is_dir() {
-                continue;
-            }
-
-            // Check file size
-            if let Ok(meta) = std::fs::metadata(&full_path) {
-                if meta.len() > MAX_PER_FILE_BYTES as u64 {
-                    out.push_str(&format!(
-                        "### Untracked File: `{}` (Omitted: exceeds 100KB)\n\n",
-                        rel_path
-                    ));
-                    continue;
-                }
-            }
-
-            if let Ok(content) = std::fs::read_to_string(&full_path) {
-                if total_bytes + content.len() > MAX_TOTAL_BYTES {
-                    out.push_str("\n*(Untracked source files truncated: reached 500KB cap)*\n");
-                    break;
-                }
-                total_bytes += content.len();
-                out.push_str(&format!("### Untracked File: `{}`\n```text\n", rel_path));
-                out.push_str(&content);
-                if !content.ends_with('\n') {
-                    out.push('\n');
-                }
-                out.push_str("```\n\n");
-            }
-        }
-
-        Ok(out)
+        git.collect_untracked_source_files_bounded(repo_path, 500 * 1024, 100 * 1024)
+            .map_err(|e| ReviewError::Git(e.to_string()))
     }
 
     /// Strict parser for reviewer verdict response.
     pub fn parse_reviewer_response(
         text: &str,
     ) -> Result<(ReviewVerdict, String, Vec<ParsedReviewFinding>), ReviewError> {
+        let parsed = Self::parse_reviewer_envelope(text)?;
+        let verdict: ReviewVerdict = parsed.verdict.parse()?;
+        let summary = parsed
+            .summary
+            .unwrap_or_else(|| format!("Review completed with verdict {}", verdict));
+
+        Ok((verdict, summary, parsed.findings))
+    }
+
+    /// Strict parser for structured reviewer envelope with schema and binding metadata.
+    pub fn parse_reviewer_envelope(text: &str) -> Result<RawVerdictEnvelope, ReviewError> {
         let verdict_block = extract_verdict_block(text).ok_or_else(|| {
             ReviewError::ParseError(
                 "No ```verdict, ```yaml, or ```json code block containing a structured review verdict was found."
                     .to_string(),
             )
         })?;
-
-        // Attempt YAML / JSON parsing of the extracted block
-        #[derive(Deserialize)]
-        struct RawVerdictEnvelope {
-            verdict: String,
-            #[serde(default)]
-            summary: Option<String>,
-            #[serde(default)]
-            findings: Vec<ParsedReviewFinding>,
-        }
 
         let parsed: RawVerdictEnvelope = serde_yaml::from_str(&verdict_block)
             .or_else(|_| serde_json::from_str(&verdict_block))
@@ -601,15 +602,14 @@ impl ReviewService {
                 ))
             })?;
 
-        let verdict: ReviewVerdict = parsed.verdict.parse()?;
-        let summary = parsed
-            .summary
-            .unwrap_or_else(|| format!("Review completed with verdict {}", verdict));
+        // Strict verdict validation
+        let _verdict: ReviewVerdict = parsed.verdict.parse()?;
 
-        Ok((verdict, summary, parsed.findings))
+        Ok(parsed)
     }
 
-    /// Prepares a preview of importing a review response without committing state.
+    /// Prepares a preview of importing a review response, validates envelope bounds,
+    /// and persists an opaque server-owned preview record.
     pub fn prepare_review_import(
         conn: &Connection,
         repo_path: &Path,
@@ -634,8 +634,56 @@ impl ReviewService {
             )));
         }
 
-        // Parse reviewer response
-        let (verdict, summary, findings) = Self::parse_reviewer_response(raw_response)?;
+        // Parse reviewer envelope
+        let envelope = Self::parse_reviewer_envelope(raw_response)?;
+        let verdict: ReviewVerdict = envelope.verdict.parse()?;
+        let summary = envelope
+            .summary
+            .clone()
+            .unwrap_or_else(|| format!("Review completed with verdict {}", verdict));
+        let findings = envelope.findings;
+
+        // Strict Reviewer Envelope Validation (Item 2)
+        if let Some(sv) = envelope.schema_version {
+            if sv != 1 {
+                return Err(ReviewError::ParseError(format!(
+                    "Unsupported schema_version: {}. Expected 1.",
+                    sv
+                )));
+            }
+        }
+        if let Some(ref rt) = envelope.response_type {
+            if rt.trim().to_uppercase() != "REVIEW_VERDICT" {
+                return Err(ReviewError::ParseError(format!(
+                    "Invalid response_type: '{}'. Expected 'REVIEW_VERDICT'.",
+                    rt
+                )));
+            }
+        }
+        if let Some(ref pid) = envelope.project_id {
+            if pid != project_id {
+                return Err(ReviewError::ParseError(format!(
+                    "Reviewer response project_id '{}' does not match active project '{}'",
+                    pid, project_id
+                )));
+            }
+        }
+        if let Some(ref cid) = envelope.cycle_id {
+            if cid != cycle_id {
+                return Err(ReviewError::ParseError(format!(
+                    "Reviewer response cycle_id '{}' does not match active cycle '{}'",
+                    cid, cycle_id
+                )));
+            }
+        }
+        if let Some(ref rph) = envelope.review_packet_hash {
+            if rph != &cycle.review_packet_hash {
+                return Err(ReviewError::ParseError(format!(
+                    "Reviewer response review_packet_hash '{}' does not match active cycle packet hash '{}'",
+                    rph, cycle.review_packet_hash
+                )));
+            }
+        }
 
         // Verify git state has not drifted since packet was prepared
         let git = GitAdapter::new().map_err(|e| ReviewError::Git(e.to_string()))?;
@@ -667,6 +715,7 @@ impl ReviewService {
         let corrections_preview = if verdict == ReviewVerdict::CorrectionsRequired {
             Some(Self::generate_corrections_packet(
                 cycle.cycle_number,
+                cycle_id,
                 &summary,
                 &findings,
             ))
@@ -674,36 +723,123 @@ impl ReviewService {
             None
         };
 
+        let preview_id = format!("prev-rev-{}", Uuid::new_v4());
+        let now = chrono::Utc::now().to_rfc3339();
+
         let preview = ReviewImportPreview {
-            preview_id: format!("prev-rev-{}", Uuid::new_v4()),
+            preview_id: preview_id.clone(),
             project_id: project_id.to_string(),
             cycle_id: cycle_id.to_string(),
             verdict,
-            summary,
-            findings,
-            raw_response_hash,
-            git_head: cycle.git_head,
-            git_dirty_fingerprint: Some(current_dirty),
-            corrections_preview,
-            created_at: chrono::Utc::now().to_rfc3339(),
+            summary: summary.clone(),
+            findings: findings.clone(),
+            raw_response_hash: raw_response_hash.clone(),
+            git_head: cycle.git_head.clone(),
+            git_dirty_fingerprint: Some(current_dirty.clone()),
+            corrections_preview: corrections_preview.clone(),
+            created_at: now.clone(),
         };
+
+        // Server-Owned Preview Persistence (Item 3, Forward Migration 012)
+        let findings_json = serde_json::to_string(&findings).unwrap_or_else(|_| "[]".to_string());
+        conn.execute(
+            "INSERT INTO review_import_previews (
+                preview_id, project_id, cycle_id, verdict, summary, raw_response,
+                raw_response_hash, git_head, git_dirty_fingerprint, corrections_preview,
+                findings_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                preview_id,
+                project_id,
+                cycle_id,
+                verdict.to_string(),
+                summary,
+                raw_response,
+                raw_response_hash,
+                cycle.git_head,
+                current_dirty,
+                corrections_preview,
+                findings_json,
+                now,
+            ],
+        )
+        .map_err(|e| ReviewError::Database(e.to_string()))?;
 
         Ok(preview)
     }
 
-    /// Authoritatively confirms review import: writes durable review artifacts, updates SQLite, and transitions workflow.
+    /// Authoritatively confirms review import from a server-owned preview record.
+    /// Writes durable review artifacts, updates SQLite atomically, and transitions workflow.
     pub fn confirm_review_import(
         conn: &mut Connection,
         repo_path: &Path,
         project_id: &str,
-        preview: &ReviewImportPreview,
-        raw_response: &str,
+        preview_id: &str,
         actor: &str,
     ) -> Result<ReviewCycleRecord, ReviewError> {
-        let cycle = get_review_cycle(conn, &preview.cycle_id)?
-            .ok_or_else(|| ReviewError::NotFound(preview.cycle_id.clone()))?;
+        // 1. Fetch server-owned preview record from review_import_previews (Item 3)
+        struct StoredPreview {
+            cycle_id: String,
+            verdict: ReviewVerdict,
+            summary: String,
+            raw_response: String,
+            raw_response_hash: String,
+            git_head: Option<String>,
+            git_dirty_fingerprint: Option<String>,
+            findings: Vec<ParsedReviewFinding>,
+        }
 
-        // 1. Verify working tree has not drifted since preview was created
+        let stored: StoredPreview = conn
+            .query_row(
+                "SELECT cycle_id, verdict, summary, raw_response, raw_response_hash,
+                        git_head, git_dirty_fingerprint, findings_json
+                 FROM review_import_previews
+                 WHERE preview_id = ?1 AND project_id = ?2",
+                params![preview_id, project_id],
+                |r| {
+                    let v_str: String = r.get(1)?;
+                    let v: ReviewVerdict = v_str.parse().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                    let f_json: String = r.get(7)?;
+                    let findings: Vec<ParsedReviewFinding> =
+                        serde_json::from_str(&f_json).unwrap_or_default();
+                    Ok(StoredPreview {
+                        cycle_id: r.get(0)?,
+                        verdict: v,
+                        summary: r.get(2)?,
+                        raw_response: r.get(3)?,
+                        raw_response_hash: r.get(4)?,
+                        git_head: r.get(5)?,
+                        git_dirty_fingerprint: r.get(6)?,
+                        findings,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| ReviewError::Database(e.to_string()))?
+            .ok_or_else(|| {
+                ReviewError::NotFound(format!(
+                    "Review import preview '{}' not found for project '{}'",
+                    preview_id, project_id
+                ))
+            })?;
+
+        let cycle = get_review_cycle(conn, &stored.cycle_id)?
+            .ok_or_else(|| ReviewError::NotFound(stored.cycle_id.clone()))?;
+
+        if cycle.status != ReviewCycleStatus::Pending {
+            return Err(ReviewError::ParseError(format!(
+                "Review cycle {} is not PENDING (current status: {})",
+                cycle.cycle_id, cycle.status
+            )));
+        }
+
+        // 2. Verify working tree has not drifted since preview was created
         let git = GitAdapter::new().map_err(|e| ReviewError::Git(e.to_string()))?;
         let current_info = git
             .inspect_repo(repo_path)
@@ -712,19 +848,29 @@ impl ReviewService {
             .compute_implementation_fingerprint(repo_path)
             .map_err(|e| ReviewError::Git(e.to_string()))?;
 
-        if preview.git_head != current_info.head_commit {
+        if stored.git_head != current_info.head_commit {
             return Err(ReviewError::StalePreview(format!(
                 "Git HEAD has moved from {:?} to {:?} since preview was created",
-                preview.git_head, current_info.head_commit
+                stored.git_head, current_info.head_commit
             )));
         }
 
-        if preview.git_dirty_fingerprint.as_deref() != Some(&current_dirty) {
+        if stored.git_dirty_fingerprint.as_deref() != Some(&current_dirty) {
             return Err(ReviewError::StalePreview(format!(
                 "Working tree fingerprint has changed from {:?} to {} since preview was created",
-                preview.git_dirty_fingerprint, current_dirty
+                stored.git_dirty_fingerprint, current_dirty
             )));
         }
+
+        // 3. Directive 4: Ensure validation review gate remains satisfied at confirmation point
+        let _ = ValidationService::check_review_gate(
+            conn,
+            repo_path,
+            project_id,
+            &cycle.architecture_version,
+            cycle.epoch_id.as_deref().unwrap_or(""),
+        )
+        .map_err(|e| ReviewError::ValidationGateBlocked(e.to_string()))?;
 
         let now = chrono::Utc::now().to_rfc3339();
         let cycle_dir = repo_path
@@ -733,15 +879,14 @@ impl ReviewService {
             .join(format!("cycle-{}", cycle.cycle_number));
         std::fs::create_dir_all(&cycle_dir)?;
 
-        // 2. Persist response.md
-        let sanitized_resp = safe_sanitize_text(raw_response);
+        // 4. Persist response.md
+        let sanitized_resp = safe_sanitize_text(&stored.raw_response);
         std::fs::write(cycle_dir.join("response.md"), &sanitized_resp)?;
 
-        // 3. Process findings & compute fingerprints
+        // 5. Process findings & compute fingerprints (excluding severity per Item 14)
         let mut finding_records = Vec::new();
         let mut durable_findings = Vec::new();
 
-        // Query open findings from previous cycles for repeat detection
         let mut open_findings_map = std::collections::HashMap::new();
         {
             let mut stmt = conn
@@ -764,7 +909,7 @@ impl ReviewService {
             }
         }
 
-        for (idx, pf) in preview.findings.iter().enumerate() {
+        for pf in &stored.findings {
             let severity: ReviewFindingSeverity = pf
                 .severity
                 .as_deref()
@@ -772,28 +917,33 @@ impl ReviewService {
                 .parse()
                 .unwrap_or(ReviewFindingSeverity::Major);
 
-            // Compute stable finding fingerprint
+            // Compute stable finding fingerprint EXCLUDING severity (Item 14)
+            let norm_file = pf
+                .file
+                .as_deref()
+                .unwrap_or("")
+                .replace('\\', "/")
+                .to_lowercase();
+            let norm_title = pf.title.trim().to_lowercase();
             let mut hasher = Sha256::new();
-            hasher.update(pf.file.as_deref().unwrap_or("").as_bytes());
+            hasher.update(norm_file.as_bytes());
             hasher.update(b":");
-            hasher.update(severity.to_string().as_bytes());
-            hasher.update(b":");
-            hasher.update(pf.title.trim().to_lowercase().as_bytes());
+            hasher.update(norm_title.as_bytes());
             let fp = format!("{:x}", hasher.finalize());
 
             let (finding_id, first_cycle_id, is_repeat) =
                 if let Some((existing_id, orig_cycle)) = open_findings_map.get(&fp) {
                     (existing_id.clone(), orig_cycle.clone(), true)
                 } else {
-                    let fid = format!("FND-{}-{:02}", cycle.cycle_number, idx + 1);
-                    (fid, preview.cycle_id.clone(), false)
+                    let fid = format!("fnd-{}-{}", project_id, Uuid::new_v4());
+                    (fid, cycle.cycle_id.clone(), false)
                 };
 
             let f_rec = ReviewFindingRecord {
                 finding_id: finding_id.clone(),
                 project_id: project_id.to_string(),
                 first_cycle_id,
-                last_cycle_id: preview.cycle_id.clone(),
+                last_cycle_id: cycle.cycle_id.clone(),
                 fingerprint: fp.clone(),
                 severity,
                 status: ReviewFindingStatus::Open,
@@ -823,12 +973,13 @@ impl ReviewService {
             finding_records.push(f_rec);
         }
 
-        // 4. Generate corrections packet if corrections required
-        let corrections_text = if preview.verdict == ReviewVerdict::CorrectionsRequired {
+        // 6. Generate corrections packet if corrections required
+        let corrections_text = if stored.verdict == ReviewVerdict::CorrectionsRequired {
             let cp = Self::generate_corrections_packet(
                 cycle.cycle_number,
-                &preview.summary,
-                &preview.findings,
+                &cycle.cycle_id,
+                &stored.summary,
+                &stored.findings,
             );
             std::fs::write(cycle_dir.join("corrections.md"), &cp)?;
             Some(cp)
@@ -836,21 +987,21 @@ impl ReviewService {
             None
         };
 
-        // 5. Write verdict.yaml atomically
+        // 7. Write verdict.yaml atomically
         let verdict_file = DurableReviewVerdictFile {
             schema_version: 1,
-            cycle_id: preview.cycle_id.clone(),
+            cycle_id: cycle.cycle_id.clone(),
             cycle_number: cycle.cycle_number,
             project_id: project_id.to_string(),
             architecture_version: cycle.architecture_version.clone(),
             epoch_id: cycle.epoch_id.clone(),
             validation_run_id: cycle.validation_run_id.clone(),
-            verdict: preview.verdict.to_string(),
-            summary: preview.summary.clone(),
-            git_head: preview.git_head.clone(),
-            git_dirty_fingerprint: preview.git_dirty_fingerprint.clone(),
+            verdict: stored.verdict.to_string(),
+            summary: stored.summary.clone(),
+            git_head: stored.git_head.clone(),
+            git_dirty_fingerprint: stored.git_dirty_fingerprint.clone(),
             review_packet_hash: cycle.review_packet_hash.clone(),
-            raw_response_hash: preview.raw_response_hash.clone(),
+            raw_response_hash: stored.raw_response_hash.clone(),
             completed_at: now.clone(),
             findings: durable_findings,
         };
@@ -861,30 +1012,35 @@ impl ReviewService {
         std::fs::write(&temp_path, &verdict_yaml)?;
         std::fs::rename(&temp_path, &final_path)?;
 
-        // 6. Persist to SQLite
-        let new_cycle_status = match preview.verdict {
+        // 8. Atomic SQLite persistence transaction (Item 15)
+        let new_cycle_status = match stored.verdict {
             ReviewVerdict::Accept => ReviewCycleStatus::Accepted,
             ReviewVerdict::CorrectionsRequired => ReviewCycleStatus::CorrectionsRequired,
-            ReviewVerdict::Block => ReviewCycleStatus::Blocked,
+            ReviewVerdict::Blocked => ReviewCycleStatus::Blocked,
+            ReviewVerdict::ArchitectureConcern => ReviewCycleStatus::ArchitectureConcern,
         };
 
-        conn.execute(
+        let tx = conn
+            .transaction()
+            .map_err(|e| ReviewError::Database(e.to_string()))?;
+
+        tx.execute(
             "UPDATE review_cycles
              SET status = ?1, verdict = ?2, summary = ?3, corrections_packet = ?4, completed_at = ?5
              WHERE cycle_id = ?6",
             params![
                 new_cycle_status.to_string(),
-                preview.verdict.to_string(),
-                preview.summary,
+                stored.verdict.to_string(),
+                stored.summary,
                 corrections_text,
                 now,
-                preview.cycle_id
+                cycle.cycle_id
             ],
         )
         .map_err(|e| ReviewError::Database(e.to_string()))?;
 
         for f in &finding_records {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO review_findings (
                     finding_id, project_id, first_cycle_id, last_cycle_id, fingerprint,
                     severity, status, file_path, line_range, title, description,
@@ -912,11 +1068,11 @@ impl ReviewService {
             )
             .map_err(|e| ReviewError::Database(e.to_string()))?;
 
-            conn.execute(
+            tx.execute(
                 "INSERT OR REPLACE INTO review_cycle_findings (cycle_id, finding_id, is_repeat)
                  VALUES (?1, ?2, ?3)",
                 params![
-                    preview.cycle_id,
+                    cycle.cycle_id,
                     f.finding_id,
                     if f.is_repeat { 1 } else { 0 }
                 ],
@@ -924,39 +1080,61 @@ impl ReviewService {
             .map_err(|e| ReviewError::Database(e.to_string()))?;
         }
 
-        // 7. Transition workflow state authoritatively
-        let action = match preview.verdict {
+        // On ACCEPT verdict: all open findings for this project are authoritatively resolved (Item 14)
+        if stored.verdict == ReviewVerdict::Accept {
+            tx.execute(
+                "UPDATE review_findings
+                 SET status = 'RESOLVED', resolution_cycle_id = ?1, updated_at = ?2
+                 WHERE project_id = ?3 AND status = 'OPEN'",
+                params![cycle.cycle_id, now, project_id],
+            )
+            .map_err(|e| ReviewError::Database(e.to_string()))?;
+        }
+
+        // Clean up consumed preview record
+        tx.execute(
+            "DELETE FROM review_import_previews WHERE preview_id = ?1",
+            params![preview_id],
+        )
+        .map_err(|e| ReviewError::Database(e.to_string()))?;
+
+        // 9. Authoritative workflow state transition
+        let action = match stored.verdict {
             ReviewVerdict::Accept => WorkflowAction::AcceptReview,
             ReviewVerdict::CorrectionsRequired => WorkflowAction::RequestCorrections,
-            ReviewVerdict::Block => WorkflowAction::Block,
+            ReviewVerdict::Blocked => WorkflowAction::Block,
+            ReviewVerdict::ArchitectureConcern => WorkflowAction::RaiseArchitectureConcern,
         };
 
-        workflow::apply_workflow_action(conn, project_id, action, actor)
+        workflow::apply_workflow_action_conn(&tx, project_id, action, actor)
             .map_err(|e| ReviewError::Database(e.to_string()))?;
 
-        // 8. Record audit activity event
+        // 10. Record audit activity event
         let meta = serde_json::json!({
-            "cycle_id": preview.cycle_id,
-            "verdict": preview.verdict.to_string(),
+            "cycle_id": cycle.cycle_id,
+            "verdict": stored.verdict.to_string(),
             "findings_count": finding_records.len(),
-            "summary": preview.summary
+            "summary": stored.summary
         });
         let _ = ActivityManager::record_event(
-            conn,
+            &tx,
             project_id,
             "REVIEW_VERDICT_CONFIRMED",
             actor,
             &format!(
                 "Review cycle {} concluded with verdict {}: {}",
-                preview.cycle_id, preview.verdict, preview.summary
+                cycle.cycle_id, stored.verdict, stored.summary
             ),
             Some(&meta),
         );
 
+        tx.commit()
+            .map_err(|e| ReviewError::Database(e.to_string()))?;
+
         let mut completed_cycle = cycle;
         completed_cycle.status = new_cycle_status;
-        completed_cycle.verdict = Some(preview.verdict);
-        completed_cycle.summary = Some(preview.summary.clone());
+        completed_cycle.verdict = Some(stored.verdict);
+        completed_cycle.summary = Some(stored.summary);
         completed_cycle.corrections_packet = corrections_text;
         completed_cycle.completed_at = Some(now);
         completed_cycle.findings = finding_records;
@@ -967,6 +1145,7 @@ impl ReviewService {
     /// Formats a normalized correction prompt for the Builder.
     pub fn generate_corrections_packet(
         cycle_number: i64,
+        cycle_id: &str,
         summary: &str,
         findings: &[ParsedReviewFinding],
     ) -> String {
@@ -975,6 +1154,9 @@ impl ReviewService {
             "# Coalition Review Correction Request (Cycle {})\n\n",
             cycle_number
         ));
+        out.push_str(&format!("- **Review Cycle ID**: `{}`\n", cycle_id));
+        out.push_str("- **Source**: Governed Reviewer\n");
+        out.push_str("- **Directive**: Independent review requires corrections before this change can be accepted.\n\n");
         out.push_str("## Overall Review Evaluation\n");
         out.push_str(summary);
         out.push_str("\n\n## Actionable Findings to Correct\n");
@@ -1054,7 +1236,10 @@ impl ReviewService {
                             Some(ReviewVerdict::CorrectionsRequired) => {
                                 ReviewCycleStatus::CorrectionsRequired
                             }
-                            Some(ReviewVerdict::Block) => ReviewCycleStatus::Blocked,
+                            Some(ReviewVerdict::Blocked) => ReviewCycleStatus::Blocked,
+                            Some(ReviewVerdict::ArchitectureConcern) => {
+                                ReviewCycleStatus::ArchitectureConcern
+                            }
                             None => ReviewCycleStatus::Pending,
                         };
 
@@ -1113,6 +1298,14 @@ impl ReviewService {
                                  VALUES (?1, ?2, ?3)",
                                 params![vf.cycle_id, f.finding_id, if f.is_repeat { 1 } else { 0 }],
                             ).map_err(|e| ReviewError::Database(e.to_string()))?;
+                        }
+
+                        // If verdict was Accept, mark findings resolved
+                        if verdict == Some(ReviewVerdict::Accept) {
+                            let _ = conn.execute(
+                                "UPDATE review_findings SET status = 'RESOLVED', resolution_cycle_id = ?1, updated_at = ?2 WHERE project_id = ?3 AND status = 'OPEN'",
+                                params![vf.cycle_id, vf.completed_at, project_id],
+                            );
                         }
 
                         count += 1;
@@ -1338,6 +1531,68 @@ pub fn list_findings_for_cycle(
     Ok(list)
 }
 
+pub fn list_findings_for_project(
+    conn: &Connection,
+    project_id: &str,
+    status_filter: Option<ReviewFindingStatus>,
+) -> Result<Vec<ReviewFindingRecord>, ReviewError> {
+    let sql = match status_filter {
+        Some(st) => format!(
+            "SELECT finding_id, project_id, first_cycle_id, last_cycle_id, fingerprint,
+                    severity, status, file_path, line_range, title, description,
+                    suggested_fix, resolution_cycle_id, 0, created_at, updated_at
+             FROM review_findings
+             WHERE project_id = ?1 AND status = '{}'
+             ORDER BY finding_id ASC",
+            st
+        ),
+        None => "SELECT finding_id, project_id, first_cycle_id, last_cycle_id, fingerprint,
+                        severity, status, file_path, line_range, title, description,
+                        suggested_fix, resolution_cycle_id, 0, created_at, updated_at
+                 FROM review_findings
+                 WHERE project_id = ?1
+                 ORDER BY finding_id ASC"
+            .to_string(),
+    };
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| ReviewError::Database(e.to_string()))?;
+
+    let rows = stmt
+        .query_map(params![project_id], |row| {
+            let sev_str: String = row.get(5)?;
+            let st_str: String = row.get(6)?;
+            let repeat_int: i64 = row.get(13)?;
+
+            Ok(ReviewFindingRecord {
+                finding_id: row.get(0)?,
+                project_id: row.get(1)?,
+                first_cycle_id: row.get(2)?,
+                last_cycle_id: row.get(3)?,
+                fingerprint: row.get(4)?,
+                severity: sev_str.parse().unwrap_or(ReviewFindingSeverity::Major),
+                status: st_str.parse().unwrap_or(ReviewFindingStatus::Open),
+                file_path: row.get(7)?,
+                line_range: row.get(8)?,
+                title: row.get(9)?,
+                description: row.get(10)?,
+                suggested_fix: row.get(11)?,
+                resolution_cycle_id: row.get(12)?,
+                is_repeat: repeat_int != 0,
+                created_at: row.get(14)?,
+                updated_at: row.get(15)?,
+            })
+        })
+        .map_err(|e| ReviewError::Database(e.to_string()))?;
+
+    let mut list = Vec::new();
+    for item in rows.flatten() {
+        list.push(item);
+    }
+    Ok(list)
+}
+
 /// Helper function to extract structured verdict code fence.
 fn extract_verdict_block(text: &str) -> Option<String> {
     // Look for ```verdict, ```yaml, or ```json
@@ -1417,9 +1672,14 @@ findings:
             description: "Entries are not pruned on TTL expiry.".to_string(),
             suggested_fix: Some("Add cleanup_expired() call.".to_string()),
         }];
-        let packet =
-            ReviewService::generate_corrections_packet(1, "Fix critical issues", &findings);
+        let packet = ReviewService::generate_corrections_packet(
+            1,
+            "rcy-test-1",
+            "Fix critical issues",
+            &findings,
+        );
         assert!(packet.contains("# Coalition Review Correction Request (Cycle 1)"));
+        assert!(packet.contains("rcy-test-1"));
         assert!(packet.contains("Memory leak in cache"));
         assert!(packet.contains("src/cache.rs"));
         assert!(packet.contains("cleanup_expired()"));

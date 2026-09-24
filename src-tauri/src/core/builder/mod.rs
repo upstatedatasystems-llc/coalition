@@ -1469,6 +1469,32 @@ impl BuilderService {
         let turn_prompt = match &instruction_source {
             Some(BuilderInstructionSource::ValidationDiagnostic { validation_run_id }) => {
                 let db = db_arc.lock().await;
+                let run_project_id: Option<String> = db
+                    .connection()
+                    .query_row(
+                        "SELECT project_id FROM validation_runs WHERE run_id = ?1",
+                        rusqlite::params![validation_run_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| BuilderError::Database(e.to_string()))?;
+
+                match run_project_id {
+                    Some(ref pid) if pid == project_id => {}
+                    Some(_) => {
+                        return Err(BuilderError::ExecutionFailed(format!(
+                            "Validation run {} does not belong to project {}",
+                            validation_run_id, project_id
+                        )));
+                    }
+                    None => {
+                        return Err(BuilderError::ExecutionFailed(format!(
+                            "Validation run {} not found",
+                            validation_run_id
+                        )));
+                    }
+                }
+
                 let diagnostic =
                     crate::core::validation::ValidationService::generate_diagnostic_packet_for_run(
                         db.connection(),
@@ -1481,27 +1507,43 @@ impl BuilderService {
                             e
                         ))
                     })?;
+                let sanitized_diagnostic = safe_sanitize_text(&diagnostic);
                 format!(
                     "{}\n\n=== VALIDATION DIAGNOSTIC REPORT ===\n{}",
-                    builder_packet.prompt, diagnostic
+                    builder_packet.prompt, sanitized_diagnostic
                 )
             }
             Some(BuilderInstructionSource::ReviewCorrection { review_cycle_id }) => {
                 let db = db_arc.lock().await;
-                let correction_text: Option<String> = db
+                let cycle_info: Option<(String, Option<String>)> = db
                     .connection()
                     .query_row(
-                        "SELECT corrections_packet FROM review_cycles WHERE cycle_id = ?1",
+                        "SELECT project_id, corrections_packet FROM review_cycles WHERE cycle_id = ?1",
                         rusqlite::params![review_cycle_id],
-                        |r| r.get(0),
+                        |r| Ok((r.get(0)?, r.get(1)?)),
                     )
                     .optional()
-                    .unwrap_or(None);
+                    .map_err(|e| BuilderError::Database(e.to_string()))?;
+
+                let (cycle_project_id, correction_text) = cycle_info.ok_or_else(|| {
+                    BuilderError::ExecutionFailed(format!(
+                        "Review cycle {} not found",
+                        review_cycle_id
+                    ))
+                })?;
+
+                if cycle_project_id != project_id {
+                    return Err(BuilderError::ExecutionFailed(format!(
+                        "Review cycle {} does not belong to project {}",
+                        review_cycle_id, project_id
+                    )));
+                }
 
                 if let Some(text) = correction_text {
+                    let sanitized = safe_sanitize_text(&text);
                     format!(
                         "{}\n\n=== REVIEW CORRECTION REQUEST ===\n{}",
-                        builder_packet.prompt, text
+                        builder_packet.prompt, sanitized
                     )
                 } else {
                     format!(
@@ -1839,14 +1881,37 @@ impl BuilderService {
                 }
 
                 if resp.text_response.contains("COALITION_REQUEST_VALIDATION") {
-                    let _ = crate::core::activity::ActivityManager::record_event(
-                        db.connection(),
-                        project_id,
-                        "BUILDER_REQUESTED_VALIDATION",
-                        "BUILDER",
-                        "Builder signaled intent to validate project via COALITION_REQUEST_VALIDATION",
-                        None,
-                    );
+                    let config_res =
+                        crate::core::validation::ValidationService::read_validation_config(
+                            &repo_path,
+                        );
+                    let allow_builder = config_res
+                        .as_ref()
+                        .map(|c| c.is_builder_requested_run_allowed())
+                        .unwrap_or(false);
+
+                    if allow_builder {
+                        let _ = crate::core::activity::ActivityManager::record_event(
+                            db.connection(),
+                            project_id,
+                            "BUILDER_REQUESTED_VALIDATION",
+                            "BUILDER",
+                            "Builder requested validation execution via COALITION_REQUEST_VALIDATION",
+                            None,
+                        );
+                    } else {
+                        let meta = serde_json::json!({
+                            "reason": "Builder-requested validation runs are disabled in project configuration"
+                        });
+                        let _ = crate::core::activity::ActivityManager::record_event(
+                            db.connection(),
+                            project_id,
+                            "BUILDER_VALIDATION_REFUSED",
+                            "GOVERNANCE",
+                            "Refused builder-requested validation: triggers.allow_builder_requested_runs is disabled",
+                            Some(&meta),
+                        );
+                    }
                 }
 
                 Ok(resp)

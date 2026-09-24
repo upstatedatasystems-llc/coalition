@@ -26,6 +26,7 @@ export const ReviewControlView: React.FC<ReviewControlViewProps> = ({
   const [history, setHistory] = useState<ReviewCycleRecord[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isPreparingPacket, setIsPreparingPacket] = useState<boolean>(false);
+  const [preparedPacketText, setPreparedPacketText] = useState<string | null>(null);
   const [copiedPacket, setCopiedPacket] = useState<boolean>(false);
 
   // Reviewer response import state
@@ -72,7 +73,10 @@ export const ReviewControlView: React.FC<ReviewControlViewProps> = ({
       setIsPreparingPacket(true);
       setErrorMessage(null);
       setSuccessMessage(null);
-      const cycle = await invoke<ReviewCycleRecord>('prepare_review_packet', { projectId });
+      const resp = await invoke<any>('prepare_review_packet', { projectId });
+      const cycle: ReviewCycleRecord = resp?.cycle || resp;
+      const packetText: string = resp?.packet || '';
+      setPreparedPacketText(packetText);
       setLatestCycle(cycle);
       setSelectedCycle(cycle);
       setSuccessMessage(`Review packet prepared successfully for Cycle #${cycle.cycle_number}`);
@@ -87,19 +91,21 @@ export const ReviewControlView: React.FC<ReviewControlViewProps> = ({
   };
 
   const handleCopyPacket = async () => {
-    if (!latestCycle) return;
+    const textToCopy =
+      preparedPacketText ||
+      latestCycle?.corrections_packet ||
+      latestCycle?.summary ||
+      (latestCycle ? `Review Packet for Cycle #${latestCycle.cycle_number}\nHash: ${latestCycle.review_packet_hash}` : '');
+    if (!textToCopy) return;
     try {
-      // Look up packet content or fetch clipboard
-      // The review packet hash and corrections packet are stored on the cycle
-      const packetContent = latestCycle.corrections_packet || latestCycle.summary || `Review Packet for Cycle #${latestCycle.cycle_number}\nHash: ${latestCycle.review_packet_hash}`;
-      await navigator.clipboard.writeText(packetContent);
+      await navigator.clipboard.writeText(textToCopy);
       setCopiedPacket(true);
       setTimeout(() => setCopiedPacket(false), 3000);
     } catch {
       // Fallback to desktop_clipboard_write
       try {
         await invoke('desktop_clipboard_write', {
-          text: latestCycle.corrections_packet || latestCycle.summary || latestCycle.review_packet_hash,
+          text: textToCopy,
         });
         setCopiedPacket(true);
         setTimeout(() => setCopiedPacket(false), 3000);

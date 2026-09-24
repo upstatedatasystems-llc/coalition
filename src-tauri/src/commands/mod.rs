@@ -412,6 +412,7 @@ impl From<crate::core::validation::ValidationError> for CommandError {
             ValidationError::Git(e) => Self::new("GIT_ERROR", e),
             ValidationError::Execution(e) => Self::new("VALIDATION_EXECUTION_ERROR", e),
             ValidationError::NotFound(e) => Self::new("NOT_FOUND", e),
+            ValidationError::Validation(e) => Self::new("VALIDATION_ERROR", e),
             ValidationError::StaleEvidence(e) => Self::new("STALE_EVIDENCE", e),
         }
     }
@@ -683,6 +684,19 @@ pub fn apply_workflow_action_impl(
                     action
                 ),
             ));
+        }
+        WorkflowAction::Block | WorkflowAction::RaiseArchitectureConcern => {
+            let current = workflow::get_workflow_state(db.connection(), project_id)
+                .map_err(CommandError::from)?;
+            if current.state == workflow::WorkflowState::WaitingForReview {
+                return Err(CommandError::new(
+                    "STAGE4_GOVERNANCE_BYPASS_FORBIDDEN",
+                    format!(
+                        "Action {:?} cannot be invoked directly while awaiting review. Review verdicts must be confirmed through confirm_review_import.",
+                        action
+                    ),
+                ));
+            }
         }
         WorkflowAction::StartBuild => {
             validate_builder_preflight(db, project_id)?;
@@ -1568,9 +1582,8 @@ pub async fn start_validation_run(
         .app_data_dir()
         .unwrap_or_else(|_| PathBuf::from("."));
 
-    let trigger = payload
-        .trigger
-        .unwrap_or(crate::core::validation::ValidationTriggerSource::Manual);
+    // Manual invocation from frontend is always Manual trigger (Item 7)
+    let trigger = crate::core::validation::ValidationTriggerSource::Manual;
 
     crate::core::validation::ValidationService::execute_validation_run(
         state.db.clone(),
@@ -1796,26 +1809,43 @@ pub struct PrepareReviewImportPayload {
     pub project_id: String,
     #[serde(alias = "cycle_id")]
     pub cycle_id: String,
+    #[serde(alias = "reviewer_response", alias = "reviewerResponse")]
     pub raw_response: String,
 }
 
 #[tauri::command]
 pub async fn prepare_review_import(
     state: State<'_, AppState>,
-    payload: PrepareReviewImportPayload,
+    payload: Option<PrepareReviewImportPayload>,
+    project_id: Option<String>,
+    cycle_id: Option<String>,
+    raw_response: Option<String>,
+    reviewer_response: Option<String>,
 ) -> Result<crate::core::review::ReviewImportPreview, CommandError> {
+    let (pid, cid, resp) = if let Some(p) = payload {
+        (p.project_id, p.cycle_id, p.raw_response)
+    } else {
+        (
+            project_id.ok_or_else(|| CommandError::new("MISSING_ARG", "project_id required"))?,
+            cycle_id.ok_or_else(|| CommandError::new("MISSING_ARG", "cycle_id required"))?,
+            raw_response
+                .or(reviewer_response)
+                .ok_or_else(|| CommandError::new("MISSING_ARG", "raw_response required"))?,
+        )
+    };
+
     let repo_path = {
         let db = state.db.lock().await;
-        get_repo_path_for_project_sync(&db, &payload.project_id)?
+        get_repo_path_for_project_sync(&db, &pid)?
     };
 
     let db = state.db.lock().await;
     crate::core::review::ReviewService::prepare_review_import(
         db.connection(),
         &repo_path,
-        &payload.project_id,
-        &payload.cycle_id,
-        &payload.raw_response,
+        &pid,
+        &cid,
+        &resp,
     )
     .map_err(CommandError::from)
 }
@@ -1825,27 +1855,37 @@ pub async fn prepare_review_import(
 pub struct ConfirmReviewImportPayload {
     #[serde(alias = "project_id")]
     pub project_id: String,
-    pub preview: crate::core::review::ReviewImportPreview,
-    pub raw_response: String,
+    #[serde(alias = "preview_id")]
+    pub preview_id: String,
 }
 
 #[tauri::command]
 pub async fn confirm_review_import(
     state: State<'_, AppState>,
-    payload: ConfirmReviewImportPayload,
+    payload: Option<ConfirmReviewImportPayload>,
+    project_id: Option<String>,
+    preview_id: Option<String>,
 ) -> Result<crate::core::review::ReviewCycleRecord, CommandError> {
+    let (pid, prev_id) = if let Some(p) = payload {
+        (p.project_id, p.preview_id)
+    } else {
+        (
+            project_id.ok_or_else(|| CommandError::new("MISSING_ARG", "project_id required"))?,
+            preview_id.ok_or_else(|| CommandError::new("MISSING_ARG", "preview_id required"))?,
+        )
+    };
+
     let repo_path = {
         let db = state.db.lock().await;
-        get_repo_path_for_project_sync(&db, &payload.project_id)?
+        get_repo_path_for_project_sync(&db, &pid)?
     };
 
     let mut db = state.db.lock().await;
     crate::core::review::ReviewService::confirm_review_import(
         db.connection_mut(),
         &repo_path,
-        &payload.project_id,
-        &payload.preview,
-        &payload.raw_response,
+        &pid,
+        &prev_id,
         "HUMAN",
     )
     .map_err(CommandError::from)

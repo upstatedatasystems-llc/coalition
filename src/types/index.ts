@@ -536,12 +536,17 @@ export interface ValidationGateOverrideRecord {
 }
 
 // Stage 4 Review & Correction Loop Types
-export type ReviewVerdict = 'ACCEPT' | 'CORRECTIONS_REQUIRED' | 'BLOCK';
+export type ReviewVerdict =
+  | 'ACCEPT'
+  | 'CORRECTIONS_REQUIRED'
+  | 'BLOCKED'
+  | 'ARCHITECTURE_CONCERN';
 export type ReviewCycleStatus =
   | 'PENDING'
   | 'ACCEPTED'
   | 'CORRECTIONS_REQUIRED'
   | 'BLOCKED'
+  | 'ARCHITECTURE_CONCERN'
   | 'SUPERSEDED';
 export type ReviewFindingSeverity = 'CRITICAL' | 'MAJOR' | 'MINOR' | 'INFO';
 export type ReviewFindingStatus = 'OPEN' | 'RESOLVED' | 'SUPERSEDED' | 'BLOCKED';

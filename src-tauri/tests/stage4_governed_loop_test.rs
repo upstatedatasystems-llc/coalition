@@ -267,16 +267,9 @@ async fn test_stage4_end_to_end_governed_loop_acceptance() {
         assert_eq!(gate_ok.run_id, run_1.run_id);
     }
 
-    // 7. Submit For Review: transitions to WAITING_FOR_REVIEW
+    // 7. Workflow State reached WAITING_FOR_REVIEW (automatically advanced on gate override)
     {
-        let mut db = db_manager.lock().await;
-        apply_workflow_action(
-            db.connection_mut(),
-            &project_id,
-            WorkflowAction::SubmitForReview,
-            "HUMAN",
-        )
-        .unwrap();
+        let db = db_manager.lock().await;
         let state = coalition_lib::core::workflow::get_workflow_state(db.connection(), &project_id)
             .unwrap();
         assert_eq!(state.state, WorkflowState::WaitingForReview);
@@ -300,10 +293,16 @@ async fn test_stage4_end_to_end_governed_loop_acceptance() {
     );
 
     // 9. Reviewer returns CORRECTIONS_REQUIRED with structured findings
-    let reviewer_resp_1 = r#"
+    let reviewer_resp_1 = format!(
+        r#"
 We have reviewed the implementation diff and untracked files.
 
 ```verdict
+schema_version: 1
+response_type: REVIEW_VERDICT
+project_id: "{}"
+cycle_id: "{}"
+review_packet_hash: "{}"
 verdict: CORRECTIONS_REQUIRED
 summary: "Memory safety concern: buffer bounds check is missing in lib.rs."
 findings:
@@ -313,9 +312,11 @@ findings:
     file: "src/lib.rs"
     lines: "1-2"
     description: "The function process_data accepts buf without validating minimum length."
-    suggested_fix: "Add `if buf.len() < 4 { return; }` at the beginning of process_data."
+    suggested_fix: "Add `if buf.len() < 4 {{ return; }}` at the beginning of process_data."
 ```
-"#;
+"#,
+        project_id, cycle_1.cycle_id, cycle_1.review_packet_hash
+    );
 
     // Preview import
     let preview_1 = {
@@ -325,7 +326,7 @@ findings:
             repo_path,
             &project_id,
             &cycle_1.cycle_id,
-            reviewer_resp_1,
+            &reviewer_resp_1,
         )
         .unwrap()
     };
@@ -339,8 +340,7 @@ findings:
             db.connection_mut(),
             repo_path,
             &project_id,
-            &preview_1,
-            reviewer_resp_1,
+            &preview_1.preview_id,
             "HUMAN",
         )
         .unwrap()
@@ -463,13 +463,21 @@ findings:
     assert_eq!(cycle_2.cycle_number, 2);
 
     // 14. Reviewer returns ACCEPT
-    let reviewer_resp_2 = r#"
+    let reviewer_resp_2 = format!(
+        r#"
 ```verdict
+schema_version: 1
+response_type: REVIEW_VERDICT
+project_id: "{}"
+cycle_id: "{}"
+review_packet_hash: "{}"
 verdict: ACCEPT
 summary: "All findings from Cycle #1 have been cleanly resolved. Bounds check verified."
 findings: []
 ```
-"#;
+"#,
+        project_id, cycle_2.cycle_id, cycle_2.review_packet_hash
+    );
 
     let preview_2 = {
         let db = db_manager.lock().await;
@@ -478,7 +486,7 @@ findings: []
             repo_path,
             &project_id,
             &cycle_2.cycle_id,
-            reviewer_resp_2,
+            &reviewer_resp_2,
         )
         .unwrap()
     };
@@ -490,8 +498,7 @@ findings: []
             db.connection_mut(),
             repo_path,
             &project_id,
-            &preview_2,
-            reviewer_resp_2,
+            &preview_2.preview_id,
             "HUMAN",
         )
         .unwrap()
@@ -530,16 +537,13 @@ findings: []
     )
     .unwrap();
 
-    // Rehydrate reviews from disk
-    let rehydrated_count = ReviewService::rehydrate_reviews_from_disk(
-        fresh_db.connection_mut(),
-        repo_path,
-        &project_id,
-    )
-    .unwrap();
+    // Verify that register_or_open_project automatically rehydrated reviews from disk (Criterion 16)
+    let all_rehydrated =
+        list_review_cycles_for_project(fresh_db.connection(), &project_id, 20).unwrap();
     assert_eq!(
-        rehydrated_count, 2,
-        "Both cycle 1 and cycle 2 must rehydrate from disk"
+        all_rehydrated.len(),
+        2,
+        "Both cycle 1 and cycle 2 must automatically rehydrate on project reopen"
     );
 
     // Query latest review cycle from rehydrated SQLite
@@ -635,7 +639,10 @@ async fn test_stale_review_preview_guard() {
         .unwrap()
     };
 
-    let reviewer_resp = "```verdict\nverdict: ACCEPT\nsummary: Approved\nfindings: []\n```";
+    let reviewer_resp = format!(
+        "```verdict\nschema_version: 1\nresponse_type: REVIEW_VERDICT\nproject_id: \"{}\"\ncycle_id: \"{}\"\nreview_packet_hash: \"{}\"\nverdict: ACCEPT\nsummary: Approved\nfindings: []\n```",
+        project_id, cycle.cycle_id, cycle.review_packet_hash
+    );
     let preview = {
         let db = db_manager.lock().await;
         ReviewService::prepare_review_import(
@@ -643,7 +650,7 @@ async fn test_stale_review_preview_guard() {
             repo_path,
             &project_id,
             &cycle.cycle_id,
-            reviewer_resp,
+            &reviewer_resp,
         )
         .unwrap()
     };
@@ -658,8 +665,7 @@ async fn test_stale_review_preview_guard() {
             db.connection_mut(),
             repo_path,
             &project_id,
-            &preview,
-            reviewer_resp,
+            &preview.preview_id,
             "HUMAN",
         )
     };
@@ -671,4 +677,365 @@ async fn test_stale_review_preview_guard() {
         }
         other => panic!("Expected StalePreview error, got: {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn test_review_blocked_and_arch_concern_verdicts() {
+    let (repo_temp, _db_temp, project_id, db_path) = setup_frozen_test_project();
+    let repo_path = repo_temp.path();
+
+    let db_manager = Arc::new(Mutex::new(DbManager::open(&db_path).unwrap()));
+    let validation_reg = Arc::new(Mutex::new(ActiveValidationRegistry::new()));
+    let app_data_temp = tempdir().unwrap();
+    let app_data_dir = app_data_temp.path();
+
+    // Start build and validation
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartBuild,
+            "HUMAN",
+        )
+        .unwrap();
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartValidation,
+            "HUMAN",
+        )
+        .unwrap();
+    }
+
+    let target_dir = repo_path.join("target");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::write(target_dir.join("clean.txt"), "clean\n").unwrap();
+
+    ValidationService::execute_validation_run(
+        db_manager.clone(),
+        validation_reg.clone(),
+        &project_id,
+        repo_path,
+        ValidationTriggerSource::PostBuild,
+        None,
+        None,
+        app_data_dir,
+    )
+    .await
+    .unwrap();
+
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::SubmitForReview,
+            "HUMAN",
+        )
+        .unwrap();
+    }
+
+    let (cycle_1, _) = {
+        let db = db_manager.lock().await;
+        ReviewService::prepare_review_packet(
+            db.connection(),
+            repo_path,
+            &project_id,
+            ReviewerType::ChatgptRelay,
+        )
+        .unwrap()
+    };
+
+    // Test BLOCKED verdict
+    let resp_blocked = format!(
+        "```verdict\nschema_version: 1\nresponse_type: REVIEW_VERDICT\nproject_id: \"{}\"\ncycle_id: \"{}\"\nreview_packet_hash: \"{}\"\nverdict: BLOCKED\nsummary: \"Critical dependency vulnerability\"\nfindings: []\n```",
+        project_id, cycle_1.cycle_id, cycle_1.review_packet_hash
+    );
+
+    let prev_blocked = {
+        let db = db_manager.lock().await;
+        ReviewService::prepare_review_import(
+            db.connection(),
+            repo_path,
+            &project_id,
+            &cycle_1.cycle_id,
+            &resp_blocked,
+        )
+        .unwrap()
+    };
+    assert_eq!(prev_blocked.verdict, ReviewVerdict::Blocked);
+
+    let confirmed_blocked = {
+        let mut db = db_manager.lock().await;
+        ReviewService::confirm_review_import(
+            db.connection_mut(),
+            repo_path,
+            &project_id,
+            &prev_blocked.preview_id,
+            "HUMAN",
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        confirmed_blocked.status,
+        coalition_lib::core::review::ReviewCycleStatus::Blocked
+    );
+
+    // Verify workflow state is Blocked
+    {
+        let db = db_manager.lock().await;
+        let st = coalition_lib::core::workflow::get_workflow_state(db.connection(), &project_id)
+            .unwrap();
+        assert_eq!(st.state, WorkflowState::Blocked);
+    }
+}
+
+#[tokio::test]
+async fn test_review_architecture_concern_verdict() {
+    let (repo_temp, _db_temp, project_id, db_path) = setup_frozen_test_project();
+    let repo_path = repo_temp.path();
+
+    let db_manager = Arc::new(Mutex::new(DbManager::open(&db_path).unwrap()));
+    let validation_reg = Arc::new(Mutex::new(ActiveValidationRegistry::new()));
+    let app_data_temp = tempdir().unwrap();
+    let app_data_dir = app_data_temp.path();
+
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartBuild,
+            "HUMAN",
+        )
+        .unwrap();
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartValidation,
+            "HUMAN",
+        )
+        .unwrap();
+    }
+
+    let target_dir = repo_path.join("target");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::write(target_dir.join("clean.txt"), "clean\n").unwrap();
+
+    ValidationService::execute_validation_run(
+        db_manager.clone(),
+        validation_reg.clone(),
+        &project_id,
+        repo_path,
+        ValidationTriggerSource::PostBuild,
+        None,
+        None,
+        app_data_dir,
+    )
+    .await
+    .unwrap();
+
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::SubmitForReview,
+            "HUMAN",
+        )
+        .unwrap();
+    }
+
+    let (cycle, _) = {
+        let db = db_manager.lock().await;
+        ReviewService::prepare_review_packet(
+            db.connection(),
+            repo_path,
+            &project_id,
+            ReviewerType::ChatgptRelay,
+        )
+        .unwrap()
+    };
+
+    let resp_concern = format!(
+        "```verdict\nschema_version: 1\nresponse_type: REVIEW_VERDICT\nproject_id: \"{}\"\ncycle_id: \"{}\"\nreview_packet_hash: \"{}\"\nverdict: ARCHITECTURE_CONCERN\nsummary: \"Contract requirement contradiction\"\nfindings: []\n```",
+        project_id, cycle.cycle_id, cycle.review_packet_hash
+    );
+
+    let prev_concern = {
+        let db = db_manager.lock().await;
+        ReviewService::prepare_review_import(
+            db.connection(),
+            repo_path,
+            &project_id,
+            &cycle.cycle_id,
+            &resp_concern,
+        )
+        .unwrap()
+    };
+    assert_eq!(prev_concern.verdict, ReviewVerdict::ArchitectureConcern);
+
+    let confirmed = {
+        let mut db = db_manager.lock().await;
+        ReviewService::confirm_review_import(
+            db.connection_mut(),
+            repo_path,
+            &project_id,
+            &prev_concern.preview_id,
+            "HUMAN",
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        confirmed.status,
+        coalition_lib::core::review::ReviewCycleStatus::ArchitectureConcern
+    );
+
+    {
+        let db = db_manager.lock().await;
+        let st = coalition_lib::core::workflow::get_workflow_state(db.connection(), &project_id)
+            .unwrap();
+        assert_eq!(st.state, WorkflowState::ArchitectureConcern);
+    }
+}
+
+#[tokio::test]
+async fn test_manual_validation_disabling() {
+    let (repo_temp, _db_temp, project_id, db_path) = setup_frozen_test_project();
+    let repo_path = repo_temp.path();
+
+    // Disable manual runs in validation.yaml
+    let val_path = repo_path
+        .join(".coalition")
+        .join("implementation")
+        .join("validation.yaml");
+    #[cfg(windows)]
+    let val_yaml = r#"schema_version: 1
+enabled: true
+triggers:
+  allow_manual_runs: false
+  allow_builder_requested_runs: false
+commands:
+  - id: check-sentinel
+    name: "Check Clean Sentinel"
+    command: "cmd /c exit 0"
+    timeout_seconds: 30
+    required: true
+policy:
+  gate_review_on_required_failure: true
+  grace_period_seconds: 5
+"#;
+    #[cfg(not(windows))]
+    let val_yaml = r#"schema_version: 1
+enabled: true
+triggers:
+  allow_manual_runs: false
+  allow_builder_requested_runs: false
+commands:
+  - id: check-sentinel
+    name: "Check Clean Sentinel"
+    command: "exit 0"
+    timeout_seconds: 30
+    required: true
+policy:
+  gate_review_on_required_failure: true
+  grace_period_seconds: 5
+"#;
+    fs::write(&val_path, val_yaml).unwrap();
+
+    let db_manager = Arc::new(Mutex::new(DbManager::open(&db_path).unwrap()));
+    let validation_reg = Arc::new(Mutex::new(ActiveValidationRegistry::new()));
+    let app_data_temp = tempdir().unwrap();
+    let app_data_dir = app_data_temp.path();
+
+    let res = ValidationService::execute_validation_run(
+        db_manager,
+        validation_reg,
+        &project_id,
+        repo_path,
+        ValidationTriggerSource::Manual,
+        None,
+        None,
+        app_data_dir,
+    )
+    .await;
+
+    assert!(res.is_err());
+    let err_str = res.unwrap_err().to_string();
+    assert!(err_str.contains("Manual validation runs are disabled"));
+}
+
+#[tokio::test]
+async fn test_partial_validation_gate_rejection() {
+    let (repo_temp, _db_temp, project_id, db_path) = setup_frozen_test_project();
+    let repo_path = repo_temp.path();
+
+    // Config with 2 required commands
+    let val_path = repo_path
+        .join(".coalition")
+        .join("implementation")
+        .join("validation.yaml");
+    #[cfg(windows)]
+    let val_yaml = r#"schema_version: 1
+enabled: true
+commands:
+  - id: cmd-1
+    name: "Command 1"
+    command: "cmd /c exit 0"
+    timeout_seconds: 30
+    required: true
+  - id: cmd-2
+    name: "Command 2"
+    command: "cmd /c exit 0"
+    timeout_seconds: 30
+    required: true
+policy:
+  gate_review_on_required_failure: true
+  grace_period_seconds: 5
+"#;
+    #[cfg(not(windows))]
+    let val_yaml = r#"schema_version: 1
+enabled: true
+commands:
+  - id: cmd-1
+    name: "Command 1"
+    command: "exit 0"
+    timeout_seconds: 30
+    required: true
+  - id: cmd-2
+    name: "Command 2"
+    command: "exit 0"
+    timeout_seconds: 30
+    required: true
+policy:
+  gate_review_on_required_failure: true
+  grace_period_seconds: 5
+"#;
+    fs::write(&val_path, val_yaml).unwrap();
+
+    let db_manager = Arc::new(Mutex::new(DbManager::open(&db_path).unwrap()));
+    let validation_reg = Arc::new(Mutex::new(ActiveValidationRegistry::new()));
+    let app_data_temp = tempdir().unwrap();
+    let app_data_dir = app_data_temp.path();
+
+    // Run only cmd-1
+    let run = ValidationService::execute_validation_run(
+        db_manager,
+        validation_reg,
+        &project_id,
+        repo_path,
+        ValidationTriggerSource::PostBuild,
+        Some(vec!["cmd-1".to_string()]),
+        None,
+        app_data_dir,
+    )
+    .await
+    .unwrap();
+
+    // Gate must NOT pass because cmd-2 was not run!
+    assert!(
+        !run.is_gate_passed,
+        "Gate must not pass when required commands were omitted"
+    );
 }

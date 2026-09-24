@@ -473,6 +473,14 @@ impl ProjectService {
             conn,
         )?;
 
+        // Rehydrate Stage 4 reviews from disk and reconcile interrupted validation runs
+        let _ = crate::core::review::ReviewService::rehydrate_reviews_from_disk(
+            conn,
+            &repo_root,
+            &project_record.project_id,
+        );
+        let _ = crate::core::validation::ValidationService::reconcile_interrupted_runs(conn);
+
         // Re-query authoritative workflow state and durable project descriptor post-reconciliation
         let workflow_record = workflow::get_workflow_state(conn, &project_record.project_id)?;
         let project_yaml = ArtifactManager::read_project_yaml(&canonical_yaml_path)?;
