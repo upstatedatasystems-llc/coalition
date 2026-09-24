@@ -1477,6 +1477,71 @@ impl ValidationService {
     ) -> Result<Option<ValidationRunRecord>, ValidationError> {
         let config = Self::read_validation_config(repo_path)?;
         if !config.enabled {
+            let mut db = db_conn.lock().await;
+            if let Ok(st) = crate::core::workflow::get_workflow_state(db.connection(), project_id) {
+                if st.state == crate::core::workflow::WorkflowState::Building {
+                    crate::core::workflow::apply_workflow_action(
+                        db.connection_mut(),
+                        project_id,
+                        crate::core::workflow::WorkflowAction::StartValidation,
+                        "system",
+                    )
+                    .map_err(|e| ValidationError::Execution(e.to_string()))?;
+                }
+            }
+
+            let meta = serde_json::json!({
+                "reason": "validation disabled or unconfigured in project configuration"
+            });
+            let _ = ActivityManager::record_event(
+                db.connection_mut(),
+                project_id,
+                "VALIDATION_SKIPPED",
+                "system",
+                "Validation skipped: validation.yaml is disabled or unconfigured",
+                Some(&meta),
+            );
+
+            let arch_version =
+                crate::core::artifacts::ArtifactManager::resolve_coalition_dir(repo_path)
+                    .ok()
+                    .and_then(|dir| {
+                        crate::core::artifacts::ArtifactManager::read_project_yaml(
+                            dir.join("project.yaml"),
+                        )
+                        .ok()
+                    })
+                    .and_then(|py| py.current_architecture_version)
+                    .unwrap_or_else(|| "1.0".to_string());
+
+            let epoch_id = db.connection()
+                .query_row(
+                    "SELECT epoch_id FROM builder_sessions WHERE project_id = ?1 ORDER BY id DESC LIMIT 1",
+                    rusqlite::params![project_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap_or_else(|_| "epoch-0".to_string());
+
+            Self::check_review_gate(
+                db.connection(),
+                repo_path,
+                project_id,
+                &arch_version,
+                &epoch_id,
+            )?;
+
+            if let Ok(st) = crate::core::workflow::get_workflow_state(db.connection(), project_id) {
+                if st.state == crate::core::workflow::WorkflowState::Validating {
+                    crate::core::workflow::apply_workflow_action(
+                        db.connection_mut(),
+                        project_id,
+                        crate::core::workflow::WorkflowAction::SubmitForReview,
+                        "system",
+                    )
+                    .map_err(|e| ValidationError::Execution(e.to_string()))?;
+                }
+            }
+
             return Ok(None);
         }
 

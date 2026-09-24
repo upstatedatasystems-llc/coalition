@@ -452,9 +452,11 @@ export type ValidationTriggerSource =
   | 'FINAL_VALIDATION';
 
 export type ValidationRunStatus =
+  | 'QUEUED'
   | 'RUNNING'
   | 'PASS'
   | 'FAIL'
+  | 'TIMEOUT'
   | 'CANCELED'
   | 'INTERRUPTED';
 

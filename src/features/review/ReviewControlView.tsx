@@ -167,6 +167,8 @@ export const ReviewControlView: React.FC<ReviewControlViewProps> = ({
     }
   };
 
+  const [isRejecting, setIsRejecting] = useState<boolean>(false);
+
   const handleConfirmImport = async () => {
     if (!importPreview) return;
     try {
@@ -190,6 +192,27 @@ export const ReviewControlView: React.FC<ReviewControlViewProps> = ({
       setErrorMessage(err.message || 'Failed to confirm review import');
     } finally {
       setIsConfirming(false);
+    }
+  };
+
+  const handleRejectImport = async () => {
+    if (!importPreview) return;
+    try {
+      setIsRejecting(true);
+      setErrorMessage(null);
+      await invoke('reject_review_import', {
+        projectId,
+        previewId: importPreview.preview_id,
+      });
+      setImportPreview(null);
+      setSuccessMessage('Review import preview was rejected.');
+      await loadData();
+      await onRefreshProject();
+    } catch (e: unknown) {
+      const err = e as { message?: string };
+      setErrorMessage(err.message || 'Failed to reject review import');
+    } finally {
+      setIsRejecting(false);
     }
   };
 
@@ -639,15 +662,23 @@ export const ReviewControlView: React.FC<ReviewControlViewProps> = ({
               <button
                 className="secondary-btn"
                 onClick={() => setImportPreview(null)}
-                disabled={isConfirming}
+                disabled={isConfirming || isRejecting}
                 data-testid="cancel-preview-btn"
               >
-                Cancel
+                Dismiss
+              </button>
+              <button
+                className="danger-btn reject-import-btn"
+                onClick={handleRejectImport}
+                disabled={isConfirming || isRejecting}
+                data-testid="reject-import-btn"
+              >
+                {isRejecting ? 'Rejecting...' : 'Reject Import'}
               </button>
               <button
                 className="primary-btn confirm-import-btn"
                 onClick={handleConfirmImport}
-                disabled={isConfirming}
+                disabled={isConfirming || isRejecting}
                 data-testid="confirm-import-btn"
               >
                 {isConfirming ? 'Confirming...' : 'Confirm Review Import'}

@@ -262,6 +262,54 @@ describe('ReviewControlView', () => {
     });
   });
 
+  it('rejects review import preview when clicking Reject Import button', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_latest_review_cycle') return Promise.resolve(mockPendingCycle);
+      if (cmd === 'list_review_cycles') return Promise.resolve([mockPendingCycle]);
+      if (cmd === 'prepare_review_import') return Promise.resolve(mockPreview);
+      if (cmd === 'reject_review_import') return Promise.resolve('prev-1');
+      return Promise.resolve(null);
+    });
+
+    const refreshMock = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <ReviewControlView
+        projectId="proj-1"
+        projectName="Test Project"
+        workflowState="WAITING_FOR_REVIEW"
+        onRefreshProject={refreshMock}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('reviewer-response-input')).toBeInTheDocument();
+    });
+
+    const input = screen.getByTestId('reviewer-response-input');
+    fireEvent.change(input, {
+      target: { value: '```verdict\nverdict: CORRECTIONS_REQUIRED\n```' },
+    });
+
+    fireEvent.click(screen.getByTestId('preview-import-btn'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('import-preview-modal')).toBeInTheDocument();
+      expect(screen.getByTestId('reject-import-btn')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByTestId('reject-import-btn'));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith('reject_review_import', {
+        projectId: 'proj-1',
+        previewId: 'prev-1',
+      });
+      expect(screen.queryByTestId('import-preview-modal')).not.toBeInTheDocument();
+      expect(refreshMock).toHaveBeenCalled();
+    });
+  });
+
   it('renders repeat findings badge and corrections packet with start corrections button', async () => {
     mockInvoke.mockImplementation((cmd) => {
       if (cmd === 'get_latest_review_cycle') return Promise.resolve(mockCorrectionsCycle);

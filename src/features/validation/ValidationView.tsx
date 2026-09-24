@@ -11,12 +11,14 @@ interface ValidationViewProps {
   projectName: string;
   workflowState: string;
   onRefreshProject: () => Promise<void>;
+  onNavigateToBuilder?: () => void;
 }
 
 export const ValidationView: React.FC<ValidationViewProps> = ({
   projectId,
   workflowState,
   onRefreshProject,
+  onNavigateToBuilder,
 }) => {
   const [config, setConfig] = useState<ValidationConfig | null>(null);
   const [activeRun, setActiveRun] = useState<ValidationRunRecord | null>(null);
@@ -288,6 +290,33 @@ export const ValidationView: React.FC<ValidationViewProps> = ({
     }
   };
 
+  const [isStartingDiagnosticTurn, setIsStartingDiagnosticTurn] = useState<boolean>(false);
+
+  const handleStartDiagnosticTurn = async (runId: string) => {
+    setIsStartingDiagnosticTurn(true);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    try {
+      await invoke('start_builder_diagnostic_turn', {
+        payload: {
+          projectId,
+          validationRunId: runId,
+        },
+      });
+      setSuccessMessage('Builder diagnostic turn started successfully!');
+      await onRefreshProject();
+      await loadData();
+      if (onNavigateToBuilder) {
+        onNavigateToBuilder();
+      }
+    } catch (e: unknown) {
+      const err = e as { message?: string };
+      setErrorMessage(err.message || String(e));
+    } finally {
+      setIsStartingDiagnosticTurn(false);
+    }
+  };
+
   if (isLoading) {
     return <div className="loading-state">Loading validation configuration and runs...</div>;
   }
@@ -489,6 +518,16 @@ export const ValidationView: React.FC<ValidationViewProps> = ({
                     </p>
                   </div>
                   <div className="detail-header-actions">
+                    {(selectedRun.status === 'FAIL' || selectedRun.status === 'TIMEOUT') && (
+                      <button
+                        className="primary-btn diagnostic-turn-btn"
+                        onClick={() => handleStartDiagnosticTurn(selectedRun.run_id)}
+                        disabled={isStartingDiagnosticTurn}
+                        data-testid="send-diagnostics-builder-btn"
+                      >
+                        {isStartingDiagnosticTurn ? 'Starting Builder Turn...' : 'Send Diagnostics to Builder'}
+                      </button>
+                    )}
                     {selectedRun.status === 'FAIL' && !selectedRun.has_override && (
                       <button
                         className="warning-btn"

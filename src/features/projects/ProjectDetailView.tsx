@@ -136,6 +136,7 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
           projectName={project.name}
           workflowState={workflow_state.state}
           onRefreshProject={onRefresh}
+          onNavigateToBuilder={() => setActiveSubTab('builder')}
         />
       )}
 

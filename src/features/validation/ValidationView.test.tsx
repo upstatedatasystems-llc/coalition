@@ -371,4 +371,41 @@ describe('ValidationView', () => {
       });
     });
   });
+
+  it('renders Send Diagnostics to Builder button for failed runs and invokes start_builder_diagnostic_turn', async () => {
+    const onNavigateToBuilder = vi.fn();
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'get_validation_config') return Promise.resolve(mockConfig);
+      if (cmd === 'get_active_validation_run') return Promise.resolve(null);
+      if (cmd === 'get_validation_history') return Promise.resolve([mockHistoryRun]);
+      if (cmd === 'start_builder_diagnostic_turn') return Promise.resolve({ status: 'RUNNING' });
+      return Promise.resolve(null);
+    });
+
+    render(
+      <ValidationView
+        projectId="proj-1"
+        projectName="Test Project"
+        workflowState="VALIDATING"
+        onRefreshProject={onRefreshProject}
+        onNavigateToBuilder={onNavigateToBuilder}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('send-diagnostics-builder-btn')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByTestId('send-diagnostics-builder-btn'));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith('start_builder_diagnostic_turn', {
+        payload: {
+          projectId: 'proj-1',
+          validationRunId: 'val-run-123',
+        },
+      });
+      expect(onNavigateToBuilder).toHaveBeenCalled();
+    });
+  });
 });

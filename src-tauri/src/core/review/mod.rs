@@ -882,6 +882,70 @@ impl ReviewService {
         Ok(preview)
     }
 
+    /// Governed operation to reject a server-owned review import preview.
+    /// Deletes the preview from review_import_previews, leaves review cycle PENDING,
+    /// leaves workflow in WAITING_FOR_REVIEW, logs REVIEW_IMPORT_REJECTED, and enables subsequent import.
+    pub fn reject_review_import(
+        conn: &mut Connection,
+        project_id: &str,
+        preview_id: &str,
+        actor: &str,
+    ) -> Result<String, ReviewError> {
+        // 1. Fetch preview to verify existence and project ownership
+        let (cycle_id, verdict_str): (String, String) = conn
+            .query_row(
+                "SELECT cycle_id, verdict FROM review_import_previews WHERE preview_id = ?1 AND project_id = ?2",
+                rusqlite::params![preview_id, project_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| ReviewError::Database(e.to_string()))?
+            .ok_or_else(|| {
+                ReviewError::NotFound(format!(
+                    "Review import preview '{}' not found for project '{}'",
+                    preview_id, project_id
+                ))
+            })?;
+
+        // 2. Fetch cycle to ensure it exists and is still PENDING
+        let cycle = get_review_cycle(conn, &cycle_id)?
+            .ok_or_else(|| ReviewError::NotFound(cycle_id.clone()))?;
+
+        if cycle.status != ReviewCycleStatus::Pending {
+            return Err(ReviewError::ParseError(format!(
+                "Review cycle {} is not PENDING (current status: {})",
+                cycle.cycle_id, cycle.status
+            )));
+        }
+
+        // 3. Delete preview from review_import_previews
+        conn.execute(
+            "DELETE FROM review_import_previews WHERE preview_id = ?1 AND project_id = ?2",
+            rusqlite::params![preview_id, project_id],
+        )
+        .map_err(|e| ReviewError::Database(e.to_string()))?;
+
+        // 4. Log audit event REVIEW_IMPORT_REJECTED
+        let meta = serde_json::json!({
+            "cycle_id": cycle.cycle_id,
+            "preview_id": preview_id,
+            "verdict": verdict_str,
+        });
+        let _ = ActivityManager::record_event(
+            conn,
+            project_id,
+            "REVIEW_IMPORT_REJECTED",
+            actor,
+            &format!(
+                "Review import preview {} for cycle {} was rejected by human operator",
+                preview_id, cycle.cycle_id
+            ),
+            Some(&meta),
+        );
+
+        Ok(preview_id.to_string())
+    }
+
     /// Authoritatively confirms review import from a server-owned preview record.
     /// Writes durable review artifacts, updates SQLite atomically, and transitions workflow.
     pub fn confirm_review_import(

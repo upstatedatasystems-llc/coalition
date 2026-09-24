@@ -929,6 +929,170 @@ pub async fn start_builder_turn(
     .map_err(CommandError::from)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartBuilderDiagnosticTurnPayload {
+    #[serde(alias = "project_id")]
+    pub project_id: String,
+    #[serde(alias = "validation_run_id")]
+    pub validation_run_id: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+#[tauri::command]
+pub async fn start_builder_diagnostic_turn(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    payload: StartBuilderDiagnosticTurnPayload,
+) -> Result<BuilderTurnResponse, CommandError> {
+    // 1. Authoritative verification: preflight repo, architecture version, builder epoch
+    let (_repo_path, current_arch_version, builder_packet) = {
+        let mut db = state.db.lock().await;
+        validate_builder_preflight(&mut db, &payload.project_id)?
+    };
+    let current_epoch = builder_packet.metadata.builder_epoch_id;
+
+    // 2. Authoritative verification of validation run
+    {
+        let db = state.db.lock().await;
+        let run = crate::core::validation::get_validation_run(
+            db.connection(),
+            &payload.validation_run_id,
+        )
+        .map_err(CommandError::from)?
+        .ok_or_else(|| {
+            CommandError::new(
+                "NOT_FOUND",
+                format!("Validation run {} not found", payload.validation_run_id),
+            )
+        })?;
+
+        if run.project_id != payload.project_id {
+            return Err(CommandError::new(
+                "FORBIDDEN",
+                format!(
+                    "Validation run {} does not belong to project {}",
+                    payload.validation_run_id, payload.project_id
+                ),
+            ));
+        }
+
+        if run.status != crate::core::validation::ValidationRunStatus::Fail
+            && run.status != crate::core::validation::ValidationRunStatus::Timeout
+        {
+            return Err(CommandError::new(
+                "INVALID_STATE",
+                format!(
+                    "Validation run {} has status {} (must be FAIL or TIMEOUT)",
+                    payload.validation_run_id, run.status
+                ),
+            ));
+        }
+
+        if run.architecture_version != current_arch_version {
+            return Err(CommandError::new(
+                "STALE_EVIDENCE",
+                format!(
+                    "Validation run architecture version ({}) does not match current ({})",
+                    run.architecture_version, current_arch_version
+                ),
+            ));
+        }
+
+        if run.epoch_id.as_deref() != Some(&current_epoch) {
+            return Err(CommandError::new(
+                "STALE_EVIDENCE",
+                format!(
+                    "Validation run epoch ({:?}) does not match current Builder epoch ({})",
+                    run.epoch_id, current_epoch
+                ),
+            ));
+        }
+    }
+
+    // 3. Workflow transition: VALIDATING -> CORRECTIONS_REQUIRED
+    {
+        let mut db = state.db.lock().await;
+        let wf_state =
+            crate::core::workflow::get_workflow_state(db.connection(), &payload.project_id)
+                .map_err(CommandError::from)?;
+
+        if wf_state.state == crate::core::workflow::WorkflowState::Validating {
+            crate::core::workflow::apply_workflow_action(
+                db.connection_mut(),
+                &payload.project_id,
+                crate::core::workflow::WorkflowAction::RequestCorrections,
+                "HUMAN",
+            )
+            .map_err(CommandError::from)?;
+
+            let meta = serde_json::json!({
+                "validation_run_id": payload.validation_run_id,
+                "reason": "Routed validation failure diagnostics to Builder"
+            });
+            let _ = crate::core::activity::ActivityManager::record_event(
+                db.connection(),
+                &payload.project_id,
+                "VALIDATION_DIAGNOSTICS_ROUTED_TO_BUILDER",
+                "HUMAN",
+                &format!(
+                    "Routed validation run {} diagnostics to Builder",
+                    payload.validation_run_id
+                ),
+                Some(&meta),
+            );
+        } else if wf_state.state != crate::core::workflow::WorkflowState::CorrectionsRequired {
+            return Err(CommandError::new(
+                "INVALID_WORKFLOW_STATE",
+                format!("Cannot start builder diagnostic turn while project is in {} state (must be VALIDATING or CORRECTIONS_REQUIRED)", wf_state.state),
+            ));
+        }
+    }
+
+    // 4. Launch builder turn with ValidationDiagnostic instruction source
+    let adapter = {
+        let lock = state.agy.lock().await;
+        if let Some(ref a) = *lock {
+            AntigravityCliAdapter::with_path(a.binary_path())
+        } else {
+            AntigravityCliAdapter::discover()
+                .map_err(|e| CommandError::new("AGY_DISCOVERY_ERROR", e.to_string()))?
+        }
+    };
+
+    let app_handle = app.clone();
+    let sink: crate::core::builder::BuilderEventSink = Arc::new(move |evt, val| {
+        use tauri::Emitter;
+        let _ = app_handle.emit(evt, val);
+    });
+
+    let app_handle_val = app.clone();
+    let val_sink: crate::core::validation::ValidationEventSink = Arc::new(move |evt, val| {
+        use tauri::Emitter;
+        let _ = app_handle_val.emit(evt, val);
+    });
+
+    crate::core::builder::BuilderService::start_governed_turn_with_source(
+        state.db.clone(),
+        state.active_builder_registry.clone(),
+        Some(sink),
+        &payload.project_id,
+        payload.model,
+        payload.effort,
+        Some(adapter),
+        Some(
+            crate::core::builder::BuilderInstructionSource::ValidationDiagnostic {
+                validation_run_id: payload.validation_run_id,
+            },
+        ),
+        Some(state.active_validation_registry.clone()),
+        Some(val_sink),
+    )
+    .await
+    .map_err(CommandError::from)
+}
+
 #[tauri::command]
 pub async fn cancel_builder_turn(
     state: State<'_, AppState>,
@@ -1895,6 +2059,48 @@ pub async fn confirm_review_import(
         &pid,
         &prev_id,
         "HUMAN",
+    )
+    .map_err(CommandError::from)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectReviewImportPayload {
+    #[serde(alias = "project_id")]
+    pub project_id: String,
+    #[serde(alias = "preview_id")]
+    pub preview_id: String,
+    pub actor: Option<String>,
+}
+
+#[tauri::command]
+pub async fn reject_review_import(
+    state: State<'_, AppState>,
+    payload: Option<RejectReviewImportPayload>,
+    project_id: Option<String>,
+    preview_id: Option<String>,
+    actor: Option<String>,
+) -> Result<String, CommandError> {
+    let (pid, prev_id, act) = if let Some(p) = payload {
+        (
+            p.project_id,
+            p.preview_id,
+            p.actor.unwrap_or_else(|| "HUMAN".to_string()),
+        )
+    } else {
+        (
+            project_id.ok_or_else(|| CommandError::new("MISSING_ARG", "project_id required"))?,
+            preview_id.ok_or_else(|| CommandError::new("MISSING_ARG", "preview_id required"))?,
+            actor.unwrap_or_else(|| "HUMAN".to_string()),
+        )
+    };
+
+    let mut db = state.db.lock().await;
+    crate::core::review::ReviewService::reject_review_import(
+        db.connection_mut(),
+        &pid,
+        &prev_id,
+        &act,
     )
     .map_err(CommandError::from)
 }

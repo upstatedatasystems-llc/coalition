@@ -1415,7 +1415,7 @@ impl BuilderService {
         >,
         val_event_sink: Option<crate::core::validation::ValidationEventSink>,
     ) -> Result<BuilderTurnResponse, BuilderError> {
-        let effective_val_registry = val_registry_arc.unwrap_or_else(|| {
+        let effective_val_registry = val_registry_arc.clone().unwrap_or_else(|| {
             Arc::new(tokio::sync::Mutex::new(
                 crate::core::validation::ActiveValidationRegistry::new(),
             ))
@@ -2008,7 +2008,19 @@ impl BuilderService {
                             )
                             .await;
                         if let Err(e) = val_res {
-                            eprintln!("Builder-requested validation execution failed: {}", e);
+                            let db = db_arc.lock().await;
+                            let meta = serde_json::json!({
+                                "session_id": session_id,
+                                "error": e.to_string(),
+                            });
+                            let _ = crate::core::activity::ActivityManager::record_event(
+                                db.connection(),
+                                project_id,
+                                "BUILDER_VALIDATION_FAILED",
+                                "VALIDATION_SERVICE",
+                                &format!("Builder-requested validation execution failed: {}", e),
+                                Some(&meta),
+                            );
                         }
                     } else {
                         let meta = serde_json::json!({
@@ -2026,17 +2038,39 @@ impl BuilderService {
                 } else if resp.status == STATUS_SUCCESS && !resp.was_canceled {
                     // Item 2: Wire workflow-triggered post-build validation into production
                     // Successful builder completion drives BUILDING -> VALIDATING -> POST_BUILD validation -> WAITING_FOR_REVIEW
-                    drop(db);
-                    let app_dir = repo_path.join(".coalition");
-                    let _ = crate::core::validation::ValidationService::run_post_build_validation(
-                        db_arc.clone(),
-                        effective_val_registry.clone(),
-                        project_id,
-                        &repo_path,
-                        val_event_sink.clone(),
-                        &app_dir,
-                    )
-                    .await;
+                    if let Some(ref val_reg) = val_registry_arc {
+                        drop(db);
+                        let app_dir = repo_path.join(".coalition");
+                        let val_res =
+                            crate::core::validation::ValidationService::run_post_build_validation(
+                                db_arc.clone(),
+                                val_reg.clone(),
+                                project_id,
+                                &repo_path,
+                                val_event_sink.clone(),
+                                &app_dir,
+                            )
+                            .await;
+                        if let Err(e) = val_res {
+                            let db = db_arc.lock().await;
+                            let meta = serde_json::json!({
+                                "session_id": session_id,
+                                "error": e.to_string(),
+                            });
+                            let _ = crate::core::activity::ActivityManager::record_event(
+                                db.connection(),
+                                project_id,
+                                "VALIDATION_ORCHESTRATION_FAILED",
+                                "VALIDATION_SERVICE",
+                                &format!("Post-build validation orchestration failed: {}", e),
+                                Some(&meta),
+                            );
+                            return Err(BuilderError::ExecutionFailed(format!(
+                                "Post-build validation orchestration failed: {}",
+                                e
+                            )));
+                        }
+                    }
                 }
 
                 Ok(resp)

@@ -1,3 +1,4 @@
+use coalition_lib::core::activity::ActivityManager;
 use coalition_lib::core::artifacts::CANONICAL_ARCHITECTURE_ARTIFACTS;
 use coalition_lib::core::freeze::FreezeService;
 use coalition_lib::core::git::GitAdapter;
@@ -1456,4 +1457,481 @@ async fn test_review_packet_hash_identity() {
         disk_content.contains(&format!("Review-Packet-Hash: {}", computed_hash)),
         "Header must cleanly state the review packet hash"
     );
+}
+
+#[tokio::test]
+async fn test_stage4_validation_disabled_continues_to_review() {
+    let (repo_temp, _db_temp, project_id, db_path) = setup_frozen_test_project();
+    let repo_path = repo_temp.path();
+    let app_data_temp = tempdir().unwrap();
+    let app_data_dir = app_data_temp.path();
+
+    let db_manager = Arc::new(Mutex::new(DbManager::open(&db_path).unwrap()));
+    let val_registry = Arc::new(Mutex::new(ActiveValidationRegistry::new()));
+
+    // 1. Transition FROZEN -> BUILDING
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartBuild,
+            "HUMAN",
+        )
+        .unwrap();
+    }
+
+    // Ensure validation.yaml is explicitly disabled (or absent)
+    let val_yaml_path = repo_path
+        .join(".coalition")
+        .join("implementation")
+        .join("validation.yaml");
+    fs::create_dir_all(val_yaml_path.parent().unwrap()).unwrap();
+    fs::write(
+        &val_yaml_path,
+        "schema_version: 1\nenabled: false\ncommands: []\npolicy:\n  gate_review_on_required_failure: true\n  grace_period_seconds: 10\n",
+    )
+    .unwrap();
+
+    // 2. Run post-build validation orchestration
+    let result = ValidationService::run_post_build_validation(
+        db_manager.clone(),
+        val_registry.clone(),
+        &project_id,
+        repo_path,
+        None,
+        app_data_dir,
+    )
+    .await
+    .expect("post-build validation should succeed when validation is disabled");
+
+    assert!(
+        result.is_none(),
+        "No validation run record is created when validation is disabled"
+    );
+
+    // 3. Verify workflow state legally transitioned BUILDING -> VALIDATING -> WAITING_FOR_REVIEW
+    {
+        let db = db_manager.lock().await;
+        let wf = coalition_lib::core::workflow::get_workflow_state(db.connection(), &project_id)
+            .unwrap();
+        assert_eq!(
+            wf.state,
+            WorkflowState::WaitingForReview,
+            "Project must reach WAITING_FOR_REVIEW when validation is disabled"
+        );
+
+        // Verify VALIDATION_SKIPPED audit event was logged
+        let events =
+            ActivityManager::get_project_activity(db.connection(), &project_id, Some(20)).unwrap();
+        let skip_event = events
+            .iter()
+            .find(|e| e.event_type == "VALIDATION_SKIPPED")
+            .expect("VALIDATION_SKIPPED event must be recorded in activity history");
+        assert!(skip_event.summary.contains("disabled or unconfigured"));
+
+        // Verify review packet can now be prepared directly
+        let (cycle, packet) = ReviewService::prepare_review_packet(
+            db.connection(),
+            repo_path,
+            &project_id,
+            ReviewerType::ChatgptRelay,
+        )
+        .expect("Must be able to prepare review packet from WAITING_FOR_REVIEW");
+        assert_eq!(cycle.cycle_number, 1);
+        assert!(!packet.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_stage4_diagnostic_only_mode_allows_review_progression() {
+    let (repo_temp, _db_temp, project_id, db_path) = setup_frozen_test_project();
+    let repo_path = repo_temp.path();
+    let app_data_temp = tempdir().unwrap();
+    let app_data_dir = app_data_temp.path();
+
+    let db_manager = Arc::new(Mutex::new(DbManager::open(&db_path).unwrap()));
+    let val_registry = Arc::new(Mutex::new(ActiveValidationRegistry::new()));
+
+    // 1. Transition FROZEN -> BUILDING
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartBuild,
+            "HUMAN",
+        )
+        .unwrap();
+    }
+
+    // Configure validation with diagnostic-only policy (gate_review_on_required_failure: false)
+    // and a command that purposefully fails
+    let val_yaml_path = repo_path
+        .join(".coalition")
+        .join("implementation")
+        .join("validation.yaml");
+    fs::create_dir_all(val_yaml_path.parent().unwrap()).unwrap();
+    #[cfg(windows)]
+    let failing_cmd = "cmd.exe /C exit 1";
+    #[cfg(not(windows))]
+    let failing_cmd = "false";
+
+    fs::write(
+        &val_yaml_path,
+        format!(
+            "schema_version: 1\nenabled: true\ncommands:\n  - id: cmd-fail\n    name: Failing Check\n    command: '{}'\n    required: true\npolicy:\n  gate_review_on_required_failure: false\n  grace_period_seconds: 10\n",
+            failing_cmd
+        ),
+    )
+    .unwrap();
+
+    // 2. Run post-build validation
+    let result = ValidationService::run_post_build_validation(
+        db_manager.clone(),
+        val_registry.clone(),
+        &project_id,
+        repo_path,
+        None,
+        app_data_dir,
+    )
+    .await
+    .expect("post-build validation should succeed");
+
+    let record = result.expect("Must return validation run record");
+    assert_eq!(
+        record.status,
+        coalition_lib::core::validation::ValidationRunStatus::Fail
+    );
+    assert!(
+        record.is_gate_passed,
+        "In diagnostic-only mode, is_gate_passed must be true despite command failure"
+    );
+
+    // 3. Workflow must progress to WAITING_FOR_REVIEW
+    {
+        let db = db_manager.lock().await;
+        let wf = coalition_lib::core::workflow::get_workflow_state(db.connection(), &project_id)
+            .unwrap();
+        assert_eq!(
+            wf.state,
+            WorkflowState::WaitingForReview,
+            "Diagnostic-only failure must not block progression to WAITING_FOR_REVIEW"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_stage4_reject_review_import_governed_operation() {
+    let (repo_temp, _db_temp, project_id, db_path) = setup_frozen_test_project();
+    let repo_path = repo_temp.path();
+    let app_data_temp = tempdir().unwrap();
+    let app_data_dir = app_data_temp.path();
+
+    let db_manager = Arc::new(Mutex::new(DbManager::open(&db_path).unwrap()));
+    let val_registry = Arc::new(Mutex::new(ActiveValidationRegistry::new()));
+
+    // 1. Progress to WAITING_FOR_REVIEW
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartBuild,
+            "HUMAN",
+        )
+        .unwrap();
+    }
+
+    // Create sentinel so validation passes
+    let target_dir = repo_path.join("target");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::write(target_dir.join("clean.txt"), "clean\n").unwrap();
+
+    ValidationService::run_post_build_validation(
+        db_manager.clone(),
+        val_registry.clone(),
+        &project_id,
+        repo_path,
+        None,
+        app_data_dir,
+    )
+    .await
+    .unwrap();
+
+    // 2. Prepare review packet
+    let (cycle, _) = {
+        let db = db_manager.lock().await;
+        ReviewService::prepare_review_packet(
+            db.connection(),
+            repo_path,
+            &project_id,
+            ReviewerType::ChatgptRelay,
+        )
+        .unwrap()
+    };
+
+    // 3. Prepare review import preview
+    let raw_review_response = format!(
+        "```verdict\nschema_version: 1\nresponse_type: REVIEW_VERDICT\nproject_id: \"{}\"\ncycle_id: \"{}\"\nreview_packet_hash: \"{}\"\nverdict: CORRECTIONS_REQUIRED\nsummary: Security flaw found\nfindings:\n  - id: \"1\"\n    severity: MAJOR\n    title: Broken auth\n    description: Missing signature check in auth module\n    problem_statement: Missing signature\n    required_change: Validate Ed25519\n    required_test: Run auth test\n```",
+        project_id, cycle.cycle_id, cycle.review_packet_hash
+    );
+    let preview = {
+        let db = db_manager.lock().await;
+        ReviewService::prepare_review_import(
+            db.connection(),
+            repo_path,
+            &project_id,
+            &cycle.cycle_id,
+            &raw_review_response,
+        )
+        .unwrap()
+    };
+
+    // Verify preview row exists in review_import_previews
+    {
+        let db = db_manager.lock().await;
+        let count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM review_import_previews WHERE preview_id = ?1",
+                rusqlite::params![preview.preview_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "Preview row must exist before rejection");
+    }
+
+    // 4. Reject the import preview via governed ReviewService::reject_review_import
+    {
+        let mut db = db_manager.lock().await;
+        let rejected_id = ReviewService::reject_review_import(
+            db.connection_mut(),
+            &project_id,
+            &preview.preview_id,
+            "HUMAN",
+        )
+        .expect("Rejecting review import should succeed");
+        assert_eq!(rejected_id, preview.preview_id);
+
+        // Verify preview row is deleted
+        let count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM review_import_previews WHERE preview_id = ?1",
+                rusqlite::params![preview.preview_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "Preview row must be deleted after rejection");
+
+        // Verify review cycle remains PENDING
+        let loaded_cycle =
+            coalition_lib::core::review::get_review_cycle(db.connection(), &cycle.cycle_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            loaded_cycle.status,
+            coalition_lib::core::review::ReviewCycleStatus::Pending,
+            "Review cycle must remain PENDING after import rejection"
+        );
+
+        // Verify workflow state remains WAITING_FOR_REVIEW
+        let wf = coalition_lib::core::workflow::get_workflow_state(db.connection(), &project_id)
+            .unwrap();
+        assert_eq!(
+            wf.state,
+            WorkflowState::WaitingForReview,
+            "Workflow must remain in WAITING_FOR_REVIEW after import rejection"
+        );
+
+        // Verify REVIEW_IMPORT_REJECTED audit event was recorded
+        let events =
+            ActivityManager::get_project_activity(db.connection(), &project_id, Some(20)).unwrap();
+        let reject_event = events
+            .iter()
+            .find(|e| e.event_type == "REVIEW_IMPORT_REJECTED")
+            .expect("REVIEW_IMPORT_REJECTED activity event must be recorded");
+        assert_eq!(reject_event.actor, "HUMAN");
+    }
+
+    // 5. Verify confirming the rejected preview ID fails with NotFound
+    {
+        let mut db = db_manager.lock().await;
+        let confirm_res = ReviewService::confirm_review_import(
+            db.connection_mut(),
+            repo_path,
+            &project_id,
+            &preview.preview_id,
+            "HUMAN",
+        );
+        match confirm_res {
+            Err(ReviewError::NotFound(_)) => {}
+            other => panic!("Expected NotFound for rejected preview ID, got {:?}", other),
+        }
+    }
+
+    // 6. Verify subsequent import preview can be prepared and confirmed
+    let accept_response = format!(
+        "```verdict\nschema_version: 1\nresponse_type: REVIEW_VERDICT\nproject_id: \"{}\"\ncycle_id: \"{}\"\nreview_packet_hash: \"{}\"\nverdict: ACCEPT\nsummary: Architecture fully compliant\nfindings: []\n```",
+        project_id, cycle.cycle_id, cycle.review_packet_hash
+    );
+    let new_preview = {
+        let db = db_manager.lock().await;
+        ReviewService::prepare_review_import(
+            db.connection(),
+            repo_path,
+            &project_id,
+            &cycle.cycle_id,
+            &accept_response,
+        )
+        .unwrap()
+    };
+
+    {
+        let mut db = db_manager.lock().await;
+        let confirmed_cycle = ReviewService::confirm_review_import(
+            db.connection_mut(),
+            repo_path,
+            &project_id,
+            &new_preview.preview_id,
+            "HUMAN",
+        )
+        .expect("Subsequent import confirmation must succeed");
+        assert_eq!(
+            confirmed_cycle.status,
+            coalition_lib::core::review::ReviewCycleStatus::Accepted
+        );
+        assert_eq!(confirmed_cycle.verdict, Some(ReviewVerdict::Accept));
+
+        let wf = coalition_lib::core::workflow::get_workflow_state(db.connection(), &project_id)
+            .unwrap();
+        assert_eq!(wf.state, WorkflowState::ReviewAccepted);
+    }
+}
+
+#[tokio::test]
+async fn test_stage4_validation_diagnostic_routing_to_builder() {
+    let (repo_temp, _db_temp, project_id, db_path) = setup_frozen_test_project();
+    let repo_path = repo_temp.path();
+    let app_data_temp = tempdir().unwrap();
+    let app_data_dir = app_data_temp.path();
+
+    let db_manager = Arc::new(Mutex::new(DbManager::open(&db_path).unwrap()));
+    let val_registry = Arc::new(Mutex::new(ActiveValidationRegistry::new()));
+    let builder_registry = Arc::new(Mutex::new(
+        coalition_lib::core::builder::ActiveBuilderRegistry::new(),
+    ));
+    let fake_agy_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("tests")
+        .join("fake-commands")
+        .join(if cfg!(windows) {
+            "fake-agy.cmd"
+        } else {
+            "fake-agy"
+        });
+    let adapter = coalition_lib::core::builder::AntigravityCliAdapter::with_path(fake_agy_path);
+
+    // 1. Move to BUILDING
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::StartBuild,
+            "HUMAN",
+        )
+        .unwrap();
+    }
+
+    // 2. Run post-build validation: fails because target/clean.txt does not exist, leaving workflow in VALIDATING
+    let val_run = ValidationService::run_post_build_validation(
+        db_manager.clone(),
+        val_registry.clone(),
+        &project_id,
+        repo_path,
+        None,
+        app_data_dir,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        val_run.status,
+        coalition_lib::core::validation::ValidationRunStatus::Fail
+    );
+    assert!(!val_run.is_gate_passed);
+
+    {
+        let db = db_manager.lock().await;
+        let wf = coalition_lib::core::workflow::get_workflow_state(db.connection(), &project_id)
+            .unwrap();
+        assert_eq!(wf.state, WorkflowState::Validating);
+    }
+
+    // 3. Route diagnostics: legal transition VALIDATING -> CORRECTIONS_REQUIRED via RequestCorrections
+    {
+        let mut db = db_manager.lock().await;
+        apply_workflow_action(
+            db.connection_mut(),
+            &project_id,
+            WorkflowAction::RequestCorrections,
+            "HUMAN",
+        )
+        .unwrap();
+
+        let wf = coalition_lib::core::workflow::get_workflow_state(db.connection(), &project_id)
+            .unwrap();
+        assert_eq!(wf.state, WorkflowState::CorrectionsRequired);
+    }
+
+    // 4. Start Builder turn with BuilderInstructionSource::ValidationDiagnostic
+    let turn_resp = coalition_lib::core::builder::BuilderService::start_governed_turn_with_source(
+        db_manager.clone(),
+        builder_registry.clone(),
+        None,
+        &project_id,
+        Some("gemini-3.8-flash-high".to_string()),
+        Some("low".to_string()),
+        Some(adapter),
+        Some(
+            coalition_lib::core::builder::BuilderInstructionSource::ValidationDiagnostic {
+                validation_run_id: val_run.run_id.clone(),
+            },
+        ),
+        None, // None so post-build doesn't auto-run inside this unit check
+        None,
+    )
+    .await
+    .expect("Builder diagnostic turn should start and complete successfully");
+
+    assert_eq!(turn_resp.status, "SUCCESS");
+
+    // Verify workflow state transitioned CORRECTIONS_REQUIRED -> BUILDING
+    {
+        let db = db_manager.lock().await;
+        let wf = coalition_lib::core::workflow::get_workflow_state(db.connection(), &project_id)
+            .unwrap();
+        assert_eq!(
+            wf.state,
+            WorkflowState::Building,
+            "Builder turn must transition project back to BUILDING"
+        );
+
+        // Verify the prompt recorded in the session includes the validation diagnostic report
+        let latest_session = db.get_latest_builder_session(&project_id).unwrap().unwrap();
+        assert!(
+            latest_session
+                .prompt
+                .contains("=== VALIDATION DIAGNOSTIC REPORT ==="),
+            "Builder prompt must contain sanitized validation diagnostic report"
+        );
+        assert!(
+            latest_session.prompt.contains(&val_run.run_id),
+            "Builder prompt must reference the validation run ID"
+        );
+    }
 }

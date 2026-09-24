@@ -99,6 +99,7 @@ pub fn run() {
             commands::list_builder_sessions,
             commands::get_builder_events,
             commands::start_builder_turn,
+            commands::start_builder_diagnostic_turn,
             commands::cancel_builder_turn,
             commands::run_diagnostic_fake_agy_turn,
             commands::get_usage_telemetry,
@@ -147,6 +148,7 @@ pub fn run() {
             commands::list_review_cycles,
             commands::prepare_review_import,
             commands::confirm_review_import,
+            commands::reject_review_import,
             commands::get_review_packet_content,
         ])
         .run(tauri::generate_context!())
